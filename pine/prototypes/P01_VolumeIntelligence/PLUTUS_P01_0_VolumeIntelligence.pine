@@ -22,11 +22,12 @@ rvolClimax      = input.float(1.80, "RVOL Climax Candidate >=", minval=0.0, step
 groupPrice = "Price Result"
 atrLen = input.int(14, "ATR Length", minval=1, group=groupPrice)
 
-showVol      = input.bool(true, "Plot Raw Volume", group="Display")
-showBaseline = input.bool(true, "Plot Volume Baseline", group="Display")
-showRvol     = input.bool(false, "Plot RVOL", group="Display")
-showZ        = input.bool(false, "Plot Volume Z-Score", group="Display")
-showTable    = input.bool(true, "Show Diagnostic Table", group="Display")
+groupDisplay = "Display"
+showRvol     = input.bool(true, "Plot RVOL Histogram", group=groupDisplay)
+showZ        = input.bool(false, "Plot Volume Z-Score", group=groupDisplay)
+showRawVol   = input.bool(false, "Plot Raw Volume (Diagnostic)", group=groupDisplay)
+showBaseline = input.bool(false, "Plot Raw Volume Baseline (Diagnostic)", group=groupDisplay)
+showTable    = input.bool(true, "Show Diagnostic Table", group=groupDisplay)
 
 //------------------------------------------------------------------------------
 // Volume availability and metadata
@@ -90,21 +91,35 @@ else if lowEffort and lowResult
     effortResult := "LOW_EFFORT_LOW_RESULT"
 
 //------------------------------------------------------------------------------
-// Plots
+// Normalized diagnostic plots
 //------------------------------------------------------------------------------
-plot(showVol ? volume : na, "Raw Volume", style=plot.style_columns)
-plot(showBaseline ? volBaseline : na, "Volume Baseline", linewidth=2)
-plot(showRvol ? rvol : na, "RVOL", linewidth=2)
-plot(showZ ? volZ : na, "Volume Z-Score", linewidth=2)
+color rvolColor = volumeRegime == "CLIMAX_CANDIDATE" ? color.fuchsia :
+     volumeRegime == "EXPANSION" ? color.aqua :
+     volumeRegime == "CONTRACTION" ? color.gray :
+     color.blue
+
+plot(showRvol ? rvol : na, "RVOL", style=plot.style_columns, color=rvolColor)
+plot(showZ ? volZ : na, "Volume Z-Score", linewidth=2, color=color.orange)
+
+// Raw-volume plots are intentionally disabled by default because their absolute
+// scale can dominate the diagnostic pane and become unusable if the indicator
+// is manually moved into the price pane.
+plot(showRawVol ? volume : na, "Raw Volume", style=plot.style_columns, color=color.new(color.blue, 50))
+plot(showBaseline ? volBaseline : na, "Volume Baseline", linewidth=2, color=color.yellow)
+
+hline(1.0, "RVOL Baseline", color=color.new(color.gray, 55), linestyle=hline.style_dotted)
+hline(rvolContraction, "Contraction Threshold", color=color.new(color.gray, 65), linestyle=hline.style_dashed)
+hline(rvolExpansion, "Expansion Threshold", color=color.new(color.aqua, 55), linestyle=hline.style_dashed)
+hline(rvolClimax, "Climax Candidate Threshold", color=color.new(color.fuchsia, 55), linestyle=hline.style_dashed)
 
 //------------------------------------------------------------------------------
 // Diagnostic table
 //------------------------------------------------------------------------------
-var table diag = table.new(position.top_right, 2, 11, border_width=1)
+var table diag = table.new(position.top_right, 2, 11, border_width=1, frame_width=1, bgcolor=color.new(color.black, 15))
 
 f_setRow(int row, string labelText, string valueText) =>
-    table.cell(diag, 0, row, labelText, text_halign=text.align_left)
-    table.cell(diag, 1, row, valueText, text_halign=text.align_right)
+    table.cell(diag, 0, row, labelText, text_color=color.silver, bgcolor=color.new(color.black, 15), text_halign=text.align_left)
+    table.cell(diag, 1, row, valueText, text_color=color.white, bgcolor=color.new(color.black, 15), text_halign=text.align_right)
 
 if barstate.islast
     if showTable
