@@ -1,0 +1,313 @@
+//@version=6
+indicator("PLUTUS P03.3 — Profile Migration", shorttitle="PLUTUS P03.3", overlay=true, max_labels_count=50)
+
+//==============================================================================
+// PLUTUS P03.3 — Profile Migration / Developing Value
+// Builds on P03.2. Tracks how POC / VAH / VAL migrate through the active profile
+// and compares the current profile against the last completed profile.
+// Context only; no trade signals.
+//==============================================================================
+
+//------------------------------------------------------------------------------
+// Inputs
+//------------------------------------------------------------------------------
+groupTiming = "Timing / Timezone"
+timezoneInput = input.string("Exchange", "Session Timezone", options=["Exchange", "UTC-2", "UTC-1", "UTC+0", "UTC+1", "UTC+2", "America/New_York", "Europe/London", "Asia/Tokyo"], group=groupTiming)
+string sessionTz = timezoneInput == "Exchange" ? syminfo.timezone : timezoneInput
+
+groupProfile = "Profile Engine"
+profileScope = input.string("New York", "Profile Scope", options=["Asia", "London", "New York", "Day"], group=groupProfile)
+allocationSource = input.source(hlc3, "Allocation Price", group=groupProfile)
+binCount = input.int(24, "Price Bins", minval=8, maxval=80, group=groupProfile)
+maxProfileBars = input.int(300, "Maximum Bars Per Profile", minval=25, maxval=1000, group=groupProfile)
+valueAreaPct = input.float(70.0, "Value Area %", minval=50.0, maxval=99.0, step=1.0, group=groupProfile)
+
+groupMigration = "Profile Migration Model"
+migrationLookback = input.int(5, "Migration Lookback Bars", minval=1, maxval=50, group=groupMigration)
+atrLen = input.int(14, "ATR Length", minval=1, group=groupMigration)
+minMigrationAtr = input.float(0.10, "Min POC Migration / ATR", minval=0.0, step=0.01, group=groupMigration)
+widthChangePct = input.float(10.0, "VA Width Change Threshold %", minval=1.0, step=1.0, group=groupMigration)
+persistenceLookback = input.int(5, "Persistence Lookback", minval=2, maxval=50, group=groupMigration)
+persistenceRatio = input.float(0.60, "Persistence Ratio", minval=0.50, maxval=1.0, step=0.05, group=groupMigration)
+
+groupDisplay = "Display"
+showValueLevels = input.bool(true, "Show Developing POC / VAH / VAL", group=groupDisplay)
+showPreviousLevels = input.bool(false, "Show Previous Completed POC / VAH / VAL", group=groupDisplay)
+showTable = input.bool(true, "Show Diagnostic Table", group=groupDisplay)
+lineWidth = input.int(2, "Line Width", minval=1, maxval=4, group=groupDisplay)
+
+//------------------------------------------------------------------------------
+// Fixed ARTHA sessions
+//------------------------------------------------------------------------------
+string asiaSession = "0000-0800:1234567"
+string londonSession = "0800-1630:1234567"
+string newYorkSession = "1330-2000:1234567"
+
+bool inAsia = not na(time(timeframe.period, asiaSession, sessionTz))
+bool inLondon = not na(time(timeframe.period, londonSession, sessionTz))
+bool inNewYork = not na(time(timeframe.period, newYorkSession, sessionTz))
+
+bool newAsia = inAsia and not inAsia[1]
+bool newLondon = inLondon and not inLondon[1]
+bool newNewYork = inNewYork and not inNewYork[1]
+
+int localDay = dayofmonth(time, sessionTz)
+bool newDay = ta.change(localDay) != 0
+
+bool scopeActive = switch profileScope
+    "Asia" => inAsia
+    "London" => inLondon
+    "New York" => inNewYork
+    => true
+
+bool scopeReset = switch profileScope
+    "Asia" => newAsia
+    "London" => newLondon
+    "New York" => newNewYork
+    => barstate.isfirst or newDay
+
+//------------------------------------------------------------------------------
+// Storage
+//------------------------------------------------------------------------------
+var array<float> profilePrices = array.new_float()
+var array<float> profileHighs = array.new_float()
+var array<float> profileLows = array.new_float()
+var array<float> profileVolumes = array.new_float()
+var array<float> bins = array.new_float()
+
+if barstate.isfirst
+    for i = 0 to binCount - 1
+        array.push(bins, 0.0)
+
+//------------------------------------------------------------------------------
+// Current profile outputs
+//------------------------------------------------------------------------------
+float profileHigh = na
+float profileLow = na
+float pocPrice = na
+float vahPrice = na
+float valPrice = na
+float totalProfileVolume = 0.0
+float valueAreaVolume = 0.0
+float binSize = na
+int pocIndex = na
+int vaLowIndex = na
+int vaHighIndex = na
+
+//------------------------------------------------------------------------------
+// Completed-profile snapshot
+//------------------------------------------------------------------------------
+var float completedPoc = na
+var float completedVah = na
+var float completedVal = na
+var float completedWidth = na
+
+if scopeReset and not barstate.isfirst
+    completedPoc := pocPrice[1]
+    completedVah := vahPrice[1]
+    completedVal := valPrice[1]
+    completedWidth := not na(vahPrice[1]) and not na(valPrice[1]) ? vahPrice[1] - valPrice[1] : na
+
+if scopeReset
+    array.clear(profilePrices)
+    array.clear(profileHighs)
+    array.clear(profileLows)
+    array.clear(profileVolumes)
+
+if scopeActive and not na(volume)
+    array.push(profilePrices, allocationSource)
+    array.push(profileHighs, high)
+    array.push(profileLows, low)
+    array.push(profileVolumes, volume)
+
+    if array.size(profilePrices) > maxProfileBars
+        array.shift(profilePrices)
+        array.shift(profileHighs)
+        array.shift(profileLows)
+        array.shift(profileVolumes)
+
+//------------------------------------------------------------------------------
+// Rebuild current profile
+//------------------------------------------------------------------------------
+int storedBars = array.size(profilePrices)
+
+if storedBars > 0
+    profileHigh := array.max(profileHighs)
+    profileLow := array.min(profileLows)
+    float profileRange = profileHigh - profileLow
+    binSize := math.max(profileRange > 0.0 ? profileRange / binCount : syminfo.mintick, syminfo.mintick)
+
+    for i = 0 to binCount - 1
+        array.set(bins, i, 0.0)
+
+    for i = 0 to storedBars - 1
+        float p = array.get(profilePrices, i)
+        float v = array.get(profileVolumes, i)
+        int idx = int(math.floor((p - profileLow) / binSize))
+        idx := math.max(0, math.min(binCount - 1, idx))
+        array.set(bins, idx, array.get(bins, idx) + v)
+        totalProfileVolume += v
+
+    float maxBinVol = -1.0
+    pocIndex := 0
+    for i = 0 to binCount - 1
+        float binVol = array.get(bins, i)
+        if binVol > maxBinVol
+            maxBinVol := binVol
+            pocIndex := i
+
+    pocPrice := profileLow + (pocIndex + 0.5) * binSize
+
+    float targetVolume = totalProfileVolume * valueAreaPct / 100.0
+    vaLowIndex := pocIndex
+    vaHighIndex := pocIndex
+    valueAreaVolume := array.get(bins, pocIndex)
+    int expansionSteps = 0
+    while valueAreaVolume < targetVolume and expansionSteps < binCount
+        bool canDown = vaLowIndex > 0
+        bool canUp = vaHighIndex < binCount - 1
+        if not canDown and not canUp
+            break
+        float downVol = canDown ? array.get(bins, vaLowIndex - 1) : -1.0
+        float upVol = canUp ? array.get(bins, vaHighIndex + 1) : -1.0
+        if canDown and canUp and downVol == upVol
+            vaLowIndex -= 1
+            vaHighIndex += 1
+            valueAreaVolume += downVol + upVol
+        else if canUp and (not canDown or upVol > downVol)
+            vaHighIndex += 1
+            valueAreaVolume += upVol
+        else if canDown
+            vaLowIndex -= 1
+            valueAreaVolume += downVol
+        expansionSteps += 1
+
+    valPrice := profileLow + vaLowIndex * binSize
+    vahPrice := profileLow + (vaHighIndex + 1) * binSize
+
+//------------------------------------------------------------------------------
+// Migration measurements
+//------------------------------------------------------------------------------
+float atr = ta.atr(atrLen)
+float pocMigrationAtr = not na(pocPrice) and not na(pocPrice[migrationLookback]) and not na(atr) and atr != 0.0 ? (pocPrice - pocPrice[migrationLookback]) / atr : na
+float vahMigrationAtr = not na(vahPrice) and not na(vahPrice[migrationLookback]) and not na(atr) and atr != 0.0 ? (vahPrice - vahPrice[migrationLookback]) / atr : na
+float valMigrationAtr = not na(valPrice) and not na(valPrice[migrationLookback]) and not na(atr) and atr != 0.0 ? (valPrice - valPrice[migrationLookback]) / atr : na
+
+bool pocRising = not na(pocMigrationAtr) and pocMigrationAtr >= minMigrationAtr
+bool pocFalling = not na(pocMigrationAtr) and pocMigrationAtr <= -minMigrationAtr
+bool pocFlat = not na(pocMigrationAtr) and not pocRising and not pocFalling
+
+bool valueRising = not na(vahMigrationAtr) and not na(valMigrationAtr) and vahMigrationAtr > 0.0 and valMigrationAtr > 0.0
+bool valueFalling = not na(vahMigrationAtr) and not na(valMigrationAtr) and vahMigrationAtr < 0.0 and valMigrationAtr < 0.0
+bool valueDivergent = not na(vahMigrationAtr) and not na(valMigrationAtr) and ((vahMigrationAtr > 0.0 and valMigrationAtr < 0.0) or (vahMigrationAtr < 0.0 and valMigrationAtr > 0.0))
+
+float currentWidth = not na(vahPrice) and not na(valPrice) ? vahPrice - valPrice : na
+float priorWidth = currentWidth[migrationLookback]
+float widthChange = not na(currentWidth) and not na(priorWidth) and priorWidth > 0.0 ? (currentWidth - priorWidth) / priorWidth * 100.0 : na
+bool widthExpanding = not na(widthChange) and widthChange >= widthChangePct
+bool widthContracting = not na(widthChange) and widthChange <= -widthChangePct
+
+float risingRatio = ta.sma((pocRising and valueRising) ? 1.0 : 0.0, persistenceLookback)
+float fallingRatio = ta.sma((pocFalling and valueFalling) ? 1.0 : 0.0, persistenceLookback)
+bool persistentHigher = not na(risingRatio) and risingRatio >= persistenceRatio
+bool persistentLower = not na(fallingRatio) and fallingRatio >= persistenceRatio
+
+float pocVsCompletedAtr = not na(pocPrice) and not na(completedPoc) and not na(atr) and atr != 0.0 ? (pocPrice - completedPoc) / atr : na
+float currentVsCompletedWidthPct = not na(currentWidth) and not na(completedWidth) and completedWidth > 0.0 ? (currentWidth - completedWidth) / completedWidth * 100.0 : na
+
+//------------------------------------------------------------------------------
+// Developing profile state
+//------------------------------------------------------------------------------
+string migrationState = "PROFILE_BALANCED"
+if not scopeActive or na(pocPrice) or na(vahPrice) or na(valPrice)
+    migrationState := "PROFILE_UNAVAILABLE"
+else if persistentHigher and widthExpanding
+    migrationState := "VALUE_MIGRATING_HIGHER_EXPANDING"
+else if persistentLower and widthExpanding
+    migrationState := "VALUE_MIGRATING_LOWER_EXPANDING"
+else if persistentHigher
+    migrationState := "VALUE_MIGRATING_HIGHER"
+else if persistentLower
+    migrationState := "VALUE_MIGRATING_LOWER"
+else if valueDivergent and widthExpanding
+    migrationState := "VALUE_AREA_EXPANDING"
+else if widthContracting and pocFlat
+    migrationState := "VALUE_AREA_CONTRACTING"
+else if pocRising and valueRising
+    migrationState := "VALUE_LEANING_HIGHER"
+else if pocFalling and valueFalling
+    migrationState := "VALUE_LEANING_LOWER"
+else if pocFlat and not widthExpanding
+    migrationState := "PROFILE_BALANCED"
+else
+    migrationState := "PROFILE_TRANSITION"
+
+string state = barstate.isconfirmed ? migrationState : "FORMING"
+
+//------------------------------------------------------------------------------
+// Auction location
+//------------------------------------------------------------------------------
+string priceLocation = "UNAVAILABLE"
+if not na(pocPrice) and not na(vahPrice) and not na(valPrice)
+    if close > vahPrice
+        priceLocation := "ABOVE_VALUE"
+    else if close < valPrice
+        priceLocation := "BELOW_VALUE"
+    else if close > pocPrice
+        priceLocation := "UPPER_VALUE"
+    else if close < pocPrice
+        priceLocation := "LOWER_VALUE"
+    else
+        priceLocation := "AT_POC"
+
+//------------------------------------------------------------------------------
+// Plots
+//------------------------------------------------------------------------------
+float pocPlot = showValueLevels and scopeActive ? pocPrice : na
+float vahPlot = showValueLevels and scopeActive ? vahPrice : na
+float valPlot = showValueLevels and scopeActive ? valPrice : na
+pocPlot := scopeReset ? na : pocPlot
+vahPlot := scopeReset ? na : vahPlot
+valPlot := scopeReset ? na : valPlot
+
+plot(pocPlot, "Developing POC", color=color.orange, linewidth=lineWidth, style=plot.style_linebr)
+plot(vahPlot, "Developing VAH", color=color.new(color.green, 10), linewidth=1, style=plot.style_linebr)
+plot(valPlot, "Developing VAL", color=color.new(color.red, 10), linewidth=1, style=plot.style_linebr)
+plot(showPreviousLevels ? completedPoc : na, "Previous POC", color=color.new(color.orange, 60), linewidth=1, style=plot.style_linebr)
+plot(showPreviousLevels ? completedVah : na, "Previous VAH", color=color.new(color.green, 70), linewidth=1, style=plot.style_linebr)
+plot(showPreviousLevels ? completedVal : na, "Previous VAL", color=color.new(color.red, 70), linewidth=1, style=plot.style_linebr)
+
+//------------------------------------------------------------------------------
+// Diagnostics
+//------------------------------------------------------------------------------
+var table diag = table.new(position.top_right, 2, 20, border_width=1, frame_width=1, bgcolor=color.new(color.black, 15))
+
+f_setRow(int row, string labelText, string valueText) =>
+    table.cell(diag, 0, row, labelText, text_color=color.silver, bgcolor=color.new(color.black, 15), text_halign=text.align_left)
+    table.cell(diag, 1, row, valueText, text_color=color.white, bgcolor=color.new(color.black, 15), text_halign=text.align_right)
+
+if barstate.islast
+    if showTable
+        table.clear(diag, 0, 0, 1, 19)
+        f_setRow(0, "PLUTUS", "P03.3 Migration")
+        f_setRow(1, "Timezone", sessionTz)
+        f_setRow(2, "Scope", profileScope)
+        f_setRow(3, "Scope State", scopeActive ? "ACTIVE" : "CLOSED")
+        f_setRow(4, "Stored Bars", str.tostring(storedBars))
+        f_setRow(5, "VAH", not na(vahPrice) ? str.tostring(vahPrice, format.mintick) : "N/A")
+        f_setRow(6, "POC", not na(pocPrice) ? str.tostring(pocPrice, format.mintick) : "N/A")
+        f_setRow(7, "VAL", not na(valPrice) ? str.tostring(valPrice, format.mintick) : "N/A")
+        f_setRow(8, "Price Location", priceLocation)
+        f_setRow(9, "POC Migration / ATR", not na(pocMigrationAtr) ? str.tostring(pocMigrationAtr, "#.###") : "N/A")
+        f_setRow(10, "VAH Migration / ATR", not na(vahMigrationAtr) ? str.tostring(vahMigrationAtr, "#.###") : "N/A")
+        f_setRow(11, "VAL Migration / ATR", not na(valMigrationAtr) ? str.tostring(valMigrationAtr, "#.###") : "N/A")
+        f_setRow(12, "VA Width", not na(currentWidth) ? str.tostring(currentWidth, format.mintick) : "N/A")
+        f_setRow(13, "Width Change", not na(widthChange) ? str.tostring(widthChange, "#.1") + "%" : "N/A")
+        f_setRow(14, "Persistent Higher", persistentHigher ? "YES" : "NO")
+        f_setRow(15, "Persistent Lower", persistentLower ? "YES" : "NO")
+        f_setRow(16, "Previous POC", not na(completedPoc) ? str.tostring(completedPoc, format.mintick) : "N/A")
+        f_setRow(17, "POC vs Prev / ATR", not na(pocVsCompletedAtr) ? str.tostring(pocVsCompletedAtr, "#.###") : "N/A")
+        f_setRow(18, "Width vs Prev", not na(currentVsCompletedWidthPct) ? str.tostring(currentVsCompletedWidthPct, "#.1") + "%" : "N/A")
+        f_setRow(19, "State", state)
+    else
+        table.clear(diag, 0, 0, 1, 19)
