@@ -1,0 +1,264 @@
+//@version=6
+indicator("PLUTUS P02.1 — VWAP Value Migration", shorttitle="PLUTUS P02.1", overlay=true, max_labels_count=100)
+
+//==============================================================================
+// PLUTUS P02.1 — VWAP Slope & Value Migration
+// Builds on P02.0 without changing its fixed-session or D/W/M reset mechanics.
+// Purpose: classify fair-value behavior, not generate trade signals.
+//==============================================================================
+
+//------------------------------------------------------------------------------
+// Inputs
+//------------------------------------------------------------------------------
+groupSource = "VWAP Source"
+source = input.source(hlc3, "Source", group=groupSource)
+
+groupTiming = "Timing / Timezone"
+timezoneInput = input.string(
+     "Exchange",
+     "Session Timezone",
+     options=["Exchange", "UTC-2", "UTC-1", "UTC+0", "UTC+1", "UTC+2", "America/New_York", "Europe/London", "Asia/Tokyo"],
+     group=groupTiming)
+string sessionTz = timezoneInput == "Exchange" ? syminfo.timezone : timezoneInput
+
+groupSessions = "Fixed Session VWAPs"
+showAsiaVwap = input.bool(true, "Show Asia VWAP", group=groupSessions)
+showLondonVwap = input.bool(true, "Show London VWAP", group=groupSessions)
+showNewYorkVwap = input.bool(true, "Show New York VWAP", group=groupSessions)
+
+groupHigher = "Higher-Period VWAPs"
+showDailyVwap = input.bool(true, "Show Daily VWAP", group=groupHigher)
+showWeeklyVwap = input.bool(true, "Show Weekly VWAP", group=groupHigher)
+showMonthlyVwap = input.bool(true, "Show Monthly VWAP", group=groupHigher)
+
+groupModel = "Value Migration Model"
+referenceMode = input.string("Daily", "Primary Value Reference", options=["Active Session", "Daily", "Weekly", "Monthly"], group=groupModel)
+atrLen = input.int(14, "ATR Length", minval=1, group=groupModel)
+slopeLookback = input.int(5, "VWAP Slope Lookback", minval=1, maxval=50, group=groupModel)
+slopeAtrThreshold = input.float(0.10, "Directional Slope / ATR Threshold", minval=0.0, step=0.01, group=groupModel)
+acceptanceBars = input.int(5, "Acceptance Lookback", minval=2, maxval=50, group=groupModel)
+acceptanceRatioMin = input.float(0.80, "Acceptance Ratio", minval=0.50, maxval=1.0, step=0.05, group=groupModel)
+crossLookback = input.int(10, "Equilibrium Cross Lookback", minval=3, maxval=50, group=groupModel)
+minCrosses = input.int(3, "Minimum Crosses For Equilibrium", minval=1, maxval=20, group=groupModel)
+equilibriumDistanceAtr = input.float(0.35, "Equilibrium Max Distance / ATR", minval=0.05, step=0.05, group=groupModel)
+extensionAtr = input.float(1.50, "Extension Distance / ATR", minval=0.25, step=0.05, group=groupModel)
+failureDistanceAtr = input.float(0.15, "Migration Failure Distance / ATR", minval=0.0, step=0.05, group=groupModel)
+
+groupDisplay = "Display"
+showTable = input.bool(true, "Show Diagnostic Table", group=groupDisplay)
+showStateMarks = input.bool(false, "Show State Markers", group=groupDisplay)
+lineWidth = input.int(2, "Line Width", minval=1, maxval=4, group=groupDisplay)
+breakLinesOnReset = input.bool(true, "Break Lines On Reset", group=groupDisplay)
+
+//------------------------------------------------------------------------------
+// Fixed ARTHA sessions
+//------------------------------------------------------------------------------
+string asiaSession = "0000-0800:1234567"
+string londonSession = "0800-1630:1234567"
+string newYorkSession = "1330-2000:1234567"
+
+bool inAsia = not na(time(timeframe.period, asiaSession, sessionTz))
+bool inLondon = not na(time(timeframe.period, londonSession, sessionTz))
+bool inNewYork = not na(time(timeframe.period, newYorkSession, sessionTz))
+
+bool newAsia = inAsia and not inAsia[1]
+bool newLondon = inLondon and not inLondon[1]
+bool newNewYork = inNewYork and not inNewYork[1]
+
+//------------------------------------------------------------------------------
+// Fixed-session VWAPs
+//------------------------------------------------------------------------------
+var float asiaPV = na
+var float asiaVol = na
+if not inAsia
+    asiaPV := na
+    asiaVol := na
+else if newAsia or na(asiaPV) or na(asiaVol)
+    asiaPV := source * volume
+    asiaVol := volume
+else
+    asiaPV += source * volume
+    asiaVol += volume
+float asiaVwap = inAsia and not na(asiaVol) and asiaVol > 0.0 ? asiaPV / asiaVol : na
+
+var float londonPV = na
+var float londonVol = na
+if not inLondon
+    londonPV := na
+    londonVol := na
+else if newLondon or na(londonPV) or na(londonVol)
+    londonPV := source * volume
+    londonVol := volume
+else
+    londonPV += source * volume
+    londonVol += volume
+float londonVwap = inLondon and not na(londonVol) and londonVol > 0.0 ? londonPV / londonVol : na
+
+var float newYorkPV = na
+var float newYorkVol = na
+if not inNewYork
+    newYorkPV := na
+    newYorkVol := na
+else if newNewYork or na(newYorkPV) or na(newYorkVol)
+    newYorkPV := source * volume
+    newYorkVol := volume
+else
+    newYorkPV += source * volume
+    newYorkVol += volume
+float newYorkVwap = inNewYork and not na(newYorkVol) and newYorkVol > 0.0 ? newYorkPV / newYorkVol : na
+
+//------------------------------------------------------------------------------
+// D/W/M VWAPs in the shared ARTHA timezone
+//------------------------------------------------------------------------------
+int localDay = dayofmonth(time, sessionTz)
+int localWeek = weekofyear(time, sessionTz)
+int localMonth = month(time, sessionTz)
+
+bool newDay = ta.change(localDay) != 0
+bool newWeek = ta.change(localWeek) != 0
+bool newMonth = ta.change(localMonth) != 0
+
+bool dayAnchor = barstate.isfirst or newDay
+bool weekAnchor = barstate.isfirst or newWeek
+bool monthAnchor = barstate.isfirst or newMonth
+
+float dailyVwap = ta.vwap(source, dayAnchor)
+float weeklyVwap = ta.vwap(source, weekAnchor)
+float monthlyVwap = ta.vwap(source, monthAnchor)
+
+//------------------------------------------------------------------------------
+// Primary value reference
+// During London/New York overlap, New York has priority for Active Session.
+//------------------------------------------------------------------------------
+float activeSessionVwap = inNewYork ? newYorkVwap : inLondon ? londonVwap : inAsia ? asiaVwap : na
+string activeSessionName = inNewYork ? "NEW YORK" : inLondon ? "LONDON" : inAsia ? "ASIA" : "NONE"
+
+float valueRef = switch referenceMode
+    "Active Session" => activeSessionVwap
+    "Weekly" => weeklyVwap
+    "Monthly" => monthlyVwap
+    => dailyVwap
+
+//------------------------------------------------------------------------------
+// Value migration measurements
+//------------------------------------------------------------------------------
+float atr = ta.atr(atrLen)
+float distanceAtr = not na(valueRef) and not na(atr) and atr != 0.0 ? (close - valueRef) / atr : na
+float slopeAtr = not na(valueRef) and not na(valueRef[slopeLookback]) and not na(atr) and atr != 0.0 ? (valueRef - valueRef[slopeLookback]) / atr : na
+
+bool valueRising = not na(slopeAtr) and slopeAtr >= slopeAtrThreshold
+bool valueFalling = not na(slopeAtr) and slopeAtr <= -slopeAtrThreshold
+bool valueFlat = not na(slopeAtr) and not valueRising and not valueFalling
+
+float aboveRatio = ta.sma(not na(valueRef) and close > valueRef ? 1.0 : 0.0, acceptanceBars)
+float belowRatio = ta.sma(not na(valueRef) and close < valueRef ? 1.0 : 0.0, acceptanceBars)
+bool acceptedAbove = not na(valueRef) and not na(aboveRatio) and aboveRatio >= acceptanceRatioMin
+bool acceptedBelow = not na(valueRef) and not na(belowRatio) and belowRatio >= acceptanceRatioMin
+
+bool refCross = not na(valueRef) and not na(valueRef[1]) and ((close > valueRef and close[1] <= valueRef[1]) or (close < valueRef and close[1] >= valueRef[1]))
+float crossRate = ta.sma(refCross ? 1.0 : 0.0, crossLookback)
+float approximateCrosses = not na(crossRate) ? crossRate * crossLookback : na
+bool equilibrium = not na(approximateCrosses) and approximateCrosses >= minCrosses and not na(distanceAtr) and math.abs(distanceAtr) <= equilibriumDistanceAtr
+
+bool extendedAbove = not na(distanceAtr) and distanceAtr >= extensionAtr
+bool extendedBelow = not na(distanceAtr) and distanceAtr <= -extensionAtr
+
+bool risingMigrationFailure = valueRising and not na(distanceAtr) and distanceAtr <= -failureDistanceAtr
+bool fallingMigrationFailure = valueFalling and not na(distanceAtr) and distanceAtr >= failureDistanceAtr
+
+//------------------------------------------------------------------------------
+// Unified value state
+//------------------------------------------------------------------------------
+string candidateState = "BALANCED_VALUE"
+if na(valueRef) or na(atr) or na(slopeAtr)
+    candidateState := "UNAVAILABLE"
+else if equilibrium
+    candidateState := "EQUILIBRIUM"
+else if risingMigrationFailure
+    candidateState := "RISING_VALUE_FAILURE"
+else if fallingMigrationFailure
+    candidateState := "FALLING_VALUE_FAILURE"
+else if extendedAbove
+    candidateState := "EXTENDED_ABOVE_VALUE"
+else if extendedBelow
+    candidateState := "EXTENDED_BELOW_VALUE"
+else if acceptedAbove and valueRising
+    candidateState := "ACCEPTED_ABOVE_RISING_VALUE"
+else if acceptedBelow and valueFalling
+    candidateState := "ACCEPTED_BELOW_FALLING_VALUE"
+else if acceptedAbove
+    candidateState := "ACCEPTED_ABOVE_VALUE"
+else if acceptedBelow
+    candidateState := "ACCEPTED_BELOW_VALUE"
+else if valueRising
+    candidateState := "VALUE_RISING"
+else if valueFalling
+    candidateState := "VALUE_FALLING"
+else if valueFlat
+    candidateState := "BALANCED_VALUE"
+
+string state = barstate.isconfirmed ? candidateState : "FORMING"
+
+//------------------------------------------------------------------------------
+// Baseline plots preserved from P02.0
+//------------------------------------------------------------------------------
+float asiaPlot = showAsiaVwap ? asiaVwap : na
+float londonPlot = showLondonVwap ? londonVwap : na
+float newYorkPlot = showNewYorkVwap ? newYorkVwap : na
+float dailyPlot = showDailyVwap ? dailyVwap : na
+float weeklyPlot = showWeeklyVwap ? weeklyVwap : na
+float monthlyPlot = showMonthlyVwap ? monthlyVwap : na
+
+asiaPlot := breakLinesOnReset and newAsia ? na : asiaPlot
+londonPlot := breakLinesOnReset and newLondon ? na : londonPlot
+newYorkPlot := breakLinesOnReset and newNewYork ? na : newYorkPlot
+dailyPlot := breakLinesOnReset and newDay ? na : dailyPlot
+weeklyPlot := breakLinesOnReset and newWeek ? na : weeklyPlot
+monthlyPlot := breakLinesOnReset and newMonth ? na : monthlyPlot
+
+plot(asiaPlot, "Asia VWAP", linewidth=lineWidth, color=color.aqua, style=plot.style_linebr)
+plot(londonPlot, "London VWAP", linewidth=lineWidth, color=color.yellow, style=plot.style_linebr)
+plot(newYorkPlot, "New York VWAP", linewidth=lineWidth, color=color.orange, style=plot.style_linebr)
+plot(dailyPlot, "Daily VWAP", linewidth=lineWidth, color=color.white, style=plot.style_linebr)
+plot(weeklyPlot, "Weekly VWAP", linewidth=lineWidth, color=color.blue, style=plot.style_linebr)
+plot(monthlyPlot, "Monthly VWAP", linewidth=lineWidth, color=color.fuchsia, style=plot.style_linebr)
+
+//------------------------------------------------------------------------------
+// Optional diagnostic state markers
+//------------------------------------------------------------------------------
+plotshape(showStateMarks and state == "EQUILIBRIUM", title="Equilibrium", style=shape.circle, location=location.abovebar, size=size.tiny, text="EQ")
+plotshape(showStateMarks and str.startswith(state, "EXTENDED_ABOVE"), title="Extended Above", style=shape.triangledown, location=location.abovebar, size=size.tiny, text="EXT+")
+plotshape(showStateMarks and str.startswith(state, "EXTENDED_BELOW"), title="Extended Below", style=shape.triangleup, location=location.belowbar, size=size.tiny, text="EXT-")
+plotshape(showStateMarks and str.endswith(state, "FAILURE"), title="Migration Failure", style=shape.diamond, location=location.abovebar, size=size.tiny, text="FAIL")
+
+//------------------------------------------------------------------------------
+// Diagnostics
+//------------------------------------------------------------------------------
+var table diag = table.new(position.top_right, 2, 17, border_width=1, frame_width=1, bgcolor=color.new(color.black, 15))
+
+f_setRow(int row, string labelText, string valueText) =>
+    table.cell(diag, 0, row, labelText, text_color=color.silver, bgcolor=color.new(color.black, 15), text_halign=text.align_left)
+    table.cell(diag, 1, row, valueText, text_color=color.white, bgcolor=color.new(color.black, 15), text_halign=text.align_right)
+
+if barstate.islast
+    if showTable
+        table.clear(diag, 0, 0, 1, 16)
+        f_setRow(0, "PLUTUS", "P02.1 Value Migration")
+        f_setRow(1, "Timezone", sessionTz)
+        f_setRow(2, "Reference", referenceMode)
+        f_setRow(3, "Active Session", activeSessionName)
+        f_setRow(4, "Reference VWAP", not na(valueRef) ? str.tostring(valueRef, format.mintick) : "N/A")
+        f_setRow(5, "Slope / ATR", not na(slopeAtr) ? str.tostring(slopeAtr, "#.###") : "N/A")
+        f_setRow(6, "Slope", valueRising ? "RISING" : valueFalling ? "FALLING" : valueFlat ? "FLAT" : "N/A")
+        f_setRow(7, "Distance / ATR", not na(distanceAtr) ? str.tostring(distanceAtr, "#.##") : "N/A")
+        f_setRow(8, "Above Ratio", not na(aboveRatio) ? str.tostring(aboveRatio * 100.0, "#.0") + "%" : "N/A")
+        f_setRow(9, "Below Ratio", not na(belowRatio) ? str.tostring(belowRatio * 100.0, "#.0") + "%" : "N/A")
+        f_setRow(10, "Approx Crosses", not na(approximateCrosses) ? str.tostring(approximateCrosses, "#.0") : "N/A")
+        f_setRow(11, "Accepted Above", acceptedAbove ? "YES" : "NO")
+        f_setRow(12, "Accepted Below", acceptedBelow ? "YES" : "NO")
+        f_setRow(13, "Equilibrium", equilibrium ? "YES" : "NO")
+        f_setRow(14, "Extended", extendedAbove ? "ABOVE" : extendedBelow ? "BELOW" : "NO")
+        f_setRow(15, "Confirmed Bar", barstate.isconfirmed ? "YES" : "NO")
+        f_setRow(16, "State", state)
+    else
+        table.clear(diag, 0, 0, 1, 16)
