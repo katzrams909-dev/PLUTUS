@@ -115,9 +115,11 @@ bool compressionCandidate = lowEffort and lowDirectionalResult
 //------------------------------------------------------------------------------
 // Persistence helper
 //------------------------------------------------------------------------------
+// A state is confirmed only when every bar in the confirmation window satisfies
+// the candidate condition. SMA of a 1/0 series equals 1 only when all N bars are true.
 f_confirm(bool condition, int bars) =>
-    float count = ta.sum(condition ? 1.0 : 0.0, bars)
-    count >= bars
+    float confirmationRatio = ta.sma(condition ? 1.0 : 0.0, bars)
+    not na(confirmationRatio) and confirmationRatio >= 1.0
 
 bool efficientExpansion = f_confirm(efficientExpansionCandidate, persistenceBars)
 bool bullishAbsorption = f_confirm(bullishAbsorptionCandidate, persistenceBars)
