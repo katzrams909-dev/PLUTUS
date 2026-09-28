@@ -100,6 +100,13 @@ if not na(bodyAtr) and not na(rangeAtr) and not na(displacementAtr)
 //------------------------------------------------------------------------------
 // P01.2 — Lower-timeframe estimated directional flow
 //------------------------------------------------------------------------------
+// The selected proxy timeframe must be strictly lower than the chart timeframe.
+// If it is equal or higher, proxy-dependent logic is disabled and the universal
+// P01 volume/price model remains active.
+float chartTfSeconds = timeframe.in_seconds()
+float ltfSeconds = timeframe.in_seconds(ltfTf)
+bool ltfIsLower = not na(chartTfSeconds) and not na(ltfSeconds) and ltfSeconds < chartTfSeconds
+
 ltfOpen = request.security_lower_tf(syminfo.tickerid, ltfTf, open, ignore_invalid_timeframe=true)
 ltfClose = request.security_lower_tf(syminfo.tickerid, ltfTf, close, ignore_invalid_timeframe=true)
 ltfVolume = request.security_lower_tf(syminfo.tickerid, ltfTf, volume, ignore_invalid_timeframe=true)
@@ -108,7 +115,7 @@ int intrabarCount = math.min(array.size(ltfOpen), math.min(array.size(ltfClose),
 float estBuyVolume = 0.0
 float estSellVolume = 0.0
 
-if intrabarCount > 0
+if ltfIsLower and intrabarCount > 0
     for i = 0 to intrabarCount - 1
         float io = array.get(ltfOpen, i)
         float ic = array.get(ltfClose, i)
@@ -125,10 +132,11 @@ if intrabarCount > 0
 float estTotalVolume = estBuyVolume + estSellVolume
 float estDelta = estBuyVolume - estSellVolume
 float estDeltaPct = estTotalVolume > 0.0 ? estDelta / estTotalVolume : na
-bool proxyAvailable = intrabarCount > 0 and estTotalVolume > 0.0 and not na(estDeltaPct)
+bool proxyAvailable = ltfIsLower and intrabarCount > 1 and estTotalVolume > 0.0 and not na(estDeltaPct)
 bool proxyBullish = proxyAvailable and estDeltaPct >= deltaThreshold
 bool proxyBearish = proxyAvailable and estDeltaPct <= -deltaThreshold
 bool proxyBalanced = proxyAvailable and math.abs(estDeltaPct) < deltaThreshold
+string ltfStatus = ltfIsLower ? (proxyAvailable ? "VALID" : "LOWER_NO_DATA") : "INVALID_USE_LOWER_TF"
 
 //------------------------------------------------------------------------------
 // Component scores — diagnostic API for downstream engines
@@ -254,7 +262,7 @@ plotshape(showStateMarks and state == "COMPRESSION", title="Compression", style=
 //------------------------------------------------------------------------------
 // Diagnostic table
 //------------------------------------------------------------------------------
-var table diag = table.new(position.top_right, 2, 22, border_width=1, frame_width=1, bgcolor=color.new(color.black, 15))
+var table diag = table.new(position.top_right, 2, 24, border_width=1, frame_width=1, bgcolor=color.new(color.black, 15))
 
 f_setRow(int row, string labelText, string valueText) =>
     table.cell(diag, 0, row, labelText, text_color=color.silver, bgcolor=color.new(color.black, 15), text_halign=text.align_left)
@@ -262,28 +270,30 @@ f_setRow(int row, string labelText, string valueText) =>
 
 if barstate.islast
     if showTable
-        table.clear(diag, 0, 0, 1, 21)
+        table.clear(diag, 0, 0, 1, 23)
         f_setRow(0, "PLUTUS", "P01.3 Unified")
         f_setRow(1, "Volume Type", str.tostring(volumeType))
         f_setRow(2, "Lower TF", ltfTf)
-        f_setRow(3, "Intrabars", str.tostring(intrabarCount))
-        f_setRow(4, "RVOL", not na(rvol) ? str.tostring(rvol, "#.##") : "N/A")
-        f_setRow(5, "Vol Z", not na(volZ) ? str.tostring(volZ, "#.##") : "N/A")
-        f_setRow(6, "Body / ATR", not na(bodyAtr) ? str.tostring(bodyAtr, "#.##") : "N/A")
-        f_setRow(7, "Range / ATR", not na(rangeAtr) ? str.tostring(rangeAtr, "#.##") : "N/A")
-        f_setRow(8, "Disp / ATR", not na(displacementAtr) ? str.tostring(displacementAtr, "#.##") : "N/A")
-        f_setRow(9, "Close Location", str.tostring(closeLocation, "#.##"))
-        f_setRow(10, "Price Efficiency", not na(priceEfficiency) ? str.tostring(priceEfficiency, "#.##") : "N/A")
-        f_setRow(11, "Est Delta %", proxyAvailable ? str.tostring(estDeltaPct * 100.0, "#.##") + "%" : "N/A")
-        f_setRow(12, "Flow Bias", proxyBullish ? "BULLISH" : proxyBearish ? "BEARISH" : proxyBalanced ? "BALANCED" : "N/A")
-        f_setRow(13, "Effort Score", str.tostring(effortScore))
-        f_setRow(14, "Result Score", str.tostring(resultScore))
-        f_setRow(15, "Flow Score", str.tostring(flowScore))
-        f_setRow(16, "Net Score", str.tostring(netParticipationScore))
-        f_setRow(17, "High Effort", highEffort ? "YES" : "NO")
-        f_setRow(18, "Extreme Effort", (extremeEffort or extremeZ) ? "YES" : "NO")
-        f_setRow(19, "Confirm Bars", str.tostring(persistenceBars))
-        f_setRow(20, "Confirmed Bar", barstate.isconfirmed ? "YES" : "NO")
-        f_setRow(21, "State", state)
+        f_setRow(3, "LTF Status", ltfStatus)
+        f_setRow(4, "Intrabars", str.tostring(intrabarCount))
+        f_setRow(5, "Proxy Available", proxyAvailable ? "YES" : "NO")
+        f_setRow(6, "RVOL", not na(rvol) ? str.tostring(rvol, "#.##") : "N/A")
+        f_setRow(7, "Vol Z", not na(volZ) ? str.tostring(volZ, "#.##") : "N/A")
+        f_setRow(8, "Body / ATR", not na(bodyAtr) ? str.tostring(bodyAtr, "#.##") : "N/A")
+        f_setRow(9, "Range / ATR", not na(rangeAtr) ? str.tostring(rangeAtr, "#.##") : "N/A")
+        f_setRow(10, "Disp / ATR", not na(displacementAtr) ? str.tostring(displacementAtr, "#.##") : "N/A")
+        f_setRow(11, "Close Location", str.tostring(closeLocation, "#.##"))
+        f_setRow(12, "Price Efficiency", not na(priceEfficiency) ? str.tostring(priceEfficiency, "#.##") : "N/A")
+        f_setRow(13, "Est Delta %", proxyAvailable ? str.tostring(estDeltaPct * 100.0, "#.##") + "%" : "N/A")
+        f_setRow(14, "Flow Bias", proxyBullish ? "BULLISH" : proxyBearish ? "BEARISH" : proxyBalanced ? "BALANCED" : "N/A")
+        f_setRow(15, "Effort Score", str.tostring(effortScore))
+        f_setRow(16, "Result Score", str.tostring(resultScore))
+        f_setRow(17, "Flow Score", str.tostring(flowScore))
+        f_setRow(18, "Net Score", str.tostring(netParticipationScore))
+        f_setRow(19, "High Effort", highEffort ? "YES" : "NO")
+        f_setRow(20, "Extreme Effort", (extremeEffort or extremeZ) ? "YES" : "NO")
+        f_setRow(21, "Confirm Bars", str.tostring(persistenceBars))
+        f_setRow(22, "Confirmed Bar", barstate.isconfirmed ? "YES" : "NO")
+        f_setRow(23, "State", state)
     else
-        table.clear(diag, 0, 0, 1, 21)
+        table.clear(diag, 0, 0, 1, 23)
