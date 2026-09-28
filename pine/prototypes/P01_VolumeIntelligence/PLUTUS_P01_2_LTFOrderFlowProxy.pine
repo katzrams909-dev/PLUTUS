@@ -84,7 +84,7 @@ bool bearishBar = close < open
 // Each lower-timeframe candle's volume is assigned to estimated buy volume when
 // close > open, estimated sell volume when close < open, and split evenly when
 // close == open. This is a directional-volume proxy, not exchange bid/ask data.
-[array<float> ltfOpen, array<float> ltfClose, array<float> ltfVolume] = request.security_lower_tf(
+[ltfOpen, ltfClose, ltfVolume] = request.security_lower_tf(
      syminfo.tickerid,
      ltfTf,
      [open, close, volume],
