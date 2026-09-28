@@ -1,0 +1,227 @@
+//@version=6
+indicator("PLUTUS P01.2 — LTF Order-Flow Proxy", shorttitle="PLUTUS P01.2", overlay=false, max_labels_count=100)
+
+//==============================================================================
+// PLUTUS P01.2 — Lower-Timeframe Order-Flow Proxy
+// Purpose: enrich P01.1 participation states with estimated intrabar directional
+//          volume using request.security_lower_tf().
+//
+// IMPORTANT:
+// - This is NOT true bid/ask footprint volume.
+// - Buy/sell volume is estimated from lower-timeframe candle direction.
+// - Final interpreted states are emitted only on confirmed chart bars.
+//==============================================================================
+
+//------------------------------------------------------------------------------
+// Inputs
+//------------------------------------------------------------------------------
+groupVolume = "Volume Normalization"
+volBaselineMode = input.string("SMA", "Baseline Type", options=["SMA", "EMA"], group=groupVolume)
+volBaselineLen  = input.int(20, "Baseline Length", minval=2, group=groupVolume)
+volZLen         = input.int(50, "Z-Score Length", minval=5, group=groupVolume)
+rvolLow         = input.float(0.70, "Low Effort RVOL <", minval=0.0, step=0.05, group=groupVolume)
+rvolHigh        = input.float(1.20, "High Effort RVOL >=", minval=0.0, step=0.05, group=groupVolume)
+volZAbnormal    = input.float(1.50, "Abnormal Volume Z >=", minval=0.0, step=0.10, group=groupVolume)
+
+groupResult = "Price Result"
+atrLen          = input.int(14, "ATR Length", minval=1, group=groupResult)
+bodyHigh        = input.float(0.80, "High Body / ATR >=", minval=0.0, step=0.05, group=groupResult)
+rangeHigh       = input.float(1.00, "High Range / ATR >=", minval=0.0, step=0.05, group=groupResult)
+bodyLow         = input.float(0.35, "Low Body / ATR <=", minval=0.0, step=0.05, group=groupResult)
+rangeLow        = input.float(0.65, "Low Range / ATR <=", minval=0.0, step=0.05, group=groupResult)
+closeExtremePct = input.float(0.20, "Close Near Extreme %", minval=0.01, maxval=0.49, step=0.01, group=groupResult)
+
+groupProxy = "Estimated Order Flow"
+ltfTf           = input.timeframe("1", "Lower Timeframe", group=groupProxy)
+deltaThreshold  = input.float(0.20, "Strong Delta % >=", minval=0.01, maxval=1.0, step=0.05, group=groupProxy)
+requireFlowForExpansion = input.bool(true, "Require Flow Agreement For Expansion", group=groupProxy)
+
+groupContext = "Context / Persistence"
+persistenceBars = input.int(2, "Confirmation Bars", minval=1, maxval=5, group=groupContext)
+useZConfirm     = input.bool(true, "Use Z-Score as High-Effort Confirmation", group=groupContext)
+
+groupDisplay = "Display"
+showTable       = input.bool(true, "Show Diagnostic Table", group=groupDisplay)
+showStateMarks  = input.bool(false, "Show State Markers", group=groupDisplay)
+showDelta       = input.bool(false, "Plot Estimated Delta %", group=groupDisplay)
+showRvol        = input.bool(false, "Plot RVOL", group=groupDisplay)
+
+//------------------------------------------------------------------------------
+// Baseline volume normalization
+//------------------------------------------------------------------------------
+volumeAvailable = not na(volume)
+volumeType = syminfo.volumetype
+
+float volBaseline = switch volBaselineMode
+    "EMA" => ta.ema(volume, volBaselineLen)
+    => ta.sma(volume, volBaselineLen)
+
+float rvol = volumeAvailable and not na(volBaseline) and volBaseline != 0.0 ? volume / volBaseline : na
+float volMean = ta.sma(volume, volZLen)
+float volStdev = ta.stdev(volume, volZLen)
+float volZ = volumeAvailable and not na(volMean) and not na(volStdev) and volStdev != 0.0 ? (volume - volMean) / volStdev : na
+
+//------------------------------------------------------------------------------
+// Price-result measurements
+//------------------------------------------------------------------------------
+float atr = ta.atr(atrLen)
+float body = math.abs(close - open)
+float tr = ta.tr(true)
+float bodyAtr = not na(atr) and atr != 0.0 ? body / atr : na
+float rangeAtr = not na(atr) and atr != 0.0 ? tr / atr : na
+float displacementAtr = not na(atr) and atr != 0.0 ? math.abs(close - close[1]) / atr : na
+
+float barRange = high - low
+float closeLocation = barRange > 0.0 ? (close - low) / barRange : 0.5
+bool closeNearHigh = closeLocation >= 1.0 - closeExtremePct
+bool closeNearLow  = closeLocation <= closeExtremePct
+bool bullishBar = close > open
+bool bearishBar = close < open
+
+//------------------------------------------------------------------------------
+// Lower-timeframe directional-volume proxy
+//------------------------------------------------------------------------------
+// Each lower-timeframe candle's volume is assigned to estimated buy volume when
+// close > open, estimated sell volume when close < open, and split evenly when
+// close == open. This is a directional-volume proxy, not exchange bid/ask data.
+[array<float> ltfOpen, array<float> ltfClose, array<float> ltfVolume] = request.security_lower_tf(
+     syminfo.tickerid,
+     ltfTf,
+     [open, close, volume],
+     ignore_invalid_timeframe = true)
+
+int intrabarCount = array.size(ltfVolume)
+float estBuyVolume = 0.0
+float estSellVolume = 0.0
+
+if intrabarCount > 0
+    for i = 0 to intrabarCount - 1
+        float io = array.get(ltfOpen, i)
+        float ic = array.get(ltfClose, i)
+        float iv = array.get(ltfVolume, i)
+        if not na(iv)
+            if ic > io
+                estBuyVolume += iv
+            else if ic < io
+                estSellVolume += iv
+            else
+                estBuyVolume += iv * 0.5
+                estSellVolume += iv * 0.5
+
+float estTotalVolume = estBuyVolume + estSellVolume
+float estDelta = estBuyVolume - estSellVolume
+float estDeltaPct = estTotalVolume > 0.0 ? estDelta / estTotalVolume : na
+bool proxyAvailable = intrabarCount > 0 and estTotalVolume > 0.0 and not na(estDeltaPct)
+bool proxyBullish = proxyAvailable and estDeltaPct >= deltaThreshold
+bool proxyBearish = proxyAvailable and estDeltaPct <= -deltaThreshold
+bool proxyBalanced = proxyAvailable and math.abs(estDeltaPct) < deltaThreshold
+
+//------------------------------------------------------------------------------
+// Effort / result classification
+//------------------------------------------------------------------------------
+bool abnormalZ = not na(volZ) and volZ >= volZAbnormal
+bool highEffort = not na(rvol) and (rvol >= rvolHigh or (useZConfirm and abnormalZ))
+bool lowEffort = not na(rvol) and rvol < rvolLow
+
+bool highDirectionalResult = not na(bodyAtr) and not na(rangeAtr) and bodyAtr >= bodyHigh and rangeAtr >= rangeHigh
+bool lowDirectionalResult  = not na(bodyAtr) and not na(rangeAtr) and bodyAtr <= bodyLow and rangeAtr <= rangeLow
+bool directionalClose = (bullishBar and closeNearHigh) or (bearishBar and closeNearLow)
+
+//------------------------------------------------------------------------------
+// Candidate states enriched by estimated order flow
+//------------------------------------------------------------------------------
+bool expansionFlowAgreement = not proxyAvailable or not requireFlowForExpansion or
+     (bullishBar and proxyBullish) or (bearishBar and proxyBearish)
+
+bool efficientExpansionCandidate = highEffort and highDirectionalResult and directionalClose and expansionFlowAgreement
+
+// Bullish absorption: estimated selling pressure is strong but downside result is
+// weak or price closes away from the low.
+bool downsideFailure = lowDirectionalResult or closeLocation >= 0.50
+bool bullishAbsorptionCandidate = highEffort and proxyBearish and downsideFailure
+
+// Bearish absorption: estimated buying pressure is strong but upside result is
+// weak or price closes away from the high.
+bool upsideFailure = lowDirectionalResult or closeLocation <= 0.50
+bool bearishAbsorptionCandidate = highEffort and proxyBullish and upsideFailure
+
+bool liquidityVacuumCandidate = lowEffort and highDirectionalResult and directionalClose
+bool compressionCandidate = lowEffort and lowDirectionalResult
+
+//------------------------------------------------------------------------------
+// Persistence helper
+//------------------------------------------------------------------------------
+f_confirm(bool condition, int bars) =>
+    float ratio = ta.sma(condition ? 1.0 : 0.0, bars)
+    not na(ratio) and ratio >= 1.0
+
+bool efficientExpansion = f_confirm(efficientExpansionCandidate, persistenceBars)
+bool bullishAbsorption = f_confirm(bullishAbsorptionCandidate, persistenceBars)
+bool bearishAbsorption = f_confirm(bearishAbsorptionCandidate, persistenceBars)
+bool liquidityVacuum = f_confirm(liquidityVacuumCandidate, persistenceBars)
+bool compression = f_confirm(compressionCandidate, persistenceBars)
+
+//------------------------------------------------------------------------------
+// Confirmed state output
+//------------------------------------------------------------------------------
+string candidateState = "NEUTRAL"
+if not volumeAvailable or na(rvol) or na(bodyAtr) or na(rangeAtr)
+    candidateState := "UNAVAILABLE"
+else if bullishAbsorption
+    candidateState := "ABSORPTION_BULLISH"
+else if bearishAbsorption
+    candidateState := "ABSORPTION_BEARISH"
+else if efficientExpansion
+    candidateState := bullishBar ? "EXPANSION_BULLISH" : bearishBar ? "EXPANSION_BEARISH" : "EXPANSION"
+else if liquidityVacuum
+    candidateState := bullishBar ? "VACUUM_BULLISH" : bearishBar ? "VACUUM_BEARISH" : "LIQUIDITY_VACUUM"
+else if compression
+    candidateState := "COMPRESSION"
+
+string state = barstate.isconfirmed ? candidateState : "FORMING"
+
+//------------------------------------------------------------------------------
+// Diagnostics / plots
+//------------------------------------------------------------------------------
+plot(showDelta ? estDeltaPct : na, "Estimated Delta %", linewidth=2)
+plot(showRvol ? rvol : na, "RVOL", linewidth=2)
+hline(0.0, "Delta Zero", color=color.new(color.gray, 65), linestyle=hline.style_dotted)
+
+plotshape(showStateMarks and state == "ABSORPTION_BULLISH", title="Bullish Absorption", style=shape.triangleup, location=location.bottom, size=size.tiny, text="AB+")
+plotshape(showStateMarks and state == "ABSORPTION_BEARISH", title="Bearish Absorption", style=shape.triangledown, location=location.top, size=size.tiny, text="AB-")
+plotshape(showStateMarks and str.startswith(state, "EXPANSION"), title="Efficient Expansion", style=shape.circle, location=location.bottom, size=size.tiny, text="EXP")
+plotshape(showStateMarks and str.startswith(state, "VACUUM"), title="Liquidity Vacuum", style=shape.square, location=location.bottom, size=size.tiny, text="VAC")
+plotshape(showStateMarks and state == "COMPRESSION", title="Compression", style=shape.xcross, location=location.bottom, size=size.tiny, text="CMP")
+
+//------------------------------------------------------------------------------
+// Diagnostic table
+//------------------------------------------------------------------------------
+var table diag = table.new(position.top_right, 2, 18, border_width=1, frame_width=1, bgcolor=color.new(color.black, 15))
+
+f_setRow(int row, string labelText, string valueText) =>
+    table.cell(diag, 0, row, labelText, text_color=color.silver, bgcolor=color.new(color.black, 15), text_halign=text.align_left)
+    table.cell(diag, 1, row, valueText, text_color=color.white, bgcolor=color.new(color.black, 15), text_halign=text.align_right)
+
+if barstate.islast
+    if showTable
+        table.clear(diag, 0, 0, 1, 17)
+        f_setRow(0, "PLUTUS", "P01.2 LTF Proxy")
+        f_setRow(1, "Volume Type", str.tostring(volumeType))
+        f_setRow(2, "Lower TF", ltfTf)
+        f_setRow(3, "Intrabars", str.tostring(intrabarCount))
+        f_setRow(4, "Proxy Available", proxyAvailable ? "YES" : "NO")
+        f_setRow(5, "Est Buy Vol", proxyAvailable ? str.tostring(estBuyVolume, format.volume) : "N/A")
+        f_setRow(6, "Est Sell Vol", proxyAvailable ? str.tostring(estSellVolume, format.volume) : "N/A")
+        f_setRow(7, "Est Delta %", proxyAvailable ? str.tostring(estDeltaPct * 100.0, "#.##") + "%" : "N/A")
+        f_setRow(8, "Flow Bias", proxyBullish ? "BULLISH" : proxyBearish ? "BEARISH" : proxyBalanced ? "BALANCED" : "N/A")
+        f_setRow(9, "RVOL", not na(rvol) ? str.tostring(rvol, "#.##") : "N/A")
+        f_setRow(10, "Vol Z", not na(volZ) ? str.tostring(volZ, "#.##") : "N/A")
+        f_setRow(11, "Body / ATR", not na(bodyAtr) ? str.tostring(bodyAtr, "#.##") : "N/A")
+        f_setRow(12, "Range / ATR", not na(rangeAtr) ? str.tostring(rangeAtr, "#.##") : "N/A")
+        f_setRow(13, "Disp / ATR", not na(displacementAtr) ? str.tostring(displacementAtr, "#.##") : "N/A")
+        f_setRow(14, "Close Location", str.tostring(closeLocation, "#.##"))
+        f_setRow(15, "High Effort", highEffort ? "YES" : "NO")
+        f_setRow(16, "Confirmed Bar", barstate.isconfirmed ? "YES" : "NO")
+        f_setRow(17, "State", state)
+    else
+        table.clear(diag, 0, 0, 1, 17)
