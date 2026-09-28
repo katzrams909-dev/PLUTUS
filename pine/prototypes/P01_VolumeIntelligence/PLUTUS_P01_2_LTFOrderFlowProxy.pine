@@ -19,21 +19,21 @@ groupVolume = "Volume Normalization"
 volBaselineMode = input.string("SMA", "Baseline Type", options=["SMA", "EMA"], group=groupVolume)
 volBaselineLen  = input.int(20, "Baseline Length", minval=2, group=groupVolume)
 volZLen         = input.int(50, "Z-Score Length", minval=5, group=groupVolume)
-rvolLow         = input.float(0.70, "Low Effort RVOL <", minval=0.0, step=0.05, group=groupVolume)
-rvolHigh        = input.float(1.20, "High Effort RVOL >=", minval=0.0, step=0.05, group=groupVolume)
-volZAbnormal    = input.float(1.50, "Abnormal Volume Z >=", minval=0.0, step=0.10, group=groupVolume)
+rvolLow         = input.float(0.70, "Low Effort RVOL Threshold", minval=0.0, step=0.05, group=groupVolume)
+rvolHigh        = input.float(1.20, "High Effort RVOL Threshold", minval=0.0, step=0.05, group=groupVolume)
+volZAbnormal    = input.float(1.50, "Abnormal Volume Z Threshold", minval=0.0, step=0.10, group=groupVolume)
 
 groupResult = "Price Result"
 atrLen          = input.int(14, "ATR Length", minval=1, group=groupResult)
-bodyHigh        = input.float(0.80, "High Body / ATR >=", minval=0.0, step=0.05, group=groupResult)
-rangeHigh       = input.float(1.00, "High Range / ATR >=", minval=0.0, step=0.05, group=groupResult)
-bodyLow         = input.float(0.35, "Low Body / ATR <=", minval=0.0, step=0.05, group=groupResult)
-rangeLow        = input.float(0.65, "Low Range / ATR <=", minval=0.0, step=0.05, group=groupResult)
+bodyHigh        = input.float(0.80, "High Body / ATR Threshold", minval=0.0, step=0.05, group=groupResult)
+rangeHigh       = input.float(1.00, "High Range / ATR Threshold", minval=0.0, step=0.05, group=groupResult)
+bodyLow         = input.float(0.35, "Low Body / ATR Threshold", minval=0.0, step=0.05, group=groupResult)
+rangeLow        = input.float(0.65, "Low Range / ATR Threshold", minval=0.0, step=0.05, group=groupResult)
 closeExtremePct = input.float(0.20, "Close Near Extreme %", minval=0.01, maxval=0.49, step=0.01, group=groupResult)
 
 groupProxy = "Estimated Order Flow"
 ltfTf           = input.timeframe("1", "Lower Timeframe", group=groupProxy)
-deltaThreshold  = input.float(0.20, "Strong Delta % >=", minval=0.01, maxval=1.0, step=0.05, group=groupProxy)
+deltaThreshold  = input.float(0.20, "Strong Delta % Threshold", minval=0.01, maxval=1.0, step=0.05, group=groupProxy)
 requireFlowForExpansion = input.bool(true, "Require Flow Agreement For Expansion", group=groupProxy)
 
 groupContext = "Context / Persistence"
@@ -81,16 +81,13 @@ bool bearishBar = close < open
 //------------------------------------------------------------------------------
 // Lower-timeframe directional-volume proxy
 //------------------------------------------------------------------------------
-// Each lower-timeframe candle's volume is assigned to estimated buy volume when
-// close > open, estimated sell volume when close < open, and split evenly when
-// close == open. This is a directional-volume proxy, not exchange bid/ask data.
-[ltfOpen, ltfClose, ltfVolume] = request.security_lower_tf(
-     syminfo.tickerid,
-     ltfTf,
-     [open, close, volume],
-     ignore_invalid_timeframe = true)
+// Separate lower-timeframe requests are used deliberately to avoid tuple parser
+// compatibility issues. Each returned value is an array of intrabars.
+ltfOpen = request.security_lower_tf(syminfo.tickerid, ltfTf, open, ignore_invalid_timeframe=true)
+ltfClose = request.security_lower_tf(syminfo.tickerid, ltfTf, close, ignore_invalid_timeframe=true)
+ltfVolume = request.security_lower_tf(syminfo.tickerid, ltfTf, volume, ignore_invalid_timeframe=true)
 
-int intrabarCount = array.size(ltfVolume)
+int intrabarCount = math.min(array.size(ltfOpen), math.min(array.size(ltfClose), array.size(ltfVolume)))
 float estBuyVolume = 0.0
 float estSellVolume = 0.0
 
@@ -130,18 +127,12 @@ bool directionalClose = (bullishBar and closeNearHigh) or (bearishBar and closeN
 //------------------------------------------------------------------------------
 // Candidate states enriched by estimated order flow
 //------------------------------------------------------------------------------
-bool expansionFlowAgreement = not proxyAvailable or not requireFlowForExpansion or
-     (bullishBar and proxyBullish) or (bearishBar and proxyBearish)
-
+bool expansionFlowAgreement = not proxyAvailable or not requireFlowForExpansion or (bullishBar and proxyBullish) or (bearishBar and proxyBearish)
 bool efficientExpansionCandidate = highEffort and highDirectionalResult and directionalClose and expansionFlowAgreement
 
-// Bullish absorption: estimated selling pressure is strong but downside result is
-// weak or price closes away from the low.
 bool downsideFailure = lowDirectionalResult or closeLocation >= 0.50
 bool bullishAbsorptionCandidate = highEffort and proxyBearish and downsideFailure
 
-// Bearish absorption: estimated buying pressure is strong but upside result is
-// weak or price closes away from the high.
 bool upsideFailure = lowDirectionalResult or closeLocation <= 0.50
 bool bearishAbsorptionCandidate = highEffort and proxyBullish and upsideFailure
 
