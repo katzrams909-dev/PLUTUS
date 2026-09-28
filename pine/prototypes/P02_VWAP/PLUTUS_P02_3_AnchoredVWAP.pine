@@ -1,0 +1,363 @@
+//@version=6
+indicator("PLUTUS P02.3 — Anchored VWAP", shorttitle="PLUTUS P02.3", overlay=true, max_labels_count=100)
+
+//==============================================================================
+// PLUTUS P02.3 — Anchored VWAP Framework
+// Purpose: add event-based fair-value anchors without introducing repainting.
+// Swing anchors are activated only after pivot confirmation, but their cost basis
+// is calculated from the actual pivot bar.
+//==============================================================================
+
+//------------------------------------------------------------------------------
+// Inputs
+//------------------------------------------------------------------------------
+groupSource = "VWAP Source"
+source = input.source(hlc3, "Source", group=groupSource)
+
+groupTiming = "Timing / Timezone"
+timezoneInput = input.string("Exchange", "Session Timezone", options=["Exchange", "UTC-2", "UTC-1", "UTC+0", "UTC+1", "UTC+2", "America/New_York", "Europe/London", "Asia/Tokyo"], group=groupTiming)
+string sessionTz = timezoneInput == "Exchange" ? syminfo.timezone : timezoneInput
+
+groupAnchor = "Primary Anchor"
+anchorMode = input.string("Day Open", "Anchor Type", options=["Latest Swing High", "Latest Swing Low", "Asia Open", "London Open", "New York Open", "Day Open", "Week Open", "Month Open", "Manual Time"], group=groupAnchor)
+manualAnchorTime = input.time(timestamp("01 Jan 2026 00:00 +0000"), "Manual Anchor Time", group=groupAnchor)
+
+groupSwing = "Swing Anchors"
+pivotLeft = input.int(3, "Pivot Left Bars", minval=1, maxval=20, group=groupSwing)
+pivotRight = input.int(3, "Pivot Right Bars", minval=1, maxval=20, group=groupSwing)
+showSwingHighAvwap = input.bool(false, "Show Latest Swing-High AVWAP", group=groupSwing)
+showSwingLowAvwap = input.bool(false, "Show Latest Swing-Low AVWAP", group=groupSwing)
+
+groupBaseline = "Baseline VWAPs"
+showAsiaVwap = input.bool(false, "Show Asia VWAP", group=groupBaseline)
+showLondonVwap = input.bool(false, "Show London VWAP", group=groupBaseline)
+showNewYorkVwap = input.bool(false, "Show New York VWAP", group=groupBaseline)
+showDailyVwap = input.bool(true, "Show Daily VWAP", group=groupBaseline)
+showWeeklyVwap = input.bool(false, "Show Weekly VWAP", group=groupBaseline)
+showMonthlyVwap = input.bool(false, "Show Monthly VWAP", group=groupBaseline)
+
+groupContext = "Anchor Context"
+atrLen = input.int(14, "ATR Length", minval=1, group=groupContext)
+showDistanceState = input.bool(true, "Show Anchor Distance In Table", group=groupContext)
+
+groupDisplay = "Display"
+showPrimaryAvwap = input.bool(true, "Show Primary AVWAP", group=groupDisplay)
+showTable = input.bool(true, "Show Diagnostic Table", group=groupDisplay)
+lineWidth = input.int(2, "Line Width", minval=1, maxval=4, group=groupDisplay)
+
+//------------------------------------------------------------------------------
+// Fixed ARTHA sessions
+//------------------------------------------------------------------------------
+string asiaSession = "0000-0800:1234567"
+string londonSession = "0800-1630:1234567"
+string newYorkSession = "1330-2000:1234567"
+
+bool inAsia = not na(time(timeframe.period, asiaSession, sessionTz))
+bool inLondon = not na(time(timeframe.period, londonSession, sessionTz))
+bool inNewYork = not na(time(timeframe.period, newYorkSession, sessionTz))
+
+bool newAsia = inAsia and not inAsia[1]
+bool newLondon = inLondon and not inLondon[1]
+bool newNewYork = inNewYork and not inNewYork[1]
+
+//------------------------------------------------------------------------------
+// Fixed-session VWAPs
+//------------------------------------------------------------------------------
+var float asiaPV = na
+var float asiaVol = na
+if not inAsia
+    asiaPV := na
+    asiaVol := na
+else if newAsia or na(asiaPV) or na(asiaVol)
+    asiaPV := source * volume
+    asiaVol := volume
+else
+    asiaPV += source * volume
+    asiaVol += volume
+float asiaVwap = inAsia and not na(asiaVol) and asiaVol > 0.0 ? asiaPV / asiaVol : na
+
+var float londonPV = na
+var float londonVol = na
+if not inLondon
+    londonPV := na
+    londonVol := na
+else if newLondon or na(londonPV) or na(londonVol)
+    londonPV := source * volume
+    londonVol := volume
+else
+    londonPV += source * volume
+    londonVol += volume
+float londonVwap = inLondon and not na(londonVol) and londonVol > 0.0 ? londonPV / londonVol : na
+
+var float newYorkPV = na
+var float newYorkVol = na
+if not inNewYork
+    newYorkPV := na
+    newYorkVol := na
+else if newNewYork or na(newYorkPV) or na(newYorkVol)
+    newYorkPV := source * volume
+    newYorkVol := volume
+else
+    newYorkPV += source * volume
+    newYorkVol += volume
+float newYorkVwap = inNewYork and not na(newYorkVol) and newYorkVol > 0.0 ? newYorkPV / newYorkVol : na
+
+//------------------------------------------------------------------------------
+// D/W/M VWAPs in the shared timezone
+//------------------------------------------------------------------------------
+int localDay = dayofmonth(time, sessionTz)
+int localWeek = weekofyear(time, sessionTz)
+int localMonth = month(time, sessionTz)
+
+bool newDay = ta.change(localDay) != 0
+bool newWeek = ta.change(localWeek) != 0
+bool newMonth = ta.change(localMonth) != 0
+
+float dailyVwap = ta.vwap(source, barstate.isfirst or newDay)
+float weeklyVwap = ta.vwap(source, barstate.isfirst or newWeek)
+float monthlyVwap = ta.vwap(source, barstate.isfirst or newMonth)
+
+//------------------------------------------------------------------------------
+// Global cumulative price-volume and volume
+// Used to construct anchored VWAPs from event-specific cumulative baselines.
+//------------------------------------------------------------------------------
+float pv = source * volume
+float cumulativePV = ta.cum(pv)
+float cumulativeVol = ta.cum(volume)
+
+f_avwap(float basePV, float baseVol, bool active) =>
+    float denom = cumulativeVol - baseVol
+    active and not na(basePV) and not na(baseVol) and denom > 0.0 ? (cumulativePV - basePV) / denom : na
+
+//------------------------------------------------------------------------------
+// Time/session anchor baselines
+//------------------------------------------------------------------------------
+var float asiaBasePV = na
+var float asiaBaseVol = na
+var int asiaAnchorTime = na
+if newAsia
+    asiaBasePV := nz(cumulativePV[1], 0.0)
+    asiaBaseVol := nz(cumulativeVol[1], 0.0)
+    asiaAnchorTime := time
+
+var float londonBasePV = na
+var float londonBaseVol = na
+var int londonAnchorTime = na
+if newLondon
+    londonBasePV := nz(cumulativePV[1], 0.0)
+    londonBaseVol := nz(cumulativeVol[1], 0.0)
+    londonAnchorTime := time
+
+var float newYorkBasePV = na
+var float newYorkBaseVol = na
+var int newYorkAnchorTime = na
+if newNewYork
+    newYorkBasePV := nz(cumulativePV[1], 0.0)
+    newYorkBaseVol := nz(cumulativeVol[1], 0.0)
+    newYorkAnchorTime := time
+
+var float dayBasePV = na
+var float dayBaseVol = na
+var int dayAnchorTime = na
+if barstate.isfirst or newDay
+    dayBasePV := nz(cumulativePV[1], 0.0)
+    dayBaseVol := nz(cumulativeVol[1], 0.0)
+    dayAnchorTime := time
+
+var float weekBasePV = na
+var float weekBaseVol = na
+var int weekAnchorTime = na
+if barstate.isfirst or newWeek
+    weekBasePV := nz(cumulativePV[1], 0.0)
+    weekBaseVol := nz(cumulativeVol[1], 0.0)
+    weekAnchorTime := time
+
+var float monthBasePV = na
+var float monthBaseVol = na
+var int monthAnchorTime = na
+if barstate.isfirst or newMonth
+    monthBasePV := nz(cumulativePV[1], 0.0)
+    monthBaseVol := nz(cumulativeVol[1], 0.0)
+    monthAnchorTime := time
+
+//------------------------------------------------------------------------------
+// Manual timestamp anchor
+//------------------------------------------------------------------------------
+bool manualAnchorEvent = time >= manualAnchorTime and (na(time[1]) or time[1] < manualAnchorTime)
+var float manualBasePV = na
+var float manualBaseVol = na
+var int manualOriginTime = na
+if manualAnchorEvent
+    manualBasePV := nz(cumulativePV[1], 0.0)
+    manualBaseVol := nz(cumulativeVol[1], 0.0)
+    manualOriginTime := time
+
+//------------------------------------------------------------------------------
+// Confirmed swing anchors
+// Pivot is only known pivotRight bars later. We store the cumulative values from
+// immediately before the actual pivot bar, so the AVWAP cost basis starts there.
+//------------------------------------------------------------------------------
+float pivotHigh = ta.pivothigh(high, pivotLeft, pivotRight)
+float pivotLow = ta.pivotlow(low, pivotLeft, pivotRight)
+bool newSwingHigh = not na(pivotHigh)
+bool newSwingLow = not na(pivotLow)
+
+var float swingHighBasePV = na
+var float swingHighBaseVol = na
+var int swingHighAnchorTime = na
+if newSwingHigh
+    swingHighBasePV := nz(cumulativePV[pivotRight + 1], 0.0)
+    swingHighBaseVol := nz(cumulativeVol[pivotRight + 1], 0.0)
+    swingHighAnchorTime := time[pivotRight]
+
+var float swingLowBasePV = na
+var float swingLowBaseVol = na
+var int swingLowAnchorTime = na
+if newSwingLow
+    swingLowBasePV := nz(cumulativePV[pivotRight + 1], 0.0)
+    swingLowBaseVol := nz(cumulativeVol[pivotRight + 1], 0.0)
+    swingLowAnchorTime := time[pivotRight]
+
+float swingHighAvwap = f_avwap(swingHighBasePV, swingHighBaseVol, not na(swingHighAnchorTime))
+float swingLowAvwap = f_avwap(swingLowBasePV, swingLowBaseVol, not na(swingLowAnchorTime))
+
+//------------------------------------------------------------------------------
+// Primary anchor selection
+//------------------------------------------------------------------------------
+float primaryBasePV = na
+float primaryBaseVol = na
+int primaryAnchorTime = na
+bool primaryActive = false
+bool primaryReset = false
+
+switch anchorMode
+    "Latest Swing High" =>
+        primaryBasePV := swingHighBasePV
+        primaryBaseVol := swingHighBaseVol
+        primaryAnchorTime := swingHighAnchorTime
+        primaryActive := not na(swingHighAnchorTime)
+        primaryReset := newSwingHigh
+    "Latest Swing Low" =>
+        primaryBasePV := swingLowBasePV
+        primaryBaseVol := swingLowBaseVol
+        primaryAnchorTime := swingLowAnchorTime
+        primaryActive := not na(swingLowAnchorTime)
+        primaryReset := newSwingLow
+    "Asia Open" =>
+        primaryBasePV := asiaBasePV
+        primaryBaseVol := asiaBaseVol
+        primaryAnchorTime := asiaAnchorTime
+        primaryActive := not na(asiaAnchorTime)
+        primaryReset := newAsia
+    "London Open" =>
+        primaryBasePV := londonBasePV
+        primaryBaseVol := londonBaseVol
+        primaryAnchorTime := londonAnchorTime
+        primaryActive := not na(londonAnchorTime)
+        primaryReset := newLondon
+    "New York Open" =>
+        primaryBasePV := newYorkBasePV
+        primaryBaseVol := newYorkBaseVol
+        primaryAnchorTime := newYorkAnchorTime
+        primaryActive := not na(newYorkAnchorTime)
+        primaryReset := newNewYork
+    "Week Open" =>
+        primaryBasePV := weekBasePV
+        primaryBaseVol := weekBaseVol
+        primaryAnchorTime := weekAnchorTime
+        primaryActive := not na(weekAnchorTime)
+        primaryReset := newWeek
+    "Month Open" =>
+        primaryBasePV := monthBasePV
+        primaryBaseVol := monthBaseVol
+        primaryAnchorTime := monthAnchorTime
+        primaryActive := not na(monthAnchorTime)
+        primaryReset := newMonth
+    "Manual Time" =>
+        primaryBasePV := manualBasePV
+        primaryBaseVol := manualBaseVol
+        primaryAnchorTime := manualOriginTime
+        primaryActive := not na(manualOriginTime)
+        primaryReset := manualAnchorEvent
+    =>
+        primaryBasePV := dayBasePV
+        primaryBaseVol := dayBaseVol
+        primaryAnchorTime := dayAnchorTime
+        primaryActive := not na(dayAnchorTime)
+        primaryReset := newDay
+
+float primaryAvwap = f_avwap(primaryBasePV, primaryBaseVol, primaryActive)
+
+//------------------------------------------------------------------------------
+// Anchor context
+//------------------------------------------------------------------------------
+float atr = ta.atr(atrLen)
+float primaryDistanceAtr = not na(primaryAvwap) and not na(atr) and atr != 0.0 ? (close - primaryAvwap) / atr : na
+string anchorLocation = na(primaryDistanceAtr) ? "N/A" : primaryDistanceAtr > 0.0 ? "ABOVE" : primaryDistanceAtr < 0.0 ? "BELOW" : "AT VALUE"
+
+//------------------------------------------------------------------------------
+// Baseline plots
+//------------------------------------------------------------------------------
+float asiaPlot = showAsiaVwap ? asiaVwap : na
+float londonPlot = showLondonVwap ? londonVwap : na
+float newYorkPlot = showNewYorkVwap ? newYorkVwap : na
+float dailyPlot = showDailyVwap ? dailyVwap : na
+float weeklyPlot = showWeeklyVwap ? weeklyVwap : na
+float monthlyPlot = showMonthlyVwap ? monthlyVwap : na
+
+asiaPlot := newAsia ? na : asiaPlot
+londonPlot := newLondon ? na : londonPlot
+newYorkPlot := newNewYork ? na : newYorkPlot
+dailyPlot := newDay ? na : dailyPlot
+weeklyPlot := newWeek ? na : weeklyPlot
+monthlyPlot := newMonth ? na : monthlyPlot
+
+plot(asiaPlot, "Asia VWAP", linewidth=lineWidth, color=color.aqua, style=plot.style_linebr)
+plot(londonPlot, "London VWAP", linewidth=lineWidth, color=color.yellow, style=plot.style_linebr)
+plot(newYorkPlot, "New York VWAP", linewidth=lineWidth, color=color.orange, style=plot.style_linebr)
+plot(dailyPlot, "Daily VWAP", linewidth=lineWidth, color=color.white, style=plot.style_linebr)
+plot(weeklyPlot, "Weekly VWAP", linewidth=lineWidth, color=color.blue, style=plot.style_linebr)
+plot(monthlyPlot, "Monthly VWAP", linewidth=lineWidth, color=color.fuchsia, style=plot.style_linebr)
+
+//------------------------------------------------------------------------------
+// Anchored VWAP plots
+//------------------------------------------------------------------------------
+float primaryPlot = showPrimaryAvwap ? primaryAvwap : na
+primaryPlot := primaryReset ? na : primaryPlot
+
+float swingHighPlot = showSwingHighAvwap ? swingHighAvwap : na
+float swingLowPlot = showSwingLowAvwap ? swingLowAvwap : na
+swingHighPlot := newSwingHigh ? na : swingHighPlot
+swingLowPlot := newSwingLow ? na : swingLowPlot
+
+plot(primaryPlot, "Primary Anchored VWAP", linewidth=3, color=color.lime, style=plot.style_linebr)
+plot(swingHighPlot, "Swing High AVWAP", linewidth=1, color=color.new(color.red, 20), style=plot.style_linebr)
+plot(swingLowPlot, "Swing Low AVWAP", linewidth=1, color=color.new(color.green, 20), style=plot.style_linebr)
+
+//------------------------------------------------------------------------------
+// Diagnostics
+//------------------------------------------------------------------------------
+var table diag = table.new(position.top_right, 2, 13, border_width=1, frame_width=1, bgcolor=color.new(color.black, 15))
+
+f_setRow(int row, string labelText, string valueText) =>
+    table.cell(diag, 0, row, labelText, text_color=color.silver, bgcolor=color.new(color.black, 15), text_halign=text.align_left)
+    table.cell(diag, 1, row, valueText, text_color=color.white, bgcolor=color.new(color.black, 15), text_halign=text.align_right)
+
+if barstate.islast
+    if showTable
+        table.clear(diag, 0, 0, 1, 12)
+        f_setRow(0, "PLUTUS", "P02.3 Anchored VWAP")
+        f_setRow(1, "Timezone", sessionTz)
+        f_setRow(2, "Anchor Type", anchorMode)
+        f_setRow(3, "Anchor Active", primaryActive ? "YES" : "NO")
+        f_setRow(4, "Anchor Time", not na(primaryAnchorTime) ? str.tostring(primaryAnchorTime) : "N/A")
+        f_setRow(5, "Primary AVWAP", not na(primaryAvwap) ? str.tostring(primaryAvwap, format.mintick) : "N/A")
+        f_setRow(6, "Price vs Anchor", anchorLocation)
+        f_setRow(7, "Distance / ATR", showDistanceState and not na(primaryDistanceAtr) ? str.tostring(primaryDistanceAtr, "#.##") : "N/A")
+        f_setRow(8, "Swing High Ready", not na(swingHighAnchorTime) ? "YES" : "NO")
+        f_setRow(9, "Swing Low Ready", not na(swingLowAnchorTime) ? "YES" : "NO")
+        f_setRow(10, "New Swing High", newSwingHigh ? "YES" : "NO")
+        f_setRow(11, "New Swing Low", newSwingLow ? "YES" : "NO")
+        f_setRow(12, "Confirmed Bar", barstate.isconfirmed ? "YES" : "NO")
+    else
+        table.clear(diag, 0, 0, 1, 12)
