@@ -3,12 +3,16 @@ indicator("PLUTUS P02.0 — VWAP Baseline", shorttitle="PLUTUS P02.0", overlay=t
 
 //==============================================================================
 // PLUTUS P02.0 — VWAP / Institutional Fair Value Baseline
-// Purpose: establish clean, auditable session / daily / weekly / monthly VWAPs
+// Purpose: establish clean, auditable Asia / London / New York / D / W / M VWAPs
 //          before adding slope, deviation bands, anchored VWAP, or value states.
 //
 // Timing convention follows ARTHA:
-// - One shared sessionTz governs session windows and D/W/M calendar boundaries.
+// - One shared sessionTz governs all fixed session windows and D/W/M boundaries.
 // - "Exchange" resolves to syminfo.timezone.
+// - Fixed sessions:
+//      Asia     00:00-08:00
+//      London   08:00-16:30
+//      New York 13:30-20:00
 //==============================================================================
 
 //------------------------------------------------------------------------------
@@ -25,9 +29,10 @@ timezoneInput = input.string(
      group=groupTiming)
 string sessionTz = timezoneInput == "Exchange" ? syminfo.timezone : timezoneInput
 
-groupSession = "Session VWAP"
-showSessionVwap = input.bool(true, "Show Session VWAP", group=groupSession)
-sessionInput = input.session("0800-1700", "Session", group=groupSession)
+groupSessions = "Fixed Session VWAPs"
+showAsiaVwap = input.bool(true, "Show Asia VWAP", group=groupSessions)
+showLondonVwap = input.bool(true, "Show London VWAP", group=groupSessions)
+showNewYorkVwap = input.bool(true, "Show New York VWAP", group=groupSessions)
 
 groupHigher = "Higher-Period VWAPs"
 showDailyVwap = input.bool(true, "Show Daily VWAP", group=groupHigher)
@@ -40,30 +45,66 @@ lineWidth = input.int(2, "Line Width", minval=1, maxval=4, group=groupDisplay)
 breakLinesOnReset = input.bool(true, "Break Lines On Reset", group=groupDisplay)
 
 //------------------------------------------------------------------------------
+// Fixed ARTHA sessions
+//------------------------------------------------------------------------------
+string asiaSession = "0000-0800:1234567"
+string londonSession = "0800-1630:1234567"
+string newYorkSession = "1330-2000:1234567"
+
+bool inAsia = not na(time(timeframe.period, asiaSession, sessionTz))
+bool inLondon = not na(time(timeframe.period, londonSession, sessionTz))
+bool inNewYork = not na(time(timeframe.period, newYorkSession, sessionTz))
+
+bool newAsia = inAsia and not inAsia[1]
+bool newLondon = inLondon and not inLondon[1]
+bool newNewYork = inNewYork and not inNewYork[1]
+
+//------------------------------------------------------------------------------
 // Volume availability
 //------------------------------------------------------------------------------
 volumeAvailable = not na(volume)
 
 //------------------------------------------------------------------------------
-// Session VWAP — explicit cumulative implementation
+// Fixed-session VWAPs — explicit cumulative implementation
 //------------------------------------------------------------------------------
-bool inSession = not na(time(timeframe.period, sessionInput, sessionTz))
-bool newSession = inSession and not inSession[1]
-
-var float sessionPV = na
-var float sessionVol = na
-
-if not inSession
-    sessionPV := na
-    sessionVol := na
-else if newSession or na(sessionPV) or na(sessionVol)
-    sessionPV := source * volume
-    sessionVol := volume
+var float asiaPV = na
+var float asiaVol = na
+if not inAsia
+    asiaPV := na
+    asiaVol := na
+else if newAsia or na(asiaPV) or na(asiaVol)
+    asiaPV := source * volume
+    asiaVol := volume
 else
-    sessionPV += source * volume
-    sessionVol += volume
+    asiaPV += source * volume
+    asiaVol += volume
+float asiaVwap = inAsia and not na(asiaVol) and asiaVol > 0.0 ? asiaPV / asiaVol : na
 
-float sessionVwap = inSession and not na(sessionVol) and sessionVol > 0.0 ? sessionPV / sessionVol : na
+var float londonPV = na
+var float londonVol = na
+if not inLondon
+    londonPV := na
+    londonVol := na
+else if newLondon or na(londonPV) or na(londonVol)
+    londonPV := source * volume
+    londonVol := volume
+else
+    londonPV += source * volume
+    londonVol += volume
+float londonVwap = inLondon and not na(londonVol) and londonVol > 0.0 ? londonPV / londonVol : na
+
+var float newYorkPV = na
+var float newYorkVol = na
+if not inNewYork
+    newYorkPV := na
+    newYorkVol := na
+else if newNewYork or na(newYorkPV) or na(newYorkVol)
+    newYorkPV := source * volume
+    newYorkVol := volume
+else
+    newYorkPV += source * volume
+    newYorkVol += volume
+float newYorkVwap = inNewYork and not na(newYorkVol) and newYorkVol > 0.0 ? newYorkPV / newYorkVol : na
 
 //------------------------------------------------------------------------------
 // D/W/M calendar boundaries in the shared ARTHA timezone
@@ -87,27 +128,35 @@ float monthlyVwap = ta.vwap(source, monthAnchor)
 //------------------------------------------------------------------------------
 // Plot helpers
 //------------------------------------------------------------------------------
-float sessionPlot = showSessionVwap ? sessionVwap : na
+float asiaPlot = showAsiaVwap ? asiaVwap : na
+float londonPlot = showLondonVwap ? londonVwap : na
+float newYorkPlot = showNewYorkVwap ? newYorkVwap : na
 float dailyPlot = showDailyVwap ? dailyVwap : na
 float weeklyPlot = showWeeklyVwap ? weeklyVwap : na
 float monthlyPlot = showMonthlyVwap ? monthlyVwap : na
 
-sessionPlot := breakLinesOnReset and newSession ? na : sessionPlot
+asiaPlot := breakLinesOnReset and newAsia ? na : asiaPlot
+londonPlot := breakLinesOnReset and newLondon ? na : londonPlot
+newYorkPlot := breakLinesOnReset and newNewYork ? na : newYorkPlot
 dailyPlot := breakLinesOnReset and newDay ? na : dailyPlot
 weeklyPlot := breakLinesOnReset and newWeek ? na : weeklyPlot
 monthlyPlot := breakLinesOnReset and newMonth ? na : monthlyPlot
 
-plot(sessionPlot, "Session VWAP", linewidth=lineWidth, color=color.aqua, style=plot.style_linebr)
-plot(dailyPlot, "Daily VWAP", linewidth=lineWidth, color=color.yellow, style=plot.style_linebr)
-plot(weeklyPlot, "Weekly VWAP", linewidth=lineWidth, color=color.orange, style=plot.style_linebr)
+plot(asiaPlot, "Asia VWAP", linewidth=lineWidth, color=color.aqua, style=plot.style_linebr)
+plot(londonPlot, "London VWAP", linewidth=lineWidth, color=color.yellow, style=plot.style_linebr)
+plot(newYorkPlot, "New York VWAP", linewidth=lineWidth, color=color.orange, style=plot.style_linebr)
+plot(dailyPlot, "Daily VWAP", linewidth=lineWidth, color=color.white, style=plot.style_linebr)
+plot(weeklyPlot, "Weekly VWAP", linewidth=lineWidth, color=color.blue, style=plot.style_linebr)
 plot(monthlyPlot, "Monthly VWAP", linewidth=lineWidth, color=color.fuchsia, style=plot.style_linebr)
 
 //------------------------------------------------------------------------------
 // Diagnostics
 //------------------------------------------------------------------------------
-string sessionState = inSession ? "ACTIVE" : "CLOSED"
+string asiaState = inAsia ? "ACTIVE" : "CLOSED"
+string londonState = inLondon ? "ACTIVE" : "CLOSED"
+string newYorkState = inNewYork ? "ACTIVE" : "CLOSED"
 
-var table diag = table.new(position.top_right, 2, 11, border_width=1, frame_width=1, bgcolor=color.new(color.black, 15))
+var table diag = table.new(position.top_right, 2, 15, border_width=1, frame_width=1, bgcolor=color.new(color.black, 15))
 
 f_setRow(int row, string labelText, string valueText) =>
     table.cell(diag, 0, row, labelText, text_color=color.silver, bgcolor=color.new(color.black, 15), text_halign=text.align_left)
@@ -115,17 +164,21 @@ f_setRow(int row, string labelText, string valueText) =>
 
 if barstate.islast
     if showTable
-        table.clear(diag, 0, 0, 1, 10)
+        table.clear(diag, 0, 0, 1, 14)
         f_setRow(0, "PLUTUS", "P02.0 VWAP")
         f_setRow(1, "Timezone", sessionTz)
         f_setRow(2, "Volume", volumeAvailable ? "AVAILABLE" : "UNAVAILABLE")
-        f_setRow(3, "Session", sessionState)
-        f_setRow(4, "Session VWAP", not na(sessionVwap) ? str.tostring(sessionVwap, format.mintick) : "N/A")
-        f_setRow(5, "Daily VWAP", not na(dailyVwap) ? str.tostring(dailyVwap, format.mintick) : "N/A")
-        f_setRow(6, "Weekly VWAP", not na(weeklyVwap) ? str.tostring(weeklyVwap, format.mintick) : "N/A")
-        f_setRow(7, "Monthly VWAP", not na(monthlyVwap) ? str.tostring(monthlyVwap, format.mintick) : "N/A")
-        f_setRow(8, "New Day", newDay ? "YES" : "NO")
-        f_setRow(9, "New Week", newWeek ? "YES" : "NO")
-        f_setRow(10, "New Month", newMonth ? "YES" : "NO")
+        f_setRow(3, "Asia", asiaState)
+        f_setRow(4, "Asia VWAP", not na(asiaVwap) ? str.tostring(asiaVwap, format.mintick) : "N/A")
+        f_setRow(5, "London", londonState)
+        f_setRow(6, "London VWAP", not na(londonVwap) ? str.tostring(londonVwap, format.mintick) : "N/A")
+        f_setRow(7, "New York", newYorkState)
+        f_setRow(8, "New York VWAP", not na(newYorkVwap) ? str.tostring(newYorkVwap, format.mintick) : "N/A")
+        f_setRow(9, "Daily VWAP", not na(dailyVwap) ? str.tostring(dailyVwap, format.mintick) : "N/A")
+        f_setRow(10, "Weekly VWAP", not na(weeklyVwap) ? str.tostring(weeklyVwap, format.mintick) : "N/A")
+        f_setRow(11, "Monthly VWAP", not na(monthlyVwap) ? str.tostring(monthlyVwap, format.mintick) : "N/A")
+        f_setRow(12, "New Day", newDay ? "YES" : "NO")
+        f_setRow(13, "New Week", newWeek ? "YES" : "NO")
+        f_setRow(14, "New Month", newMonth ? "YES" : "NO")
     else
-        table.clear(diag, 0, 0, 1, 10)
+        table.clear(diag, 0, 0, 1, 14)
