@@ -1,0 +1,124 @@
+//@version=6
+indicator("PLUTUS P01.0 — Volume Intelligence", shorttitle="PLUTUS P01.0", overlay=false, max_labels_count=100)
+
+//==============================================================================
+// PLUTUS P01.0 — Baseline Volume Normalization
+// Purpose: establish normalized participation measurements before higher-order
+//          absorption, exhaustion, footprint, confluence, or signal logic.
+//==============================================================================
+
+//------------------------------------------------------------------------------
+// Inputs
+//------------------------------------------------------------------------------
+groupVolume = "Volume Normalization"
+volBaselineMode = input.string("SMA", "Baseline Type", options=["SMA", "EMA"], group=groupVolume)
+volBaselineLen  = input.int(20, "Baseline Length", minval=2, group=groupVolume)
+volZLen         = input.int(50, "Z-Score Length", minval=5, group=groupVolume)
+
+rvolContraction = input.float(0.70, "RVOL Contraction <", minval=0.0, step=0.05, group=groupVolume)
+rvolExpansion   = input.float(1.20, "RVOL Expansion >=", minval=0.0, step=0.05, group=groupVolume)
+rvolClimax      = input.float(1.80, "RVOL Climax Candidate >=", minval=0.0, step=0.05, group=groupVolume)
+
+groupPrice = "Price Result"
+atrLen = input.int(14, "ATR Length", minval=1, group=groupPrice)
+
+showVol      = input.bool(true, "Plot Raw Volume", group="Display")
+showBaseline = input.bool(true, "Plot Volume Baseline", group="Display")
+showRvol     = input.bool(false, "Plot RVOL", group="Display")
+showZ        = input.bool(false, "Plot Volume Z-Score", group="Display")
+showTable    = input.bool(true, "Show Diagnostic Table", group="Display")
+
+//------------------------------------------------------------------------------
+// Volume availability and metadata
+//------------------------------------------------------------------------------
+volumeAvailable = not na(volume)
+volumeType = syminfo.volumetype
+
+//------------------------------------------------------------------------------
+// Core normalization
+//------------------------------------------------------------------------------
+float volBaseline = switch volBaselineMode
+    "EMA" => ta.ema(volume, volBaselineLen)
+    => ta.sma(volume, volBaselineLen)
+
+float rvol = volumeAvailable and not na(volBaseline) and volBaseline != 0.0 ? volume / volBaseline : na
+
+float volMean = ta.sma(volume, volZLen)
+float volStdev = ta.stdev(volume, volZLen)
+float volZ = volumeAvailable and not na(volMean) and not na(volStdev) and volStdev != 0.0 ? (volume - volMean) / volStdev : na
+
+//------------------------------------------------------------------------------
+// Price-result diagnostics
+//------------------------------------------------------------------------------
+float atr = ta.atr(atrLen)
+float body = math.abs(close - open)
+float trueRange = ta.tr(true)
+float bodyAtr = not na(atr) and atr != 0.0 ? body / atr : na
+float rangeAtr = not na(atr) and atr != 0.0 ? trueRange / atr : na
+
+//------------------------------------------------------------------------------
+// Participation regime — intentionally simple for P01.0
+//------------------------------------------------------------------------------
+string volumeRegime = "UNAVAILABLE"
+if volumeAvailable and not na(rvol)
+    volumeRegime := rvol >= rvolClimax ? "CLIMAX_CANDIDATE" :
+         rvol >= rvolExpansion ? "EXPANSION" :
+         rvol < rvolContraction ? "CONTRACTION" :
+         "NORMAL"
+
+//------------------------------------------------------------------------------
+// Simple effort/result quadrant — diagnostic only
+// High effort = RVOL expansion threshold or above.
+// High result = body >= 1 ATR.
+// These are temporary prototype definitions and NOT final institutional logic.
+//------------------------------------------------------------------------------
+bool highEffort = not na(rvol) and rvol >= rvolExpansion
+bool lowEffort  = not na(rvol) and rvol < rvolContraction
+bool highResult = not na(bodyAtr) and bodyAtr >= 1.0
+bool lowResult  = not na(bodyAtr) and bodyAtr < 0.50
+
+string effortResult = "NEUTRAL"
+if not volumeAvailable or na(rvol) or na(bodyAtr)
+    effortResult := "UNAVAILABLE"
+else if highEffort and highResult
+    effortResult := "HIGH_EFFORT_HIGH_RESULT"
+else if highEffort and lowResult
+    effortResult := "HIGH_EFFORT_LOW_RESULT"
+else if lowEffort and highResult
+    effortResult := "LOW_EFFORT_HIGH_RESULT"
+else if lowEffort and lowResult
+    effortResult := "LOW_EFFORT_LOW_RESULT"
+
+//------------------------------------------------------------------------------
+// Plots
+//------------------------------------------------------------------------------
+plot(showVol ? volume : na, "Raw Volume", style=plot.style_columns)
+plot(showBaseline ? volBaseline : na, "Volume Baseline", linewidth=2)
+plot(showRvol ? rvol : na, "RVOL", linewidth=2)
+plot(showZ ? volZ : na, "Volume Z-Score", linewidth=2)
+
+//------------------------------------------------------------------------------
+// Diagnostic table
+//------------------------------------------------------------------------------
+var table diag = table.new(position.top_right, 2, 11, border_width=1)
+
+f_setRow(int row, string labelText, string valueText) =>
+    table.cell(diag, 0, row, labelText, text_halign=text.align_left)
+    table.cell(diag, 1, row, valueText, text_halign=text.align_right)
+
+if barstate.islast
+    if showTable
+        table.clear(diag, 0, 0, 1, 10)
+        f_setRow(0, "PLUTUS", "P01.0")
+        f_setRow(1, "Volume Type", str.tostring(volumeType))
+        f_setRow(2, "Raw Volume", volumeAvailable ? str.tostring(volume, format.volume) : "N/A")
+        f_setRow(3, "Baseline", not na(volBaseline) ? str.tostring(volBaseline, format.volume) : "N/A")
+        f_setRow(4, "RVOL", not na(rvol) ? str.tostring(rvol, "#.##") : "N/A")
+        f_setRow(5, "Vol Z", not na(volZ) ? str.tostring(volZ, "#.##") : "N/A")
+        f_setRow(6, "ATR", not na(atr) ? str.tostring(atr, format.mintick) : "N/A")
+        f_setRow(7, "Body / ATR", not na(bodyAtr) ? str.tostring(bodyAtr, "#.##") : "N/A")
+        f_setRow(8, "Range / ATR", not na(rangeAtr) ? str.tostring(rangeAtr, "#.##") : "N/A")
+        f_setRow(9, "Volume Regime", volumeRegime)
+        f_setRow(10, "Effort / Result", effortResult)
+    else
+        table.clear(diag, 0, 0, 1, 10)
