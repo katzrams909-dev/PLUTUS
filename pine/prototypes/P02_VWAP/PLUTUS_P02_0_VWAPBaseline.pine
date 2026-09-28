@@ -5,6 +5,10 @@ indicator("PLUTUS P02.0 — VWAP Baseline", shorttitle="PLUTUS P02.0", overlay=t
 // PLUTUS P02.0 — VWAP / Institutional Fair Value Baseline
 // Purpose: establish clean, auditable session / daily / weekly / monthly VWAPs
 //          before adding slope, deviation bands, anchored VWAP, or value states.
+//
+// Timing convention follows ARTHA:
+// - One shared sessionTz governs session windows and D/W/M calendar boundaries.
+// - "Exchange" resolves to syminfo.timezone.
 //==============================================================================
 
 //------------------------------------------------------------------------------
@@ -13,10 +17,17 @@ indicator("PLUTUS P02.0 — VWAP Baseline", shorttitle="PLUTUS P02.0", overlay=t
 groupSource = "VWAP Source"
 source = input.source(hlc3, "Source", group=groupSource)
 
+groupTiming = "Timing / Timezone"
+timezoneInput = input.string(
+     "Exchange",
+     "Session Timezone",
+     options=["Exchange", "UTC-2", "UTC-1", "UTC+0", "UTC+1", "UTC+2", "America/New_York", "Europe/London", "Asia/Tokyo"],
+     group=groupTiming)
+string sessionTz = timezoneInput == "Exchange" ? syminfo.timezone : timezoneInput
+
 groupSession = "Session VWAP"
 showSessionVwap = input.bool(true, "Show Session VWAP", group=groupSession)
 sessionInput = input.session("0800-1700", "Session", group=groupSession)
-sessionTimezone = input.string("Etc/UTC", "Session Timezone", group=groupSession)
 
 groupHigher = "Higher-Period VWAPs"
 showDailyVwap = input.bool(true, "Show Daily VWAP", group=groupHigher)
@@ -36,7 +47,7 @@ volumeAvailable = not na(volume)
 //------------------------------------------------------------------------------
 // Session VWAP — explicit cumulative implementation
 //------------------------------------------------------------------------------
-bool inSession = not na(time(timeframe.period, sessionInput, sessionTimezone))
+bool inSession = not na(time(timeframe.period, sessionInput, sessionTz))
 bool newSession = inSession and not inSession[1]
 
 var float sessionPV = na
@@ -55,32 +66,36 @@ else
 float sessionVwap = inSession and not na(sessionVol) and sessionVol > 0.0 ? sessionPV / sessionVol : na
 
 //------------------------------------------------------------------------------
-// Daily / Weekly / Monthly anchored VWAPs
+// D/W/M calendar boundaries in the shared ARTHA timezone
 //------------------------------------------------------------------------------
-bool newDay = timeframe.change("1D")
-bool newWeek = timeframe.change("1W")
-bool newMonth = timeframe.change("1M")
+int localDay = dayofmonth(time, sessionTz)
+int localWeek = weekofyear(time, sessionTz)
+int localMonth = month(time, sessionTz)
 
-float dailyVwap = ta.vwap(source, newDay)
-float weeklyVwap = ta.vwap(source, newWeek)
-float monthlyVwap = ta.vwap(source, newMonth)
+bool newDay = ta.change(localDay) != 0
+bool newWeek = ta.change(localWeek) != 0
+bool newMonth = ta.change(localMonth) != 0
+
+bool dayAnchor = barstate.isfirst or newDay
+bool weekAnchor = barstate.isfirst or newWeek
+bool monthAnchor = barstate.isfirst or newMonth
+
+float dailyVwap = ta.vwap(source, dayAnchor)
+float weeklyVwap = ta.vwap(source, weekAnchor)
+float monthlyVwap = ta.vwap(source, monthAnchor)
 
 //------------------------------------------------------------------------------
 // Plot helpers
 //------------------------------------------------------------------------------
-// IMPORTANT: plot.style_linebr is required here. The default plot.style_line can
-// visually bridge across na values, creating false vertical/diagonal joins at
-// reset boundaries even when the underlying VWAP state resets correctly.
 float sessionPlot = showSessionVwap ? sessionVwap : na
 float dailyPlot = showDailyVwap ? dailyVwap : na
 float weeklyPlot = showWeeklyVwap ? weeklyVwap : na
 float monthlyPlot = showMonthlyVwap ? monthlyVwap : na
 
-if breakLinesOnReset
-    sessionPlot := newSession ? na : sessionPlot
-    dailyPlot := newDay ? na : dailyPlot
-    weeklyPlot := newWeek ? na : weeklyPlot
-    monthlyPlot := newMonth ? na : monthlyPlot
+sessionPlot := breakLinesOnReset and newSession ? na : sessionPlot
+dailyPlot := breakLinesOnReset and newDay ? na : dailyPlot
+weeklyPlot := breakLinesOnReset and newWeek ? na : weeklyPlot
+monthlyPlot := breakLinesOnReset and newMonth ? na : monthlyPlot
 
 plot(sessionPlot, "Session VWAP", linewidth=lineWidth, color=color.aqua, style=plot.style_linebr)
 plot(dailyPlot, "Daily VWAP", linewidth=lineWidth, color=color.yellow, style=plot.style_linebr)
@@ -92,7 +107,7 @@ plot(monthlyPlot, "Monthly VWAP", linewidth=lineWidth, color=color.fuchsia, styl
 //------------------------------------------------------------------------------
 string sessionState = inSession ? "ACTIVE" : "CLOSED"
 
-var table diag = table.new(position.top_right, 2, 10, border_width=1, frame_width=1, bgcolor=color.new(color.black, 15))
+var table diag = table.new(position.top_right, 2, 11, border_width=1, frame_width=1, bgcolor=color.new(color.black, 15))
 
 f_setRow(int row, string labelText, string valueText) =>
     table.cell(diag, 0, row, labelText, text_color=color.silver, bgcolor=color.new(color.black, 15), text_halign=text.align_left)
@@ -100,16 +115,17 @@ f_setRow(int row, string labelText, string valueText) =>
 
 if barstate.islast
     if showTable
-        table.clear(diag, 0, 0, 1, 9)
+        table.clear(diag, 0, 0, 1, 10)
         f_setRow(0, "PLUTUS", "P02.0 VWAP")
-        f_setRow(1, "Volume", volumeAvailable ? "AVAILABLE" : "UNAVAILABLE")
-        f_setRow(2, "Session", sessionState)
-        f_setRow(3, "Session VWAP", not na(sessionVwap) ? str.tostring(sessionVwap, format.mintick) : "N/A")
-        f_setRow(4, "Daily VWAP", not na(dailyVwap) ? str.tostring(dailyVwap, format.mintick) : "N/A")
-        f_setRow(5, "Weekly VWAP", not na(weeklyVwap) ? str.tostring(weeklyVwap, format.mintick) : "N/A")
-        f_setRow(6, "Monthly VWAP", not na(monthlyVwap) ? str.tostring(monthlyVwap, format.mintick) : "N/A")
-        f_setRow(7, "New Day", newDay ? "YES" : "NO")
-        f_setRow(8, "New Week", newWeek ? "YES" : "NO")
-        f_setRow(9, "New Month", newMonth ? "YES" : "NO")
+        f_setRow(1, "Timezone", sessionTz)
+        f_setRow(2, "Volume", volumeAvailable ? "AVAILABLE" : "UNAVAILABLE")
+        f_setRow(3, "Session", sessionState)
+        f_setRow(4, "Session VWAP", not na(sessionVwap) ? str.tostring(sessionVwap, format.mintick) : "N/A")
+        f_setRow(5, "Daily VWAP", not na(dailyVwap) ? str.tostring(dailyVwap, format.mintick) : "N/A")
+        f_setRow(6, "Weekly VWAP", not na(weeklyVwap) ? str.tostring(weeklyVwap, format.mintick) : "N/A")
+        f_setRow(7, "Monthly VWAP", not na(monthlyVwap) ? str.tostring(monthlyVwap, format.mintick) : "N/A")
+        f_setRow(8, "New Day", newDay ? "YES" : "NO")
+        f_setRow(9, "New Week", newWeek ? "YES" : "NO")
+        f_setRow(10, "New Month", newMonth ? "YES" : "NO")
     else
-        table.clear(diag, 0, 0, 1, 9)
+        table.clear(diag, 0, 0, 1, 10)
