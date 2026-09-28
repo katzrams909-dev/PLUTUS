@@ -1,0 +1,427 @@
+//@version=6
+indicator("PLUTUS P02.4 — Unified Fair Value", shorttitle="PLUTUS P02.4", overlay=true, max_labels_count=100)
+
+//==============================================================================
+// PLUTUS P02.4 — Unified Institutional Fair-Value State
+// Consolidates P02.0-P02.3 into a downstream-ready state + numeric scores.
+// Context engine only. No trade signals.
+//==============================================================================
+
+//------------------------------------------------------------------------------
+// Inputs
+//------------------------------------------------------------------------------
+groupSource = "VWAP Source"
+source = input.source(hlc3, "Source", group=groupSource)
+
+groupTiming = "Timing / Timezone"
+timezoneInput = input.string("Exchange", "Session Timezone", options=["Exchange", "UTC-2", "UTC-1", "UTC+0", "UTC+1", "UTC+2", "America/New_York", "Europe/London", "Asia/Tokyo"], group=groupTiming)
+string sessionTz = timezoneInput == "Exchange" ? syminfo.timezone : timezoneInput
+
+groupValue = "Primary Value Model"
+referenceMode = input.string("Daily", "Primary Value Reference", options=["Active Session", "Daily", "Weekly", "Monthly"], group=groupValue)
+atrLen = input.int(14, "ATR Length", minval=1, group=groupValue)
+slopeLookback = input.int(5, "VWAP Slope Lookback", minval=1, maxval=50, group=groupValue)
+slopeAtrThreshold = input.float(0.10, "Directional Slope / ATR Threshold", minval=0.0, step=0.01, group=groupValue)
+acceptanceBars = input.int(5, "Acceptance Lookback", minval=2, maxval=50, group=groupValue)
+acceptanceRatioMin = input.float(0.80, "Acceptance Ratio", minval=0.50, maxval=1.0, step=0.05, group=groupValue)
+crossLookback = input.int(10, "Equilibrium Cross Lookback", minval=3, maxval=50, group=groupValue)
+minCrosses = input.int(3, "Minimum Crosses For Equilibrium", minval=1, maxval=20, group=groupValue)
+equilibriumDistanceAtr = input.float(0.35, "Equilibrium Max Distance / ATR", minval=0.05, step=0.05, group=groupValue)
+failureDistanceAtr = input.float(0.15, "Migration Failure Distance / ATR", minval=0.0, step=0.05, group=groupValue)
+
+groupBands = "Deviation Context"
+bandBasis = input.string("ATR", "Band Basis", options=["ATR", "StdDev"], group=groupBands)
+stdLen = input.int(20, "StdDev Length", minval=2, group=groupBands)
+innerMult = input.float(1.0, "Inner Multiplier", minval=0.1, step=0.1, group=groupBands)
+outerMult = input.float(2.0, "Outer Multiplier", minval=0.2, step=0.1, group=groupBands)
+
+groupAnchor = "Anchor Context"
+anchorMode = input.string("Day Open", "Anchor Type", options=["Latest Swing High", "Latest Swing Low", "Asia Open", "London Open", "New York Open", "Day Open", "Week Open", "Month Open", "Manual Time"], group=groupAnchor)
+manualAnchorTime = input.time(timestamp("01 Jan 2026 00:00 +0000"), "Manual Anchor Time", group=groupAnchor)
+pivotLeft = input.int(3, "Pivot Left Bars", minval=1, maxval=20, group=groupAnchor)
+pivotRight = input.int(3, "Pivot Right Bars", minval=1, maxval=20, group=groupAnchor)
+anchorConfluenceAtr = input.float(0.25, "Value/Anchor Confluence ATR", minval=0.05, step=0.05, group=groupAnchor)
+
+groupDisplay = "Display"
+showValueRef = input.bool(true, "Show Primary Value VWAP", group=groupDisplay)
+showPrimaryAvwap = input.bool(true, "Show Primary Anchored VWAP", group=groupDisplay)
+showBands = input.bool(false, "Show Inner/Outer Bands", group=groupDisplay)
+showTable = input.bool(true, "Show Diagnostic Table", group=groupDisplay)
+lineWidth = input.int(2, "Line Width", minval=1, maxval=4, group=groupDisplay)
+
+//------------------------------------------------------------------------------
+// Fixed ARTHA sessions
+//------------------------------------------------------------------------------
+string asiaSession = "0000-0800:1234567"
+string londonSession = "0800-1630:1234567"
+string newYorkSession = "1330-2000:1234567"
+
+bool inAsia = not na(time(timeframe.period, asiaSession, sessionTz))
+bool inLondon = not na(time(timeframe.period, londonSession, sessionTz))
+bool inNewYork = not na(time(timeframe.period, newYorkSession, sessionTz))
+
+bool newAsia = inAsia and not inAsia[1]
+bool newLondon = inLondon and not inLondon[1]
+bool newNewYork = inNewYork and not inNewYork[1]
+
+//------------------------------------------------------------------------------
+// Session VWAPs
+//------------------------------------------------------------------------------
+var float asiaPV = na
+var float asiaVol = na
+if not inAsia
+    asiaPV := na
+    asiaVol := na
+else if newAsia or na(asiaPV) or na(asiaVol)
+    asiaPV := source * volume
+    asiaVol := volume
+else
+    asiaPV += source * volume
+    asiaVol += volume
+float asiaVwap = inAsia and not na(asiaVol) and asiaVol > 0.0 ? asiaPV / asiaVol : na
+
+var float londonPV = na
+var float londonVol = na
+if not inLondon
+    londonPV := na
+    londonVol := na
+else if newLondon or na(londonPV) or na(londonVol)
+    londonPV := source * volume
+    londonVol := volume
+else
+    londonPV += source * volume
+    londonVol += volume
+float londonVwap = inLondon and not na(londonVol) and londonVol > 0.0 ? londonPV / londonVol : na
+
+var float newYorkPV = na
+var float newYorkVol = na
+if not inNewYork
+    newYorkPV := na
+    newYorkVol := na
+else if newNewYork or na(newYorkPV) or na(newYorkVol)
+    newYorkPV := source * volume
+    newYorkVol := volume
+else
+    newYorkPV += source * volume
+    newYorkVol += volume
+float newYorkVwap = inNewYork and not na(newYorkVol) and newYorkVol > 0.0 ? newYorkPV / newYorkVol : na
+
+//------------------------------------------------------------------------------
+// D/W/M VWAPs in shared timezone
+//------------------------------------------------------------------------------
+int localDay = dayofmonth(time, sessionTz)
+int localWeek = weekofyear(time, sessionTz)
+int localMonth = month(time, sessionTz)
+
+bool newDay = ta.change(localDay) != 0
+bool newWeek = ta.change(localWeek) != 0
+bool newMonth = ta.change(localMonth) != 0
+
+float dailyVwap = ta.vwap(source, barstate.isfirst or newDay)
+float weeklyVwap = ta.vwap(source, barstate.isfirst or newWeek)
+float monthlyVwap = ta.vwap(source, barstate.isfirst or newMonth)
+
+float activeSessionVwap = inNewYork ? newYorkVwap : inLondon ? londonVwap : inAsia ? asiaVwap : na
+string activeSessionName = inNewYork ? "NEW YORK" : inLondon ? "LONDON" : inAsia ? "ASIA" : "NONE"
+
+float valueRef = switch referenceMode
+    "Active Session" => activeSessionVwap
+    "Weekly" => weeklyVwap
+    "Monthly" => monthlyVwap
+    => dailyVwap
+
+bool valueReset = switch referenceMode
+    "Active Session" => newNewYork or newLondon or newAsia
+    "Weekly" => newWeek
+    "Monthly" => newMonth
+    => newDay
+
+//------------------------------------------------------------------------------
+// P02.1: value migration / acceptance / equilibrium
+//------------------------------------------------------------------------------
+float atr = ta.atr(atrLen)
+float distanceAtr = not na(valueRef) and not na(atr) and atr != 0.0 ? (close - valueRef) / atr : na
+float slopeAtr = not na(valueRef) and not na(valueRef[slopeLookback]) and not na(atr) and atr != 0.0 ? (valueRef - valueRef[slopeLookback]) / atr : na
+
+bool valueRising = not na(slopeAtr) and slopeAtr >= slopeAtrThreshold
+bool valueFalling = not na(slopeAtr) and slopeAtr <= -slopeAtrThreshold
+bool valueFlat = not na(slopeAtr) and not valueRising and not valueFalling
+
+float aboveRatio = ta.sma(not na(valueRef) and close > valueRef ? 1.0 : 0.0, acceptanceBars)
+float belowRatio = ta.sma(not na(valueRef) and close < valueRef ? 1.0 : 0.0, acceptanceBars)
+bool acceptedAbove = not na(valueRef) and not na(aboveRatio) and aboveRatio >= acceptanceRatioMin
+bool acceptedBelow = not na(valueRef) and not na(belowRatio) and belowRatio >= acceptanceRatioMin
+
+bool refCross = not na(valueRef) and not na(valueRef[1]) and ((close > valueRef and close[1] <= valueRef[1]) or (close < valueRef and close[1] >= valueRef[1]))
+float crossRate = ta.sma(refCross ? 1.0 : 0.0, crossLookback)
+float approximateCrosses = not na(crossRate) ? crossRate * crossLookback : na
+bool equilibrium = not na(approximateCrosses) and approximateCrosses >= minCrosses and not na(distanceAtr) and math.abs(distanceAtr) <= equilibriumDistanceAtr
+
+bool risingMigrationFailure = valueRising and not na(distanceAtr) and distanceAtr <= -failureDistanceAtr
+bool fallingMigrationFailure = valueFalling and not na(distanceAtr) and distanceAtr >= failureDistanceAtr
+
+//------------------------------------------------------------------------------
+// P02.2: deviation context
+//------------------------------------------------------------------------------
+float stdDev = ta.stdev(source, stdLen)
+float bandUnit = bandBasis == "StdDev" ? stdDev : atr
+float innerDistance = not na(bandUnit) ? bandUnit * innerMult : na
+float outerDistance = not na(bandUnit) ? bandUnit * outerMult : na
+
+float upperInner = not na(valueRef) and not na(innerDistance) ? valueRef + innerDistance : na
+float lowerInner = not na(valueRef) and not na(innerDistance) ? valueRef - innerDistance : na
+float upperOuter = not na(valueRef) and not na(outerDistance) ? valueRef + outerDistance : na
+float lowerOuter = not na(valueRef) and not na(outerDistance) ? valueRef - outerDistance : na
+
+bool insideInner = not na(upperInner) and close <= upperInner and close >= lowerInner
+bool upperTransition = not na(upperInner) and not na(upperOuter) and close > upperInner and close <= upperOuter
+bool lowerTransition = not na(lowerInner) and not na(lowerOuter) and close < lowerInner and close >= lowerOuter
+bool extendedHigh = not na(upperOuter) and close > upperOuter
+bool extendedLow = not na(lowerOuter) and close < lowerOuter
+bool reversionContext = (upperTransition and (valueFlat or valueFalling)) or (lowerTransition and (valueFlat or valueRising))
+
+//------------------------------------------------------------------------------
+// P02.3: anchored VWAP framework
+//------------------------------------------------------------------------------
+float pv = source * volume
+float cumulativePV = ta.cum(pv)
+float cumulativeVol = ta.cum(volume)
+
+f_avwap(float basePV, float baseVol, bool active) =>
+    float denom = cumulativeVol - baseVol
+    active and not na(basePV) and not na(baseVol) and denom > 0.0 ? (cumulativePV - basePV) / denom : na
+
+var float asiaBasePV = na
+var float asiaBaseVol = na
+if newAsia
+    asiaBasePV := nz(cumulativePV[1], 0.0)
+    asiaBaseVol := nz(cumulativeVol[1], 0.0)
+
+var float londonBasePV = na
+var float londonBaseVol = na
+if newLondon
+    londonBasePV := nz(cumulativePV[1], 0.0)
+    londonBaseVol := nz(cumulativeVol[1], 0.0)
+
+var float newYorkBasePV = na
+var float newYorkBaseVol = na
+if newNewYork
+    newYorkBasePV := nz(cumulativePV[1], 0.0)
+    newYorkBaseVol := nz(cumulativeVol[1], 0.0)
+
+var float dayBasePV = na
+var float dayBaseVol = na
+if barstate.isfirst or newDay
+    dayBasePV := nz(cumulativePV[1], 0.0)
+    dayBaseVol := nz(cumulativeVol[1], 0.0)
+
+var float weekBasePV = na
+var float weekBaseVol = na
+if barstate.isfirst or newWeek
+    weekBasePV := nz(cumulativePV[1], 0.0)
+    weekBaseVol := nz(cumulativeVol[1], 0.0)
+
+var float monthBasePV = na
+var float monthBaseVol = na
+if barstate.isfirst or newMonth
+    monthBasePV := nz(cumulativePV[1], 0.0)
+    monthBaseVol := nz(cumulativeVol[1], 0.0)
+
+bool manualAnchorEvent = time >= manualAnchorTime and (na(time[1]) or time[1] < manualAnchorTime)
+var float manualBasePV = na
+var float manualBaseVol = na
+if manualAnchorEvent
+    manualBasePV := nz(cumulativePV[1], 0.0)
+    manualBaseVol := nz(cumulativeVol[1], 0.0)
+
+float pivotHigh = ta.pivothigh(high, pivotLeft, pivotRight)
+float pivotLow = ta.pivotlow(low, pivotLeft, pivotRight)
+bool newSwingHigh = not na(pivotHigh)
+bool newSwingLow = not na(pivotLow)
+
+var float swingHighBasePV = na
+var float swingHighBaseVol = na
+if newSwingHigh
+    swingHighBasePV := nz(cumulativePV[pivotRight + 1], 0.0)
+    swingHighBaseVol := nz(cumulativeVol[pivotRight + 1], 0.0)
+
+var float swingLowBasePV = na
+var float swingLowBaseVol = na
+if newSwingLow
+    swingLowBasePV := nz(cumulativePV[pivotRight + 1], 0.0)
+    swingLowBaseVol := nz(cumulativeVol[pivotRight + 1], 0.0)
+
+float primaryBasePV = na
+float primaryBaseVol = na
+bool primaryActive = false
+bool primaryReset = false
+
+switch anchorMode
+    "Latest Swing High" =>
+        primaryBasePV := swingHighBasePV
+        primaryBaseVol := swingHighBaseVol
+        primaryActive := not na(swingHighBasePV)
+        primaryReset := newSwingHigh
+    "Latest Swing Low" =>
+        primaryBasePV := swingLowBasePV
+        primaryBaseVol := swingLowBaseVol
+        primaryActive := not na(swingLowBasePV)
+        primaryReset := newSwingLow
+    "Asia Open" =>
+        primaryBasePV := asiaBasePV
+        primaryBaseVol := asiaBaseVol
+        primaryActive := not na(asiaBasePV)
+        primaryReset := newAsia
+    "London Open" =>
+        primaryBasePV := londonBasePV
+        primaryBaseVol := londonBaseVol
+        primaryActive := not na(londonBasePV)
+        primaryReset := newLondon
+    "New York Open" =>
+        primaryBasePV := newYorkBasePV
+        primaryBaseVol := newYorkBaseVol
+        primaryActive := not na(newYorkBasePV)
+        primaryReset := newNewYork
+    "Week Open" =>
+        primaryBasePV := weekBasePV
+        primaryBaseVol := weekBaseVol
+        primaryActive := not na(weekBasePV)
+        primaryReset := newWeek
+    "Month Open" =>
+        primaryBasePV := monthBasePV
+        primaryBaseVol := monthBaseVol
+        primaryActive := not na(monthBasePV)
+        primaryReset := newMonth
+    "Manual Time" =>
+        primaryBasePV := manualBasePV
+        primaryBaseVol := manualBaseVol
+        primaryActive := not na(manualBasePV)
+        primaryReset := manualAnchorEvent
+    =>
+        primaryBasePV := dayBasePV
+        primaryBaseVol := dayBaseVol
+        primaryActive := not na(dayBasePV)
+        primaryReset := newDay
+
+float primaryAvwap = f_avwap(primaryBasePV, primaryBaseVol, primaryActive)
+float anchorDistanceAtr = not na(primaryAvwap) and not na(atr) and atr != 0.0 ? (close - primaryAvwap) / atr : na
+float valueAnchorDistanceAtr = not na(primaryAvwap) and not na(valueRef) and not na(atr) and atr != 0.0 ? (valueRef - primaryAvwap) / atr : na
+bool anchorConfluence = not na(valueAnchorDistanceAtr) and math.abs(valueAnchorDistanceAtr) <= anchorConfluenceAtr
+bool priceAboveAnchor = not na(primaryAvwap) and close > primaryAvwap
+bool priceBelowAnchor = not na(primaryAvwap) and close < primaryAvwap
+
+//------------------------------------------------------------------------------
+// Unified score model
+//------------------------------------------------------------------------------
+int migrationScore = valueRising ? 2 : valueFalling ? -2 : 0
+int acceptanceScore = acceptedAbove ? 2 : acceptedBelow ? -2 : 0
+int locationScore = not na(distanceAtr) ? (distanceAtr > 0.0 ? 1 : distanceAtr < 0.0 ? -1 : 0) : 0
+int anchorScore = priceAboveAnchor ? 1 : priceBelowAnchor ? -1 : 0
+int extensionScore = extendedHigh ? 1 : extendedLow ? -1 : 0
+
+int directionalScore = migrationScore + acceptanceScore + locationScore + anchorScore
+int confluenceScore = directionalScore + extensionScore
+
+bool bullishAgreement = valueRising and acceptedAbove and priceAboveAnchor
+bool bearishAgreement = valueFalling and acceptedBelow and priceBelowAnchor
+bool directionalConflict = (valueRising and acceptedBelow) or (valueFalling and acceptedAbove) or (acceptedAbove and priceBelowAnchor) or (acceptedBelow and priceAboveAnchor)
+
+//------------------------------------------------------------------------------
+// Unified institutional fair-value state
+// Precedence emphasizes unavailable/conflict/failure/equilibrium/extension before
+// directional acceptance and migration.
+//------------------------------------------------------------------------------
+string candidateState = "VALUE_BALANCED"
+if na(valueRef) or na(atr)
+    candidateState := "VALUE_UNAVAILABLE"
+else if directionalConflict
+    candidateState := "VALUE_CONFLICT"
+else if risingMigrationFailure or fallingMigrationFailure
+    candidateState := "VALUE_MIGRATION_FAILURE"
+else if equilibrium
+    candidateState := "VALUE_EQUILIBRIUM"
+else if extendedHigh
+    candidateState := "VALUE_EXTENDED_HIGH"
+else if extendedLow
+    candidateState := "VALUE_EXTENDED_LOW"
+else if reversionContext
+    candidateState := "VALUE_REVERSION_CONTEXT"
+else if anchorConfluence and math.abs(directionalScore) <= 1
+    candidateState := "VALUE_ANCHOR_CONFLUENCE"
+else if bullishAgreement
+    candidateState := "VALUE_ACCEPTED_BULLISH"
+else if bearishAgreement
+    candidateState := "VALUE_ACCEPTED_BEARISH"
+else if acceptedAbove
+    candidateState := "VALUE_ACCEPTED_BULLISH"
+else if acceptedBelow
+    candidateState := "VALUE_ACCEPTED_BEARISH"
+else if valueRising
+    candidateState := "VALUE_MIGRATING_HIGHER"
+else if valueFalling
+    candidateState := "VALUE_MIGRATING_LOWER"
+else if anchorConfluence
+    candidateState := "VALUE_ANCHOR_CONFLUENCE"
+else if insideInner
+    candidateState := "VALUE_BALANCED"
+
+string state = barstate.isconfirmed ? candidateState : "FORMING"
+
+//------------------------------------------------------------------------------
+// Minimal production-style plots
+//------------------------------------------------------------------------------
+float valuePlot = showValueRef ? valueRef : na
+float anchorPlot = showPrimaryAvwap ? primaryAvwap : na
+valuePlot := valueReset ? na : valuePlot
+anchorPlot := primaryReset ? na : anchorPlot
+
+plot(valuePlot, "Primary Value VWAP", linewidth=lineWidth, color=color.white, style=plot.style_linebr)
+plot(anchorPlot, "Primary Anchored VWAP", linewidth=lineWidth, color=color.lime, style=plot.style_linebr)
+
+float upperInnerPlot = showBands ? upperInner : na
+float lowerInnerPlot = showBands ? lowerInner : na
+float upperOuterPlot = showBands ? upperOuter : na
+float lowerOuterPlot = showBands ? lowerOuter : na
+upperInnerPlot := valueReset ? na : upperInnerPlot
+lowerInnerPlot := valueReset ? na : lowerInnerPlot
+upperOuterPlot := valueReset ? na : upperOuterPlot
+lowerOuterPlot := valueReset ? na : lowerOuterPlot
+plot(upperInnerPlot, "Upper Inner", color=color.new(color.silver, 25), style=plot.style_linebr)
+plot(lowerInnerPlot, "Lower Inner", color=color.new(color.silver, 25), style=plot.style_linebr)
+plot(upperOuterPlot, "Upper Outer", color=color.new(color.gray, 45), style=plot.style_linebr)
+plot(lowerOuterPlot, "Lower Outer", color=color.new(color.gray, 45), style=plot.style_linebr)
+
+//------------------------------------------------------------------------------
+// Diagnostics / downstream auditability
+//------------------------------------------------------------------------------
+var table diag = table.new(position.top_right, 2, 20, border_width=1, frame_width=1, bgcolor=color.new(color.black, 15))
+
+f_setRow(int row, string labelText, string valueText) =>
+    table.cell(diag, 0, row, labelText, text_color=color.silver, bgcolor=color.new(color.black, 15), text_halign=text.align_left)
+    table.cell(diag, 1, row, valueText, text_color=color.white, bgcolor=color.new(color.black, 15), text_halign=text.align_right)
+
+if barstate.islast
+    if showTable
+        table.clear(diag, 0, 0, 1, 19)
+        f_setRow(0, "PLUTUS", "P02.4 Unified Fair Value")
+        f_setRow(1, "Timezone", sessionTz)
+        f_setRow(2, "Reference", referenceMode)
+        f_setRow(3, "Active Session", activeSessionName)
+        f_setRow(4, "Value VWAP", not na(valueRef) ? str.tostring(valueRef, format.mintick) : "N/A")
+        f_setRow(5, "Anchor", anchorMode)
+        f_setRow(6, "Anchor VWAP", not na(primaryAvwap) ? str.tostring(primaryAvwap, format.mintick) : "N/A")
+        f_setRow(7, "Slope / ATR", not na(slopeAtr) ? str.tostring(slopeAtr, "#.###") : "N/A")
+        f_setRow(8, "Distance / ATR", not na(distanceAtr) ? str.tostring(distanceAtr, "#.##") : "N/A")
+        f_setRow(9, "Anchor Dist / ATR", not na(anchorDistanceAtr) ? str.tostring(anchorDistanceAtr, "#.##") : "N/A")
+        f_setRow(10, "Value-Anchor / ATR", not na(valueAnchorDistanceAtr) ? str.tostring(valueAnchorDistanceAtr, "#.##") : "N/A")
+        f_setRow(11, "Accepted Above", acceptedAbove ? "YES" : "NO")
+        f_setRow(12, "Accepted Below", acceptedBelow ? "YES" : "NO")
+        f_setRow(13, "Equilibrium", equilibrium ? "YES" : "NO")
+        f_setRow(14, "Anchor Confluence", anchorConfluence ? "YES" : "NO")
+        f_setRow(15, "Migration Score", str.tostring(migrationScore))
+        f_setRow(16, "Acceptance Score", str.tostring(acceptanceScore))
+        f_setRow(17, "Directional Score", str.tostring(directionalScore))
+        f_setRow(18, "Confluence Score", str.tostring(confluenceScore))
+        f_setRow(19, "State", state)
+    else
+        table.clear(diag, 0, 0, 1, 19)
