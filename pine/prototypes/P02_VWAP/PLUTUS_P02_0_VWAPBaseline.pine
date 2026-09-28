@@ -68,20 +68,24 @@ float monthlyVwap = ta.vwap(source, newMonth)
 //------------------------------------------------------------------------------
 // Plot helpers
 //------------------------------------------------------------------------------
+// IMPORTANT: plot.style_linebr is required here. The default plot.style_line can
+// visually bridge across na values, creating false vertical/diagonal joins at
+// reset boundaries even when the underlying VWAP state resets correctly.
 float sessionPlot = showSessionVwap ? sessionVwap : na
 float dailyPlot = showDailyVwap ? dailyVwap : na
 float weeklyPlot = showWeeklyVwap ? weeklyVwap : na
 float monthlyPlot = showMonthlyVwap ? monthlyVwap : na
 
-sessionPlot := breakLinesOnReset and newSession ? na : sessionPlot
-dailyPlot := breakLinesOnReset and newDay ? na : dailyPlot
-weeklyPlot := breakLinesOnReset and newWeek ? na : weeklyPlot
-monthlyPlot := breakLinesOnReset and newMonth ? na : monthlyPlot
+if breakLinesOnReset
+    sessionPlot := newSession ? na : sessionPlot
+    dailyPlot := newDay ? na : dailyPlot
+    weeklyPlot := newWeek ? na : weeklyPlot
+    monthlyPlot := newMonth ? na : monthlyPlot
 
-plot(sessionPlot, "Session VWAP", linewidth=lineWidth, color=color.aqua)
-plot(dailyPlot, "Daily VWAP", linewidth=lineWidth, color=color.yellow)
-plot(weeklyPlot, "Weekly VWAP", linewidth=lineWidth, color=color.orange)
-plot(monthlyPlot, "Monthly VWAP", linewidth=lineWidth, color=color.fuchsia)
+plot(sessionPlot, "Session VWAP", linewidth=lineWidth, color=color.aqua, style=plot.style_linebr)
+plot(dailyPlot, "Daily VWAP", linewidth=lineWidth, color=color.yellow, style=plot.style_linebr)
+plot(weeklyPlot, "Weekly VWAP", linewidth=lineWidth, color=color.orange, style=plot.style_linebr)
+plot(monthlyPlot, "Monthly VWAP", linewidth=lineWidth, color=color.fuchsia, style=plot.style_linebr)
 
 //------------------------------------------------------------------------------
 // Diagnostics
