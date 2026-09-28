@@ -1,0 +1,111 @@
+//@version=6
+indicator("PLUTUS P02.0 — VWAP Baseline", shorttitle="PLUTUS P02.0", overlay=true, max_labels_count=100)
+
+//==============================================================================
+// PLUTUS P02.0 — VWAP / Institutional Fair Value Baseline
+// Purpose: establish clean, auditable session / daily / weekly / monthly VWAPs
+//          before adding slope, deviation bands, anchored VWAP, or value states.
+//==============================================================================
+
+//------------------------------------------------------------------------------
+// Inputs
+//------------------------------------------------------------------------------
+groupSource = "VWAP Source"
+source = input.source(hlc3, "Source", group=groupSource)
+
+groupSession = "Session VWAP"
+showSessionVwap = input.bool(true, "Show Session VWAP", group=groupSession)
+sessionInput = input.session("0800-1700", "Session", group=groupSession)
+sessionTimezone = input.string("Etc/UTC", "Session Timezone", group=groupSession)
+
+groupHigher = "Higher-Period VWAPs"
+showDailyVwap = input.bool(true, "Show Daily VWAP", group=groupHigher)
+showWeeklyVwap = input.bool(true, "Show Weekly VWAP", group=groupHigher)
+showMonthlyVwap = input.bool(true, "Show Monthly VWAP", group=groupHigher)
+
+groupDisplay = "Display"
+showTable = input.bool(true, "Show Diagnostic Table", group=groupDisplay)
+lineWidth = input.int(2, "Line Width", minval=1, maxval=4, group=groupDisplay)
+breakLinesOnReset = input.bool(true, "Break Lines On Reset", group=groupDisplay)
+
+//------------------------------------------------------------------------------
+// Volume availability
+//------------------------------------------------------------------------------
+volumeAvailable = not na(volume)
+
+//------------------------------------------------------------------------------
+// Session VWAP — explicit cumulative implementation
+//------------------------------------------------------------------------------
+bool inSession = not na(time(timeframe.period, sessionInput, sessionTimezone))
+bool newSession = inSession and not inSession[1]
+
+var float sessionPV = na
+var float sessionVol = na
+
+if not inSession
+    sessionPV := na
+    sessionVol := na
+else if newSession or na(sessionPV) or na(sessionVol)
+    sessionPV := source * volume
+    sessionVol := volume
+else
+    sessionPV += source * volume
+    sessionVol += volume
+
+float sessionVwap = inSession and not na(sessionVol) and sessionVol > 0.0 ? sessionPV / sessionVol : na
+
+//------------------------------------------------------------------------------
+// Daily / Weekly / Monthly anchored VWAPs
+//------------------------------------------------------------------------------
+bool newDay = timeframe.change("1D")
+bool newWeek = timeframe.change("1W")
+bool newMonth = timeframe.change("1M")
+
+float dailyVwap = ta.vwap(source, newDay)
+float weeklyVwap = ta.vwap(source, newWeek)
+float monthlyVwap = ta.vwap(source, newMonth)
+
+//------------------------------------------------------------------------------
+// Plot helpers
+//------------------------------------------------------------------------------
+float sessionPlot = showSessionVwap ? sessionVwap : na
+float dailyPlot = showDailyVwap ? dailyVwap : na
+float weeklyPlot = showWeeklyVwap ? weeklyVwap : na
+float monthlyPlot = showMonthlyVwap ? monthlyVwap : na
+
+sessionPlot := breakLinesOnReset and newSession ? na : sessionPlot
+dailyPlot := breakLinesOnReset and newDay ? na : dailyPlot
+weeklyPlot := breakLinesOnReset and newWeek ? na : weeklyPlot
+monthlyPlot := breakLinesOnReset and newMonth ? na : monthlyPlot
+
+plot(sessionPlot, "Session VWAP", linewidth=lineWidth, color=color.aqua)
+plot(dailyPlot, "Daily VWAP", linewidth=lineWidth, color=color.yellow)
+plot(weeklyPlot, "Weekly VWAP", linewidth=lineWidth, color=color.orange)
+plot(monthlyPlot, "Monthly VWAP", linewidth=lineWidth, color=color.fuchsia)
+
+//------------------------------------------------------------------------------
+// Diagnostics
+//------------------------------------------------------------------------------
+string sessionState = inSession ? "ACTIVE" : "CLOSED"
+
+var table diag = table.new(position.top_right, 2, 10, border_width=1, frame_width=1, bgcolor=color.new(color.black, 15))
+
+f_setRow(int row, string labelText, string valueText) =>
+    table.cell(diag, 0, row, labelText, text_color=color.silver, bgcolor=color.new(color.black, 15), text_halign=text.align_left)
+    table.cell(diag, 1, row, valueText, text_color=color.white, bgcolor=color.new(color.black, 15), text_halign=text.align_right)
+
+if barstate.islast
+    if showTable
+        table.clear(diag, 0, 0, 1, 9)
+        f_setRow(0, "PLUTUS", "P02.0 VWAP")
+        f_setRow(1, "Volume", volumeAvailable ? "AVAILABLE" : "UNAVAILABLE")
+        f_setRow(2, "Session", sessionState)
+        f_setRow(3, "Session VWAP", not na(sessionVwap) ? str.tostring(sessionVwap, format.mintick) : "N/A")
+        f_setRow(4, "Daily VWAP", not na(dailyVwap) ? str.tostring(dailyVwap, format.mintick) : "N/A")
+        f_setRow(5, "Weekly VWAP", not na(weeklyVwap) ? str.tostring(weeklyVwap, format.mintick) : "N/A")
+        f_setRow(6, "Monthly VWAP", not na(monthlyVwap) ? str.tostring(monthlyVwap, format.mintick) : "N/A")
+        f_setRow(7, "New Day", newDay ? "YES" : "NO")
+        f_setRow(8, "New Week", newWeek ? "YES" : "NO")
+        f_setRow(9, "New Month", newMonth ? "YES" : "NO")
+    else
+        table.clear(diag, 0, 0, 1, 9)
