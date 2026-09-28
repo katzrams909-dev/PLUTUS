@@ -1,0 +1,187 @@
+//@version=6
+indicator("PLUTUS P03.0 — Volume Profile Baseline", shorttitle="PLUTUS P03.0", overlay=true, max_labels_count=50)
+
+//==============================================================================
+// PLUTUS P03.0 — Volume Profile Baseline
+// Purpose:
+// - establish a bounded, auditable price-bin volume profile engine
+// - support fixed ARTHA sessions and daily scope
+// - expose developing profile range + POC
+// - keep visual/object load minimal
+//
+// Approximation note:
+// Each chart bar contributes its full reported volume to one price bin using the
+// selected allocation price. P03.1+ can refine value-area interpretation after
+// this baseline is validated.
+//==============================================================================
+
+//------------------------------------------------------------------------------
+// Inputs
+//------------------------------------------------------------------------------
+groupTiming = "Timing / Timezone"
+timezoneInput = input.string("Exchange", "Session Timezone", options=["Exchange", "UTC-2", "UTC-1", "UTC+0", "UTC+1", "UTC+2", "America/New_York", "Europe/London", "Asia/Tokyo"], group=groupTiming)
+string sessionTz = timezoneInput == "Exchange" ? syminfo.timezone : timezoneInput
+
+groupProfile = "Profile Engine"
+profileScope = input.string("New York", "Profile Scope", options=["Asia", "London", "New York", "Day"], group=groupProfile)
+allocationSource = input.source(hlc3, "Allocation Price", group=groupProfile)
+binCount = input.int(24, "Price Bins", minval=8, maxval=80, group=groupProfile)
+maxProfileBars = input.int(300, "Maximum Bars Per Profile", minval=25, maxval=1000, group=groupProfile)
+
+groupDisplay = "Display"
+showPoc = input.bool(true, "Show Developing POC", group=groupDisplay)
+showRange = input.bool(false, "Show Profile High / Low", group=groupDisplay)
+showTable = input.bool(true, "Show Diagnostic Table", group=groupDisplay)
+lineWidth = input.int(2, "Line Width", minval=1, maxval=4, group=groupDisplay)
+
+//------------------------------------------------------------------------------
+// Fixed ARTHA sessions
+//------------------------------------------------------------------------------
+string asiaSession = "0000-0800:1234567"
+string londonSession = "0800-1630:1234567"
+string newYorkSession = "1330-2000:1234567"
+
+bool inAsia = not na(time(timeframe.period, asiaSession, sessionTz))
+bool inLondon = not na(time(timeframe.period, londonSession, sessionTz))
+bool inNewYork = not na(time(timeframe.period, newYorkSession, sessionTz))
+
+bool newAsia = inAsia and not inAsia[1]
+bool newLondon = inLondon and not inLondon[1]
+bool newNewYork = inNewYork and not inNewYork[1]
+
+int localDay = dayofmonth(time, sessionTz)
+bool newDay = ta.change(localDay) != 0
+
+bool scopeActive = switch profileScope
+    "Asia" => inAsia
+    "London" => inLondon
+    "New York" => inNewYork
+    => true
+
+bool scopeReset = switch profileScope
+    "Asia" => newAsia
+    "London" => newLondon
+    "New York" => newNewYork
+    => barstate.isfirst or newDay
+
+//------------------------------------------------------------------------------
+// Bounded profile storage
+//------------------------------------------------------------------------------
+var array<float> profilePrices = array.new_float()
+var array<float> profileHighs = array.new_float()
+var array<float> profileLows = array.new_float()
+var array<float> profileVolumes = array.new_float()
+var array<float> bins = array.new_float()
+
+if barstate.isfirst
+    for i = 0 to binCount - 1
+        array.push(bins, 0.0)
+
+if scopeReset
+    array.clear(profilePrices)
+    array.clear(profileHighs)
+    array.clear(profileLows)
+    array.clear(profileVolumes)
+
+if scopeActive and not na(volume)
+    array.push(profilePrices, allocationSource)
+    array.push(profileHighs, high)
+    array.push(profileLows, low)
+    array.push(profileVolumes, volume)
+
+    if array.size(profilePrices) > maxProfileBars
+        array.shift(profilePrices)
+        array.shift(profileHighs)
+        array.shift(profileLows)
+        array.shift(profileVolumes)
+
+//------------------------------------------------------------------------------
+// Rebuild current profile from stored bars
+// Rebuilding is intentional: when the developing range expands, all historical
+// bars must be remapped to the new bin geometry rather than left in stale bins.
+//------------------------------------------------------------------------------
+float profileHigh = na
+float profileLow = na
+float pocPrice = na
+float pocVolume = na
+float totalProfileVolume = 0.0
+float binSize = na
+int storedBars = array.size(profilePrices)
+
+if storedBars > 0
+    profileHigh := array.max(profileHighs)
+    profileLow := array.min(profileLows)
+
+    float profileRange = profileHigh - profileLow
+    binSize := profileRange > 0.0 ? profileRange / binCount : syminfo.mintick
+    binSize := math.max(binSize, syminfo.mintick)
+
+    for i = 0 to binCount - 1
+        array.set(bins, i, 0.0)
+
+    for i = 0 to storedBars - 1
+        float p = array.get(profilePrices, i)
+        float v = array.get(profileVolumes, i)
+        int idx = int(math.floor((p - profileLow) / binSize))
+        idx := math.max(0, math.min(binCount - 1, idx))
+        array.set(bins, idx, array.get(bins, idx) + v)
+        totalProfileVolume += v
+
+    float maxBinVol = -1.0
+    int pocIndex = 0
+    for i = 0 to binCount - 1
+        float binVol = array.get(bins, i)
+        if binVol > maxBinVol
+            maxBinVol := binVol
+            pocIndex := i
+
+    pocVolume := maxBinVol
+    pocPrice := profileLow + (pocIndex + 0.5) * binSize
+
+//------------------------------------------------------------------------------
+// Plot only while the selected profile scope is active.
+// This prevents completed session POCs from extending indefinitely.
+//------------------------------------------------------------------------------
+float pocPlot = showPoc and scopeActive ? pocPrice : na
+float highPlot = showRange and scopeActive ? profileHigh : na
+float lowPlot = showRange and scopeActive ? profileLow : na
+
+pocPlot := scopeReset ? na : pocPlot
+highPlot := scopeReset ? na : highPlot
+lowPlot := scopeReset ? na : lowPlot
+
+plot(pocPlot, "Developing POC", color=color.orange, linewidth=lineWidth, style=plot.style_linebr)
+plot(highPlot, "Profile High", color=color.new(color.gray, 35), linewidth=1, style=plot.style_linebr)
+plot(lowPlot, "Profile Low", color=color.new(color.gray, 35), linewidth=1, style=plot.style_linebr)
+
+//------------------------------------------------------------------------------
+// Diagnostics
+//------------------------------------------------------------------------------
+float pocShare = not na(pocVolume) and totalProfileVolume > 0.0 ? pocVolume / totalProfileVolume : na
+string scopeState = scopeActive ? "ACTIVE" : "CLOSED"
+string volumeState = na(volume) ? "UNAVAILABLE" : "AVAILABLE"
+
+var table diag = table.new(position.top_right, 2, 13, border_width=1, frame_width=1, bgcolor=color.new(color.black, 15))
+
+f_setRow(int row, string labelText, string valueText) =>
+    table.cell(diag, 0, row, labelText, text_color=color.silver, bgcolor=color.new(color.black, 15), text_halign=text.align_left)
+    table.cell(diag, 1, row, valueText, text_color=color.white, bgcolor=color.new(color.black, 15), text_halign=text.align_right)
+
+if barstate.islast
+    if showTable
+        table.clear(diag, 0, 0, 1, 12)
+        f_setRow(0, "PLUTUS", "P03.0 Profile")
+        f_setRow(1, "Timezone", sessionTz)
+        f_setRow(2, "Scope", profileScope)
+        f_setRow(3, "Scope State", scopeState)
+        f_setRow(4, "Volume", volumeState)
+        f_setRow(5, "Stored Bars", str.tostring(storedBars))
+        f_setRow(6, "Bins", str.tostring(binCount))
+        f_setRow(7, "Profile High", not na(profileHigh) ? str.tostring(profileHigh, format.mintick) : "N/A")
+        f_setRow(8, "Profile Low", not na(profileLow) ? str.tostring(profileLow, format.mintick) : "N/A")
+        f_setRow(9, "Bin Size", not na(binSize) ? str.tostring(binSize, format.mintick) : "N/A")
+        f_setRow(10, "POC", not na(pocPrice) ? str.tostring(pocPrice, format.mintick) : "N/A")
+        f_setRow(11, "POC Volume %", not na(pocShare) ? str.tostring(pocShare * 100.0, "#.0") + "%" : "N/A")
+        f_setRow(12, "Profile Volume", totalProfileVolume > 0.0 ? str.tostring(totalProfileVolume, format.volume) : "N/A")
+    else
+        table.clear(diag, 0, 0, 1, 12)
