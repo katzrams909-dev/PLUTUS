@@ -24,8 +24,12 @@ structureLookback = input.int(5, "OB Structure Break Lookback", minval=2, maxval
 minDisplacementAtr = input.float(0.50, "Minimum Displacement Body / ATR", minval=0.05, step=0.05, group=groupDetection)
 minDisplacementEfficiency = input.float(0.55, "Minimum Displacement Body / Range", minval=0.10, maxval=1.0, step=0.05, group=groupDetection)
 fullDisplacementAtr = input.float(1.0, "Full Mechanical Displacement / ATR", minval=0.10, step=0.10, group=groupDetection)
-minFvgAtr = input.float(0.08, "Minimum FVG Width / ATR", minval=0.0, step=0.01, group=groupDetection)
+minFvgAtr = input.float(0.10, "Minimum FVG Width / ATR", minval=0.0, step=0.01, group=groupDetection)
+minFvgTicks = input.int(3, "Minimum FVG Width (Ticks)", minval=1, maxval=100, group=groupDetection)
 maxZoneWidthAtr = input.float(1.50, "Maximum Zone Width / ATR", minval=0.25, step=0.25, group=groupDetection)
+requireDisplacementFvg = input.bool(true, "Reject Opening-Gap FVG Artifacts", group=groupDetection)
+suppressNestedFvg = input.bool(true, "Suppress Nested / Overlapping FVGs", group=groupDetection)
+fvgFamilyOverlapPct = input.float(50.0, "FVG Family Overlap Threshold %", minval=10.0, maxval=100.0, step=5.0, group=groupDetection)
 obRangeMode = input.string("Body", "Order Block Range", options=["Body", "Full Candle"], group=groupDetection)
 detectFvg = input.bool(true, "Detect FVG Candidates", group=groupDetection)
 detectOb = input.bool(true, "Detect Order Block Candidates", group=groupDetection)
@@ -358,8 +362,31 @@ f_isDuplicate(string zType, int zDir, float zTop, float zBottom) =>
                     duplicate := true
     duplicate
 
+f_overlapsActiveFvgFamily(float zTop, float zBottom) =>
+    bool blocked = false
+    float zWidth = math.max(zTop - zBottom, syminfo.mintick)
+    int n = array.size(zoneTops)
+    if suppressNestedFvg and n > 0
+        for k = 0 to n - 1
+            int s = array.get(zoneStatuses, k)
+            string t = array.get(zoneTypes, k)
+            bool fvgFamily = t == "FVG" or t == "IFVG"
+            if s < 2 and fvgFamily
+                float eTop = array.get(zoneTops, k)
+                float eBottom = array.get(zoneBottoms, k)
+                float eWidth = math.max(eTop - eBottom, syminfo.mintick)
+                float overlap = math.max(0.0, math.min(zTop, eTop) - math.max(zBottom, eBottom))
+                float overlapPctCandidate = overlap / zWidth * 100.0
+                float overlapPctExisting = overlap / eWidth * 100.0
+                bool candidateContained = zTop <= eTop and zBottom >= eBottom
+                bool existingContained = eTop <= zTop and eBottom >= zBottom
+                if candidateContained or existingContained or overlapPctCandidate >= fvgFamilyOverlapPct or overlapPctExisting >= fvgFamilyOverlapPct
+                    blocked := true
+    blocked
+
 f_addZone(string zType, int zDir, float zTop, float zBottom, float mechanic, float score, int leftBar) =>
-    if zTop > zBottom and not f_isDuplicate(zType, zDir, zTop, zBottom)
+    bool familyBlocked = (zType == "FVG" or zType == "IFVG") and f_overlapsActiveFvgFamily(zTop, zBottom)
+    if zTop > zBottom and not familyBlocked and not f_isDuplicate(zType, zDir, zTop, zBottom)
         bool qualified = score >= minQualificationScore
         bool displayZone = showCandidates and (not showOnlyQualified or qualified)
         box b = na
@@ -383,6 +410,12 @@ f_addZone(string zType, int zDir, float zTop, float zBottom, float mechanic, flo
         array.push(zoneLastTouchBars, -1)
         array.push(zoneTypes, zType)
 
+//------------------------------------------------------------------------------
+// Refined FVG mechanics
+// True FVG: candle 3 wick does not overlap candle 1 wick, and candle 2 is a
+// genuine displacement candle. Optional anti-gap filters reject bar-to-bar
+// opening gaps that create tiny visual dashes but are not imbalance delivery.
+//------------------------------------------------------------------------------
 float middleBody = bar_index >= 2 ? math.abs(close[1] - open[1]) : na
 float middleRange = bar_index >= 2 ? math.max(high[1] - low[1], syminfo.mintick) : na
 float middleBodyAtr = bar_index >= 2 and not na(atr[1]) and atr[1] > 0.0 ? middleBody / atr[1] : na
@@ -390,13 +423,31 @@ float middleEfficiency = bar_index >= 2 ? middleBody / middleRange : na
 bool middleBullDisp = bar_index >= 2 and close[1] > open[1] and not na(middleBodyAtr) and middleBodyAtr >= minDisplacementAtr and middleEfficiency >= minDisplacementEfficiency
 bool middleBearDisp = bar_index >= 2 and close[1] < open[1] and not na(middleBodyAtr) and middleBodyAtr >= minDisplacementAtr and middleEfficiency >= minDisplacementEfficiency
 
-bool bullFvgRaw = detectFvg and bar_index >= 2 and low > high[2] and middleBullDisp and close > high[2]
-bool bearFvgRaw = detectFvg and bar_index >= 2 and high < low[2] and middleBearDisp and close < low[2]
-float bullFvgWidthAtr = bullFvgRaw and not na(atr) and atr > 0.0 ? (low - high[2]) / atr : na
-float bearFvgWidthAtr = bearFvgRaw and not na(atr) and atr > 0.0 ? (low[2] - high) / atr : na
-bool bullFvg = bullFvgRaw and bullFvgWidthAtr >= minFvgAtr and bullFvgWidthAtr <= maxZoneWidthAtr
-bool bearFvg = bearFvgRaw and bearFvgWidthAtr >= minFvgAtr and bearFvgWidthAtr <= maxZoneWidthAtr
+bool rawBullGap = detectFvg and bar_index >= 2 and low > high[2]
+bool rawBearGap = detectFvg and bar_index >= 2 and high < low[2]
+float bullGap = rawBullGap ? low - high[2] : na
+float bearGap = rawBearGap ? low[2] - high : na
+float bullFvgWidthAtr = rawBullGap and not na(atr) and atr > 0.0 ? bullGap / atr : na
+float bearFvgWidthAtr = rawBearGap and not na(atr) and atr > 0.0 ? bearGap / atr : na
+float minGapPrice = syminfo.mintick * minFvgTicks
 
+// Reject gaps primarily caused by discontinuous opens. A displacement FVG should
+// be delivered through traded price, not produced by candle 2 or candle 3 simply
+// opening beyond the prior candle's range.
+bool bullContinuity = not requireDisplacementFvg or (low[1] <= high[2] and open <= high[1])
+bool bearContinuity = not requireDisplacementFvg or (high[1] >= low[2] and open >= low[1])
+
+// Candle 2 must close through candle 1's extreme; candle 3 must preserve the gap
+// without itself being the entire source of the discontinuity.
+bool bullDelivery = middleBullDisp and close[1] > high[2] and close > high[2] and bullContinuity
+bool bearDelivery = middleBearDisp and close[1] < low[2] and close < low[2] and bearContinuity
+
+bool bullFvg = rawBullGap and bullDelivery and bullGap >= minGapPrice and not na(bullFvgWidthAtr) and bullFvgWidthAtr >= minFvgAtr and bullFvgWidthAtr <= maxZoneWidthAtr
+bool bearFvg = rawBearGap and bearDelivery and bearGap >= minGapPrice and not na(bearFvgWidthAtr) and bearFvgWidthAtr >= minFvgAtr and bearFvgWidthAtr <= maxZoneWidthAtr
+
+//------------------------------------------------------------------------------
+// OB mechanics
+//------------------------------------------------------------------------------
 bool bullishDispNow = close > open and not na(bodyAtr) and bodyAtr >= minDisplacementAtr and bodyEfficiency >= minDisplacementEfficiency
 bool bearishDispNow = close < open and not na(bodyAtr) and bodyAtr >= minDisplacementAtr and bodyEfficiency >= minDisplacementEfficiency
 float recentHighBefore = ta.highest(high[1], structureLookback)
@@ -412,6 +463,9 @@ float bearObWidthAtr = bearObRaw and not na(atr) and atr > 0.0 ? (bearObTop - be
 bool bullOb = bullObRaw and bullObWidthAtr > 0.0 and bullObWidthAtr <= maxZoneWidthAtr
 bool bearOb = bearObRaw and bearObWidthAtr > 0.0 and bearObWidthAtr <= maxZoneWidthAtr
 
+//------------------------------------------------------------------------------
+// Candidate creation
+//------------------------------------------------------------------------------
 if bullFvg
     float mechanic = f_mechanicQuality(middleBodyAtr, middleEfficiency, bullFvgWidthAtr)
     float score = f_zoneScore(mechanic, f_support(1, p01Signed), f_support(1, p02Signed), f_support(1, p03Signed), f_support(1, p04Signed))
@@ -429,6 +483,9 @@ if bearOb
     float score = f_zoneScore(mechanic, f_support(-1, p01Signed), f_support(-1, p02Signed), f_support(-1, p03Signed), f_support(-1, p04Signed))
     f_addZone("OB", -1, bearObTop, bearObBottom, mechanic, score, bar_index - 1)
 
+//------------------------------------------------------------------------------
+// Zone lifecycle
+//------------------------------------------------------------------------------
 int trackedNow = array.size(zoneScores)
 if trackedNow > 0
     for i = 0 to trackedNow - 1
@@ -527,6 +584,9 @@ if trackedNow > 0
                 if not na(b) and showZoneText
                     box.set_text(b, zType + (zDir == 1 ? " B " : " S ") + str.tostring(currentScore, "#.0") + " F R" + str.tostring(retests))
 
+//------------------------------------------------------------------------------
+// Confirm armed IFVG / Breaker candidates on a later bar
+//------------------------------------------------------------------------------
 int invCount = array.size(invTops)
 if invCount > 0
     for j = invCount - 1 to 0
@@ -578,8 +638,7 @@ while array.size(zoneScores) > maxTrackedZones
     array.shift(zoneTypes)
 
 //------------------------------------------------------------------------------
-// Histogram — independent visual resolution.
-// Histogram Rows does not alter analytical profile bins / POC / VAH / VAL.
+// Histogram — independent visual resolution
 //------------------------------------------------------------------------------
 if barstate.islast
     float histRowHeight = storedProfileBars > 0 and not na(profileHigh) and not na(profileLow) ? math.max((profileHigh - profileLow) / histogramRows, syminfo.mintick) : na
@@ -631,6 +690,9 @@ if barstate.islast
             box.set_bgcolor(hb, color.new(color.gray, 100))
             box.set_border_color(hb, color.new(color.gray, 100))
 
+//------------------------------------------------------------------------------
+// Reset-aware context plots
+//------------------------------------------------------------------------------
 float vwapPlot = showVwap and not valueReset ? valueRef : na
 float pocPlot = showValueLevels and profileActive and not profileReset ? pocPrice : na
 float vahPlot = showValueLevels and profileActive and not profileReset ? vahPrice : na
@@ -640,6 +702,9 @@ plot(pocPlot, "Profile POC", color=color.orange, linewidth=2, style=plot.style_l
 plot(vahPlot, "Profile VAH", color=color.new(color.green, 20), linewidth=1, style=plot.style_linebr)
 plot(valPlot, "Profile VAL", color=color.new(color.red, 20), linewidth=1, style=plot.style_linebr)
 
+//------------------------------------------------------------------------------
+// Diagnostics
+//------------------------------------------------------------------------------
 int freshZones = 0
 int partialZones = 0
 int mitigatedZones = 0
@@ -674,14 +739,14 @@ if zoneCount > 0
             else if t == "BRK"
                 breakerZones += 1
 
-var table diag = table.new(position.top_right, 2, 20, border_width=1, frame_width=1, bgcolor=color.new(color.black, 15))
+var table diag = table.new(position.top_right, 2, 22, border_width=1, frame_width=1, bgcolor=color.new(color.black, 15))
 f_setRow(int row, string labelText, string valueText) =>
     table.cell(diag, 0, row, labelText, text_color=color.silver, bgcolor=color.new(color.black, 15), text_halign=text.align_left)
     table.cell(diag, 1, row, valueText, text_color=color.white, bgcolor=color.new(color.black, 15), text_halign=text.align_right)
 
 if barstate.islast
     if showTable
-        table.clear(diag, 0, 0, 1, 19)
+        table.clear(diag, 0, 0, 1, 21)
         f_setRow(0, "PLUTUS", "P05.2 Refined Lifecycle")
         f_setRow(1, "Fresh / Partial", str.tostring(freshZones) + " / " + str.tostring(partialZones))
         f_setRow(2, "Mitigated", str.tostring(mitigatedZones))
@@ -693,14 +758,16 @@ if barstate.islast
         f_setRow(8, "Mitigation Basis", mitigationBasis)
         f_setRow(9, "OB Range", obRangeMode)
         f_setRow(10, "Structure Lookback", str.tostring(structureLookback))
-        f_setRow(11, "Min Disp / ATR", str.tostring(minDisplacementAtr, "#.##"))
-        f_setRow(12, "Min Efficiency", str.tostring(minDisplacementEfficiency, "#.##"))
-        f_setRow(13, "P01", not na(p01Signed) ? str.tostring(p01Signed, "#.0") : "N/A")
-        f_setRow(14, "P02", not na(p02Signed) ? str.tostring(p02Signed, "#.0") : "N/A")
-        f_setRow(15, "P03", not na(p03Signed) ? str.tostring(p03Signed, "#.0") : "N/A")
-        f_setRow(16, "P04", not na(p04Signed) ? str.tostring(p04Signed, "#.0") : "N/A")
-        f_setRow(17, "Histogram", showHistogram ? "ON " + str.tostring(histogramRows) + " rows" : "OFF")
-        f_setRow(18, "Profile Scope", profileScope)
-        f_setRow(19, "Tracked Zones", str.tostring(zoneCount))
+        f_setRow(11, "Min FVG ATR", str.tostring(minFvgAtr, "#.##"))
+        f_setRow(12, "Min FVG Ticks", str.tostring(minFvgTicks))
+        f_setRow(13, "Anti-Gap Filter", requireDisplacementFvg ? "ON" : "OFF")
+        f_setRow(14, "Nested FVG Filter", suppressNestedFvg ? "ON" : "OFF")
+        f_setRow(15, "P01", not na(p01Signed) ? str.tostring(p01Signed, "#.0") : "N/A")
+        f_setRow(16, "P02", not na(p02Signed) ? str.tostring(p02Signed, "#.0") : "N/A")
+        f_setRow(17, "P03", not na(p03Signed) ? str.tostring(p03Signed, "#.0") : "N/A")
+        f_setRow(18, "P04", not na(p04Signed) ? str.tostring(p04Signed, "#.0") : "N/A")
+        f_setRow(19, "Histogram", showHistogram ? "ON " + str.tostring(histogramRows) + " rows" : "OFF")
+        f_setRow(20, "Profile Scope", profileScope)
+        f_setRow(21, "Tracked Zones", str.tostring(zoneCount))
     else
-        table.clear(diag, 0, 0, 1, 19)
+        table.clear(diag, 0, 0, 1, 21)
