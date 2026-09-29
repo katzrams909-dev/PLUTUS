@@ -1,0 +1,377 @@
+//@version=6
+indicator("PLUTUS P05.0 — Institutional Zone Candidates", shorttitle="PLUTUS P05.0", overlay=true, max_boxes_count=120, max_labels_count=50)
+
+//==============================================================================
+// PLUTUS P05.0 — Candidate Detection + Qualification Framework
+// Detects FVG, Order Block and Breaker candidates, manages their lifecycle,
+// and assigns a bounded local qualification score. This is a prototype context
+// engine only — no trade signals.
+//==============================================================================
+
+//------------------------------------------------------------------------------
+// Inputs
+//------------------------------------------------------------------------------
+groupDetection = "Candidate Detection"
+atrLen = input.int(14, "ATR Length", minval=1, group=groupDetection)
+volumeLen = input.int(20, "Relative Volume Length", minval=2, group=groupDetection)
+minDisplacementAtr = input.float(0.35, "Minimum Displacement Body / ATR", minval=0.05, step=0.05, group=groupDetection)
+minFvgAtr = input.float(0.05, "Minimum FVG Width / ATR", minval=0.0, step=0.01, group=groupDetection)
+maxZoneWidthAtr = input.float(2.0, "Maximum Zone Width / ATR", minval=0.25, step=0.25, group=groupDetection)
+detectFvg = input.bool(true, "Detect FVG Candidates", group=groupDetection)
+detectOb = input.bool(true, "Detect Order Block Candidates", group=groupDetection)
+detectBreakers = input.bool(true, "Create Breakers From Invalidated OBs", group=groupDetection)
+
+groupQualification = "Qualification"
+minQualificationScore = input.float(55.0, "Institutional Qualification Score", minval=0.0, maxval=100.0, step=5.0, group=groupQualification)
+fullRvol = input.float(2.0, "Full Participation RVOL", minval=1.0, step=0.1, group=groupQualification)
+fullDisplacementAtr = input.float(1.0, "Full Displacement / ATR", minval=0.10, step=0.10, group=groupQualification)
+mitigationPenalty = input.float(15.0, "Mitigation Score Penalty", minval=0.0, maxval=50.0, step=5.0, group=groupQualification)
+breakerScoreFactor = input.float(0.80, "Breaker Score Factor", minval=0.25, maxval=1.0, step=0.05, group=groupQualification)
+
+groupLifecycle = "Lifecycle / Object Discipline"
+maxTrackedZones = input.int(24, "Maximum Tracked Zones", minval=4, maxval=80, group=groupLifecycle)
+maxZoneAgeBars = input.int(250, "Maximum Zone Age (Bars)", minval=10, maxval=2000, group=groupLifecycle)
+removeInvalidated = input.bool(true, "Remove Invalidated Zones", group=groupLifecycle)
+removeExpired = input.bool(true, "Remove Expired Zones", group=groupLifecycle)
+
+groupDisplay = "Display"
+showCandidates = input.bool(true, "Show Candidate Zones", group=groupDisplay)
+showOnlyQualified = input.bool(false, "Show Only Qualified Zones", group=groupDisplay)
+showZoneText = input.bool(true, "Show Zone Type / Score", group=groupDisplay)
+showTable = input.bool(true, "Show Diagnostic Table", group=groupDisplay)
+
+//------------------------------------------------------------------------------
+// Helpers
+//------------------------------------------------------------------------------
+f_clamp(float x, float lo, float hi) =>
+    math.max(lo, math.min(hi, x))
+
+//------------------------------------------------------------------------------
+// Local evidence used by P05.0 qualification.
+// P05.1+ will replace/augment these local proxies with direct P01-P04 outputs.
+//------------------------------------------------------------------------------
+float atr = ta.atr(atrLen)
+float volumeBase = ta.sma(volume, volumeLen)
+float rvol = not na(volume) and not na(volumeBase) and volumeBase > 0.0 ? volume / volumeBase : na
+float body = math.abs(close - open)
+float candleRange = math.max(high - low, syminfo.mintick)
+float bodyAtr = not na(atr) and atr > 0.0 ? body / atr : na
+float bodyEfficiency = body / candleRange
+float displacementScore = not na(bodyAtr) ? f_clamp(bodyAtr / fullDisplacementAtr * 35.0, 0.0, 35.0) : 0.0
+float participationScore = not na(rvol) ? f_clamp((rvol - 1.0) / math.max(fullRvol - 1.0, 0.01) * 30.0, 0.0, 30.0) : 0.0
+float efficiencyScore = f_clamp(bodyEfficiency * 20.0, 0.0, 20.0)
+
+bool bullishDisplacement = close > open and not na(bodyAtr) and bodyAtr >= minDisplacementAtr
+bool bearishDisplacement = close < open and not na(bodyAtr) and bodyAtr >= minDisplacementAtr
+
+//------------------------------------------------------------------------------
+// Zone storage
+// direction: +1 bullish, -1 bearish
+// status: 0 active/fresh, 1 mitigated, 2 invalidated, 3 expired
+// type: FVG / OB / BRK
+//------------------------------------------------------------------------------
+var array<box> zoneBoxes = array.new_box()
+var array<float> zoneTops = array.new_float()
+var array<float> zoneBottoms = array.new_float()
+var array<float> zoneScores = array.new_float()
+var array<int> zoneDirections = array.new_int()
+var array<int> zoneBornBars = array.new_int()
+var array<int> zoneStatuses = array.new_int()
+var array<string> zoneTypes = array.new_string()
+
+//------------------------------------------------------------------------------
+// Candidate definitions
+//------------------------------------------------------------------------------
+bool bullFvg = detectFvg and bar_index >= 2 and low > high[2]
+bool bearFvg = detectFvg and bar_index >= 2 and high < low[2]
+float bullFvgWidthAtr = bullFvg and not na(atr) and atr > 0.0 ? (low - high[2]) / atr : na
+float bearFvgWidthAtr = bearFvg and not na(atr) and atr > 0.0 ? (low[2] - high) / atr : na
+bullFvg := bullFvg and not na(bullFvgWidthAtr) and bullFvgWidthAtr >= minFvgAtr and bullFvgWidthAtr <= maxZoneWidthAtr
+bearFvg := bearFvg and not na(bearFvgWidthAtr) and bearFvgWidthAtr >= minFvgAtr and bearFvgWidthAtr <= maxZoneWidthAtr
+
+bool bullOb = detectOb and bar_index >= 1 and close[1] < open[1] and bullishDisplacement and close > high[1]
+bool bearOb = detectOb and bar_index >= 1 and close[1] > open[1] and bearishDisplacement and close < low[1]
+float bullObWidthAtr = bullOb and not na(atr) and atr > 0.0 ? (high[1] - low[1]) / atr : na
+float bearObWidthAtr = bearOb and not na(atr) and atr > 0.0 ? (high[1] - low[1]) / atr : na
+bullOb := bullOb and not na(bullObWidthAtr) and bullObWidthAtr <= maxZoneWidthAtr
+bearOb := bearOb and not na(bearObWidthAtr) and bearObWidthAtr <= maxZoneWidthAtr
+
+// Width quality rewards usable, non-excessive zones but does not require a
+// single ideal width. Full credit up to 1 ATR, then tapers to zero by max width.
+f_widthScore(float widthAtr) =>
+    float s = na(widthAtr) ? 0.0 : widthAtr <= 1.0 ? 15.0 : 15.0 * (1.0 - (widthAtr - 1.0) / math.max(maxZoneWidthAtr - 1.0, 0.01))
+    f_clamp(s, 0.0, 15.0)
+
+//------------------------------------------------------------------------------
+// Add FVG candidates
+//------------------------------------------------------------------------------
+if bullFvg
+    float zTop = low
+    float zBottom = high[2]
+    float zScore = f_clamp(displacementScore + participationScore + efficiencyScore + f_widthScore(bullFvgWidthAtr), 0.0, 100.0)
+    bool qualified = zScore >= minQualificationScore
+    color fill = qualified ? color.new(color.teal, 80) : color.new(color.teal, 92)
+    box b = box.new(bar_index - 2, zTop, bar_index, zBottom, xloc=xloc.bar_index, extend=extend.right, border_color=color.new(color.teal, qualified ? 25 : 70), bgcolor=fill)
+    if showZoneText
+        box.set_text(b, "FVG B " + str.tostring(zScore, "#.0"))
+        box.set_text_color(b, color.new(color.white, qualified ? 10 : 45))
+    array.push(zoneBoxes, b)
+    array.push(zoneTops, zTop)
+    array.push(zoneBottoms, zBottom)
+    array.push(zoneScores, zScore)
+    array.push(zoneDirections, 1)
+    array.push(zoneBornBars, bar_index)
+    array.push(zoneStatuses, 0)
+    array.push(zoneTypes, "FVG")
+
+if bearFvg
+    float zTop = low[2]
+    float zBottom = high
+    float zScore = f_clamp(displacementScore + participationScore + efficiencyScore + f_widthScore(bearFvgWidthAtr), 0.0, 100.0)
+    bool qualified = zScore >= minQualificationScore
+    color fill = qualified ? color.new(color.maroon, 80) : color.new(color.maroon, 92)
+    box b = box.new(bar_index - 2, zTop, bar_index, zBottom, xloc=xloc.bar_index, extend=extend.right, border_color=color.new(color.red, qualified ? 25 : 70), bgcolor=fill)
+    if showZoneText
+        box.set_text(b, "FVG S " + str.tostring(zScore, "#.0"))
+        box.set_text_color(b, color.new(color.white, qualified ? 10 : 45))
+    array.push(zoneBoxes, b)
+    array.push(zoneTops, zTop)
+    array.push(zoneBottoms, zBottom)
+    array.push(zoneScores, zScore)
+    array.push(zoneDirections, -1)
+    array.push(zoneBornBars, bar_index)
+    array.push(zoneStatuses, 0)
+    array.push(zoneTypes, "FVG")
+
+//------------------------------------------------------------------------------
+// Add OB candidates
+//------------------------------------------------------------------------------
+if bullOb
+    float zTop = high[1]
+    float zBottom = low[1]
+    float zScore = f_clamp(displacementScore + participationScore + efficiencyScore + f_widthScore(bullObWidthAtr), 0.0, 100.0)
+    bool qualified = zScore >= minQualificationScore
+    color fill = qualified ? color.new(color.green, 82) : color.new(color.green, 93)
+    box b = box.new(bar_index - 1, zTop, bar_index, zBottom, xloc=xloc.bar_index, extend=extend.right, border_color=color.new(color.green, qualified ? 20 : 70), bgcolor=fill)
+    if showZoneText
+        box.set_text(b, "OB B " + str.tostring(zScore, "#.0"))
+        box.set_text_color(b, color.new(color.white, qualified ? 10 : 45))
+    array.push(zoneBoxes, b)
+    array.push(zoneTops, zTop)
+    array.push(zoneBottoms, zBottom)
+    array.push(zoneScores, zScore)
+    array.push(zoneDirections, 1)
+    array.push(zoneBornBars, bar_index)
+    array.push(zoneStatuses, 0)
+    array.push(zoneTypes, "OB")
+
+if bearOb
+    float zTop = high[1]
+    float zBottom = low[1]
+    float zScore = f_clamp(displacementScore + participationScore + efficiencyScore + f_widthScore(bearObWidthAtr), 0.0, 100.0)
+    bool qualified = zScore >= minQualificationScore
+    color fill = qualified ? color.new(color.red, 82) : color.new(color.red, 93)
+    box b = box.new(bar_index - 1, zTop, bar_index, zBottom, xloc=xloc.bar_index, extend=extend.right, border_color=color.new(color.red, qualified ? 20 : 70), bgcolor=fill)
+    if showZoneText
+        box.set_text(b, "OB S " + str.tostring(zScore, "#.0"))
+        box.set_text_color(b, color.new(color.white, qualified ? 10 : 45))
+    array.push(zoneBoxes, b)
+    array.push(zoneTops, zTop)
+    array.push(zoneBottoms, zBottom)
+    array.push(zoneScores, zScore)
+    array.push(zoneDirections, -1)
+    array.push(zoneBornBars, bar_index)
+    array.push(zoneStatuses, 0)
+    array.push(zoneTypes, "OB")
+
+//------------------------------------------------------------------------------
+// Lifecycle: mitigation, invalidation, expiry and OB -> Breaker conversion.
+// Breakers are queued during the scan, then appended afterward to avoid changing
+// array sizes while iterating.
+//------------------------------------------------------------------------------
+var array<float> pendingBrkTops = array.new_float()
+var array<float> pendingBrkBottoms = array.new_float()
+var array<float> pendingBrkScores = array.new_float()
+var array<int> pendingBrkDirections = array.new_int()
+array.clear(pendingBrkTops)
+array.clear(pendingBrkBottoms)
+array.clear(pendingBrkScores)
+array.clear(pendingBrkDirections)
+
+int trackedNow = array.size(zoneBoxes)
+if trackedNow > 0
+    for i = 0 to trackedNow - 1
+        int status = array.get(zoneStatuses, i)
+        if status < 2
+            float zTop = array.get(zoneTops, i)
+            float zBottom = array.get(zoneBottoms, i)
+            float zScore = array.get(zoneScores, i)
+            int zDir = array.get(zoneDirections, i)
+            int born = array.get(zoneBornBars, i)
+            string zType = array.get(zoneTypes, i)
+            box b = array.get(zoneBoxes, i)
+
+            bool touched = high >= zBottom and low <= zTop
+            bool invalid = (zDir == 1 and close < zBottom) or (zDir == -1 and close > zTop)
+            bool expired = bar_index - born > maxZoneAgeBars
+
+            if invalid
+                array.set(zoneStatuses, i, 2)
+                if not na(b)
+                    box.set_extend(b, extend.none)
+                    box.set_right(b, bar_index)
+                    if removeInvalidated
+                        box.delete(b)
+                        array.set(zoneBoxes, i, na)
+                    else
+                        box.set_bgcolor(b, color.new(color.gray, 94))
+                        box.set_border_color(b, color.new(color.gray, 80))
+
+                if detectBreakers and zType == "OB"
+                    int brkDir = -zDir
+                    float brkScore = f_clamp(zScore * breakerScoreFactor, 0.0, 100.0)
+                    array.push(pendingBrkTops, zTop)
+                    array.push(pendingBrkBottoms, zBottom)
+                    array.push(pendingBrkScores, brkScore)
+                    array.push(pendingBrkDirections, brkDir)
+
+            else if expired
+                array.set(zoneStatuses, i, 3)
+                if not na(b)
+                    box.set_extend(b, extend.none)
+                    box.set_right(b, bar_index)
+                    if removeExpired
+                        box.delete(b)
+                        array.set(zoneBoxes, i, na)
+                    else
+                        box.set_bgcolor(b, color.new(color.gray, 96))
+                        box.set_border_color(b, color.new(color.gray, 85))
+
+            else if touched and status == 0 and bar_index > born
+                float newScore = f_clamp(zScore - mitigationPenalty, 0.0, 100.0)
+                array.set(zoneStatuses, i, 1)
+                array.set(zoneScores, i, newScore)
+                if not na(b)
+                    box.set_bgcolor(b, color.new(zDir == 1 ? color.green : color.red, 91))
+                    if showZoneText
+                        box.set_text(b, zType + (zDir == 1 ? " B " : " S ") + str.tostring(newScore, "#.0") + " M")
+
+// Add queued breakers after lifecycle scan.
+int pendingCount = array.size(pendingBrkTops)
+if pendingCount > 0
+    for j = 0 to pendingCount - 1
+        float zTop = array.get(pendingBrkTops, j)
+        float zBottom = array.get(pendingBrkBottoms, j)
+        float zScore = array.get(pendingBrkScores, j)
+        int zDir = array.get(pendingBrkDirections, j)
+        bool qualified = zScore >= minQualificationScore
+        color baseColor = zDir == 1 ? color.aqua : color.fuchsia
+        box b = box.new(bar_index, zTop, bar_index + 1, zBottom, xloc=xloc.bar_index, extend=extend.right, border_color=color.new(baseColor, qualified ? 20 : 70), bgcolor=color.new(baseColor, qualified ? 84 : 94))
+        if showZoneText
+            box.set_text(b, "BRK " + (zDir == 1 ? "B " : "S ") + str.tostring(zScore, "#.0"))
+            box.set_text_color(b, color.new(color.white, qualified ? 10 : 45))
+        array.push(zoneBoxes, b)
+        array.push(zoneTops, zTop)
+        array.push(zoneBottoms, zBottom)
+        array.push(zoneScores, zScore)
+        array.push(zoneDirections, zDir)
+        array.push(zoneBornBars, bar_index)
+        array.push(zoneStatuses, 0)
+        array.push(zoneTypes, "BRK")
+
+//------------------------------------------------------------------------------
+// Enforce bounded storage. Oldest tracked record is removed first.
+//------------------------------------------------------------------------------
+while array.size(zoneBoxes) > maxTrackedZones
+    box oldBox = array.shift(zoneBoxes)
+    if not na(oldBox)
+        box.delete(oldBox)
+    array.shift(zoneTops)
+    array.shift(zoneBottoms)
+    array.shift(zoneScores)
+    array.shift(zoneDirections)
+    array.shift(zoneBornBars)
+    array.shift(zoneStatuses)
+    array.shift(zoneTypes)
+
+//------------------------------------------------------------------------------
+// Display filtering. Logic remains active even when boxes are hidden.
+//------------------------------------------------------------------------------
+int activeCount = 0
+int qualifiedCount = 0
+int mitigatedCount = 0
+int fvgCount = 0
+int obCount = 0
+int breakerCount = 0
+float bestScore = na
+string bestType = "N/A"
+int bestDirection = 0
+
+int finalCount = array.size(zoneBoxes)
+if finalCount > 0
+    for i = 0 to finalCount - 1
+        int status = array.get(zoneStatuses, i)
+        float zScore = array.get(zoneScores, i)
+        int zDir = array.get(zoneDirections, i)
+        string zType = array.get(zoneTypes, i)
+        box b = array.get(zoneBoxes, i)
+        bool active = status < 2
+        bool qualified = zScore >= minQualificationScore
+
+        if active
+            activeCount += 1
+            if qualified
+                qualifiedCount += 1
+            if status == 1
+                mitigatedCount += 1
+            if zType == "FVG"
+                fvgCount += 1
+            else if zType == "OB"
+                obCount += 1
+            else if zType == "BRK"
+                breakerCount += 1
+
+            if na(bestScore) or zScore > bestScore
+                bestScore := zScore
+                bestType := zType
+                bestDirection := zDir
+
+        if not na(b)
+            bool visible = showCandidates and active and (not showOnlyQualified or qualified)
+            box.set_bgcolor(b, visible ? (zType == "FVG" ? color.new(zDir == 1 ? color.teal : color.maroon, qualified ? 80 : 92) : zType == "BRK" ? color.new(zDir == 1 ? color.aqua : color.fuchsia, qualified ? 84 : 94) : color.new(zDir == 1 ? color.green : color.red, qualified ? (status == 1 ? 91 : 82) : 93)) : color.new(color.gray, 100))
+            box.set_border_color(b, visible ? color.new(zDir == 1 ? color.green : color.red, qualified ? 25 : 75) : color.new(color.gray, 100))
+
+//------------------------------------------------------------------------------
+// Diagnostics
+//------------------------------------------------------------------------------
+string bestZone = na(bestScore) ? "N/A" : bestType + (bestDirection == 1 ? " B " : " S ") + str.tostring(bestScore, "#.0")
+string currentEvidence = "Disp " + str.tostring(displacementScore, "#.0") + " | Vol " + str.tostring(participationScore, "#.0") + " | Eff " + str.tostring(efficiencyScore, "#.0")
+
+var table diag = table.new(position.top_right, 2, 18, border_width=1, frame_width=1, bgcolor=color.new(color.black, 15))
+f_setRow(int row, string labelText, string valueText) =>
+    table.cell(diag, 0, row, labelText, text_color=color.silver, bgcolor=color.new(color.black, 15), text_halign=text.align_left)
+    table.cell(diag, 1, row, valueText, text_color=color.white, bgcolor=color.new(color.black, 15), text_halign=text.align_right)
+
+if barstate.islast
+    if showTable
+        table.clear(diag, 0, 0, 1, 17)
+        f_setRow(0, "PLUTUS", "P05.0 Zone Candidates")
+        f_setRow(1, "Tracked", str.tostring(finalCount) + " / " + str.tostring(maxTrackedZones))
+        f_setRow(2, "Active", str.tostring(activeCount))
+        f_setRow(3, "Qualified", str.tostring(qualifiedCount))
+        f_setRow(4, "Mitigated", str.tostring(mitigatedCount))
+        f_setRow(5, "FVG", str.tostring(fvgCount))
+        f_setRow(6, "OB", str.tostring(obCount))
+        f_setRow(7, "Breaker", str.tostring(breakerCount))
+        f_setRow(8, "Best Zone", bestZone)
+        f_setRow(9, "Qualification Min", str.tostring(minQualificationScore, "#.0"))
+        f_setRow(10, "RVOL", not na(rvol) ? str.tostring(rvol, "#.##") : "N/A")
+        f_setRow(11, "Body / ATR", not na(bodyAtr) ? str.tostring(bodyAtr, "#.###") : "N/A")
+        f_setRow(12, "Evidence", currentEvidence)
+        f_setRow(13, "Bull FVG", bullFvg ? "YES" : "NO")
+        f_setRow(14, "Bear FVG", bearFvg ? "YES" : "NO")
+        f_setRow(15, "Bull OB", bullOb ? "YES" : "NO")
+        f_setRow(16, "Bear OB", bearOb ? "YES" : "NO")
+        f_setRow(17, "Confirmed", barstate.isconfirmed ? "YES" : "NO")
+    else
+        table.clear(diag, 0, 0, 1, 17)
