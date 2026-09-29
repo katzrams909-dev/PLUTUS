@@ -1,5 +1,5 @@
 //@version=6
-indicator("PLUTUS P05.1 — Institutional Qualification", shorttitle="PLUTUS P05.1", overlay=true, max_boxes_count=120, max_labels_count=50)
+indicator("PLUTUS P05.1 — Institutional Qualification", shorttitle="PLUTUS P05.1", overlay=true, max_boxes_count=200, max_labels_count=50)
 
 //==============================================================================
 // PLUTUS P05.1 — Institutional Qualification Integration
@@ -81,6 +81,13 @@ showZoneText = input.bool(true, "Show Zone Type / Score", group=groupDisplay)
 showValueLevels = input.bool(false, "Show Profile POC / VAH / VAL", group=groupDisplay)
 showVwap = input.bool(false, "Show Primary VWAP", group=groupDisplay)
 showTable = input.bool(true, "Show Diagnostic Table", group=groupDisplay)
+
+groupHistogram = "Volume Profile Histogram"
+showHistogram = input.bool(false, "Show Volume Profile Histogram", group=groupHistogram)
+histogramOffset = input.int(4, "Right Offset (Bars)", minval=1, maxval=50, group=groupHistogram)
+histogramMaxWidth = input.int(24, "Maximum Width (Bars)", minval=5, maxval=100, group=groupHistogram)
+showValueAreaHighlight = input.bool(true, "Highlight Value Area", group=groupHistogram)
+showPocHighlight = input.bool(true, "Highlight POC Bin", group=groupHistogram)
 
 //------------------------------------------------------------------------------
 // Helpers
@@ -252,6 +259,11 @@ float valueRef = switch valueReference
     "Weekly" => weeklyVwap
     "Monthly" => monthlyVwap
     => dailyVwap
+bool valueReset = switch valueReference
+    "Active Session" => newNewYork or newLondon or newAsia
+    "Weekly" => newWeek
+    "Monthly" => newMonth
+    => newDay
 
 float vwapDistanceAtr = not na(valueRef) and not na(atr) and atr > 0.0 ? (close - valueRef) / atr : na
 float vwapSlopeAtr = not na(valueRef) and not na(valueRef[vwapSlopeLookback]) and not na(atr) and atr > 0.0 ? (valueRef - valueRef[vwapSlopeLookback]) / atr : na
@@ -270,9 +282,12 @@ var array<float> profileHighs = array.new_float()
 var array<float> profileLows = array.new_float()
 var array<float> profileVolumes = array.new_float()
 var array<float> bins = array.new_float()
+var array<box> histBoxes = array.new_box()
 if barstate.isfirst
     for i = 0 to binCount - 1
         array.push(bins, 0.0)
+        box hb = box.new(bar_index, close, bar_index, close, xloc=xloc.bar_index, border_width=0, bgcolor=color.new(color.gray, 100))
+        array.push(histBoxes, hb)
 
 float profileHigh = na
 float profileLow = na
@@ -632,12 +647,49 @@ while array.size(zoneBoxes) > maxTrackedZones
     array.shift(zoneDirections), array.shift(zoneBornBars), array.shift(zoneStatuses), array.shift(zoneTypes)
 
 //------------------------------------------------------------------------------
-// Optional context plots
+// Optional histogram — fixed reusable box pool; fully hides when toggled off.
 //------------------------------------------------------------------------------
-plot(showVwap ? valueRef : na, "Primary VWAP", color=color.new(color.blue, 20), linewidth=2, style=plot.style_linebr)
-plot(showValueLevels and profileActive ? pocPrice : na, "Profile POC", color=color.orange, linewidth=2, style=plot.style_linebr)
-plot(showValueLevels and profileActive ? vahPrice : na, "Profile VAH", color=color.new(color.green, 20), linewidth=1, style=plot.style_linebr)
-plot(showValueLevels and profileActive ? valPrice : na, "Profile VAL", color=color.new(color.red, 20), linewidth=1, style=plot.style_linebr)
+if barstate.islast
+    float histMax = storedProfileBars > 0 ? array.max(bins) : na
+    for i = 0 to binCount - 1
+        box hb = array.get(histBoxes, i)
+        if showHistogram and profileActive and not profileReset and storedProfileBars > 0 and not na(histMax) and histMax > 0.0 and not na(binSize)
+            float binVol = array.get(bins, i)
+            float ratio = binVol / histMax
+            int widthBars = math.max(1, int(math.round(ratio * histogramMaxWidth)))
+            int rightX = bar_index + histogramOffset + histogramMaxWidth
+            int leftX = rightX - widthBars
+            float bottomY = profileLow + i * binSize
+            float topY = bottomY + binSize
+            bool inValueArea = not na(vaLowIndex) and not na(vaHighIndex) and i >= vaLowIndex and i <= vaHighIndex
+            bool isPocBin = not na(pocIndex) and i == pocIndex
+            color fillColor = isPocBin and showPocHighlight ? color.new(color.orange, 15) : inValueArea and showValueAreaHighlight ? color.new(color.blue, 55) : color.new(color.gray, 78)
+            box.set_left(hb, leftX)
+            box.set_right(hb, rightX)
+            box.set_bottom(hb, bottomY)
+            box.set_top(hb, topY)
+            box.set_bgcolor(hb, fillColor)
+            box.set_border_color(hb, color.new(fillColor, 100))
+        else
+            box.set_left(hb, bar_index)
+            box.set_right(hb, bar_index)
+            box.set_bottom(hb, close)
+            box.set_top(hb, close)
+            box.set_bgcolor(hb, color.new(color.gray, 100))
+            box.set_border_color(hb, color.new(color.gray, 100))
+
+//------------------------------------------------------------------------------
+// Optional context plots — explicit reset-bar NA creates hard period breaks.
+//------------------------------------------------------------------------------
+float vwapPlot = showVwap and not valueReset ? valueRef : na
+float pocPlot = showValueLevels and profileActive and not profileReset ? pocPrice : na
+float vahPlot = showValueLevels and profileActive and not profileReset ? vahPrice : na
+float valPlot = showValueLevels and profileActive and not profileReset ? valPrice : na
+
+plot(vwapPlot, "Primary VWAP", color=color.new(color.blue, 20), linewidth=2, style=plot.style_linebr)
+plot(pocPlot, "Profile POC", color=color.orange, linewidth=2, style=plot.style_linebr)
+plot(vahPlot, "Profile VAH", color=color.new(color.green, 20), linewidth=1, style=plot.style_linebr)
+plot(valPlot, "Profile VAL", color=color.new(color.red, 20), linewidth=1, style=plot.style_linebr)
 
 //------------------------------------------------------------------------------
 // Diagnostics
@@ -669,14 +721,14 @@ if zoneCount > 0
 string ltfStatus = ltfIsLower ? (proxyAvailable ? "VALID" : "LOWER_NO_DATA") : "INVALID_USE_LOWER_TF"
 string lastDirText = lastCandidateDirection == 1 ? "BULLISH" : lastCandidateDirection == -1 ? "BEARISH" : "NONE"
 
-var table diag = table.new(position.top_right, 2, 26, border_width=1, frame_width=1, bgcolor=color.new(color.black, 15))
+var table diag = table.new(position.top_right, 2, 27, border_width=1, frame_width=1, bgcolor=color.new(color.black, 15))
 f_setRow(int row, string labelText, string valueText) =>
     table.cell(diag, 0, row, labelText, text_color=color.silver, bgcolor=color.new(color.black, 15), text_halign=text.align_left)
     table.cell(diag, 1, row, valueText, text_color=color.white, bgcolor=color.new(color.black, 15), text_halign=text.align_right)
 
 if barstate.islast
     if showTable
-        table.clear(diag, 0, 0, 1, 25)
+        table.clear(diag, 0, 0, 1, 26)
         f_setRow(0, "PLUTUS", "P05.1 Qualification")
         f_setRow(1, "LTF Status", ltfStatus)
         f_setRow(2, "Intrabars", str.tostring(intrabarCount))
@@ -703,5 +755,6 @@ if barstate.islast
         f_setRow(23, "VAH", not na(vahPrice) ? str.tostring(vahPrice, format.mintick) : "N/A")
         f_setRow(24, "VAL", not na(valPrice) ? str.tostring(valPrice, format.mintick) : "N/A")
         f_setRow(25, "VWAP", not na(valueRef) ? str.tostring(valueRef, format.mintick) : "N/A")
+        f_setRow(26, "Histogram", showHistogram ? "ON" : "OFF")
     else
-        table.clear(diag, 0, 0, 1, 25)
+        table.clear(diag, 0, 0, 1, 26)
