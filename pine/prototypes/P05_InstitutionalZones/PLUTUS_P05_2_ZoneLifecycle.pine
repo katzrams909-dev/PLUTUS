@@ -1,5 +1,5 @@
 //@version=6
-indicator("PLUTUS P05.2 — Zone Lifecycle", shorttitle="PLUTUS P05.2", overlay=true, max_boxes_count=220, max_labels_count=50)
+indicator("PLUTUS P05.2 — Zone Lifecycle", shorttitle="PLUTUS P05.2", overlay=true, max_boxes_count=500, max_labels_count=50)
 
 //==============================================================================
 // PLUTUS P05.2 — Refined Institutional Zone Lifecycle
@@ -72,7 +72,7 @@ showZoneText = input.bool(true, "Show Type / Score / Lifecycle", group=groupDisp
 showVwap = input.bool(false, "Show Primary VWAP", group=groupDisplay)
 showValueLevels = input.bool(false, "Show Profile POC / VAH / VAL", group=groupDisplay)
 showHistogram = input.bool(false, "Show Volume Profile Histogram", group=groupDisplay)
-histogramRowSize = input.int(1, "Histogram Row Size (Profile Bins)", minval=1, maxval=8, group=groupDisplay)
+histogramRows = input.int(80, "Histogram Rows", minval=16, maxval=160, step=8, group=groupDisplay)
 histogramOffset = input.int(4, "Histogram Right Offset", minval=1, maxval=50, group=groupDisplay)
 histogramMaxWidth = input.int(24, "Histogram Maximum Width", minval=5, maxval=100, group=groupDisplay)
 showTable = input.bool(true, "Show Diagnostic Table", group=groupDisplay)
@@ -208,10 +208,13 @@ var array<float> profileHighs = array.new_float()
 var array<float> profileLows = array.new_float()
 var array<float> profileVolumes = array.new_float()
 var array<float> bins = array.new_float()
+var array<float> histBins = array.new_float()
 var array<box> histBoxes = array.new_box()
 if barstate.isfirst
     for i = 0 to binCount - 1
         array.push(bins, 0.0)
+    for i = 0 to histogramRows - 1
+        array.push(histBins, 0.0)
         box hb = box.new(bar_index, close, bar_index, close, xloc=xloc.bar_index, border_width=0, bgcolor=color.new(color.gray, 100))
         array.push(histBoxes, hb)
 
@@ -574,31 +577,52 @@ while array.size(zoneScores) > maxTrackedZones
     array.shift(zoneLastTouchBars)
     array.shift(zoneTypes)
 
+//------------------------------------------------------------------------------
+// Histogram — independent visual resolution.
+// Histogram Rows does not alter analytical profile bins / POC / VAH / VAL.
+//------------------------------------------------------------------------------
 if barstate.islast
-    for i = 0 to binCount - 1
-        box hb = array.get(histBoxes, i)
-        bool rowStart = i % histogramRowSize == 0
-        if showHistogram and rowStart and profileActive and storedProfileBars > 0 and not na(maxBinVolume) and maxBinVolume > 0.0 and not na(binSize)
-            int rowEnd = math.min(binCount - 1, i + histogramRowSize - 1)
-            float rowVol = 0.0
-            for r = i to rowEnd
-                rowVol += array.get(bins, r)
-            float rowMaxReference = maxBinVolume * histogramRowSize
-            float ratio = rowMaxReference > 0.0 ? f_clamp(rowVol / rowMaxReference, 0.0, 1.0) : 0.0
-            int widthBars = math.max(1, int(math.round(ratio * histogramMaxWidth)))
+    float histRowHeight = storedProfileBars > 0 and not na(profileHigh) and not na(profileLow) ? math.max((profileHigh - profileLow) / histogramRows, syminfo.mintick) : na
+    float histMaxVolume = 0.0
+    if showHistogram and profileActive and storedProfileBars > 0 and not na(histRowHeight)
+        for h = 0 to histogramRows - 1
+            array.set(histBins, h, 0.0)
+        for pIdx = 0 to storedProfileBars - 1
+            float hp = array.get(profilePrices, pIdx)
+            float hv = array.get(profileVolumes, pIdx)
+            int hIdx = int(math.floor((hp - profileLow) / histRowHeight))
+            hIdx := math.max(0, math.min(histogramRows - 1, hIdx))
+            float newVol = array.get(histBins, hIdx) + hv
+            array.set(histBins, hIdx, newVol)
+            histMaxVolume := math.max(histMaxVolume, newVol)
+
+    for h = 0 to histogramRows - 1
+        box hb = array.get(histBoxes, h)
+        if showHistogram and profileActive and storedProfileBars > 0 and not na(histRowHeight) and histMaxVolume > 0.0
+            float rowVol = array.get(histBins, h)
+            float ratio = f_clamp(rowVol / histMaxVolume, 0.0, 1.0)
+            int widthBars = rowVol > 0.0 ? math.max(1, int(math.round(ratio * histogramMaxWidth))) : 0
             int rightX = bar_index + histogramOffset + histogramMaxWidth
             int leftX = rightX - widthBars
-            float bottomY = profileLow + i * binSize
-            float topY = profileLow + (rowEnd + 1) * binSize
-            bool rowHasPoc = not na(pocIndex) and pocIndex >= i and pocIndex <= rowEnd
-            bool rowInValue = not na(vaLowIndex) and not na(vaHighIndex) and rowEnd >= vaLowIndex and i <= vaHighIndex
+            float bottomY = profileLow + h * histRowHeight
+            float topY = h == histogramRows - 1 ? profileHigh : bottomY + histRowHeight
+            bool rowHasPoc = not na(pocPrice) and pocPrice >= bottomY and pocPrice <= topY
+            bool rowInValue = not na(vahPrice) and not na(valPrice) and topY >= valPrice and bottomY <= vahPrice
             color fillColor = rowHasPoc ? color.new(color.orange, 15) : rowInValue ? color.new(color.blue, 55) : color.new(color.gray, 78)
-            box.set_left(hb, leftX)
-            box.set_right(hb, rightX)
-            box.set_bottom(hb, bottomY)
-            box.set_top(hb, topY)
-            box.set_bgcolor(hb, fillColor)
-            box.set_border_color(hb, color.new(fillColor, 100))
+            if rowVol > 0.0
+                box.set_left(hb, leftX)
+                box.set_right(hb, rightX)
+                box.set_bottom(hb, bottomY)
+                box.set_top(hb, topY)
+                box.set_bgcolor(hb, fillColor)
+                box.set_border_color(hb, color.new(fillColor, 100))
+            else
+                box.set_left(hb, bar_index)
+                box.set_right(hb, bar_index)
+                box.set_bottom(hb, close)
+                box.set_top(hb, close)
+                box.set_bgcolor(hb, color.new(color.gray, 100))
+                box.set_border_color(hb, color.new(color.gray, 100))
         else
             box.set_left(hb, bar_index)
             box.set_right(hb, bar_index)
@@ -675,7 +699,7 @@ if barstate.islast
         f_setRow(14, "P02", not na(p02Signed) ? str.tostring(p02Signed, "#.0") : "N/A")
         f_setRow(15, "P03", not na(p03Signed) ? str.tostring(p03Signed, "#.0") : "N/A")
         f_setRow(16, "P04", not na(p04Signed) ? str.tostring(p04Signed, "#.0") : "N/A")
-        f_setRow(17, "Histogram", showHistogram ? "ON x" + str.tostring(histogramRowSize) : "OFF")
+        f_setRow(17, "Histogram", showHistogram ? "ON " + str.tostring(histogramRows) + " rows" : "OFF")
         f_setRow(18, "Profile Scope", profileScope)
         f_setRow(19, "Tracked Zones", str.tostring(zoneCount))
     else
