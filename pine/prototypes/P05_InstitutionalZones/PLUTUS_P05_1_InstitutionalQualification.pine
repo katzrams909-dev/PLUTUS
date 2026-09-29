@@ -1,0 +1,707 @@
+//@version=6
+indicator("PLUTUS P05.1 — Institutional Qualification", shorttitle="PLUTUS P05.1", overlay=true, max_boxes_count=120, max_labels_count=50)
+
+//==============================================================================
+// PLUTUS P05.1 — Institutional Qualification Integration
+// Builds on P05.0 candidate/lifecycle mechanics and ports compact evidence from
+// the validated P01-P04 engines into each zone's birth score.
+//
+// IMPORTANT:
+// - This prototype does not read another indicator at runtime. Pine indicators
+//   cannot directly consume another indicator's local variables, so the relevant
+//   P01-P04 measurements are ported here using the same model concepts.
+// - Estimated lower-timeframe flow is still an estimate, not true bid/ask flow.
+// - No trade signals are produced.
+//==============================================================================
+
+//------------------------------------------------------------------------------
+// Inputs
+//------------------------------------------------------------------------------
+groupTiming = "Timing / Context"
+timezoneInput = input.string("Exchange", "Session Timezone", options=["Exchange", "UTC-2", "UTC-1", "UTC+0", "UTC+1", "UTC+2", "America/New_York", "Europe/London", "Asia/Tokyo"], group=groupTiming)
+string sessionTz = timezoneInput == "Exchange" ? syminfo.timezone : timezoneInput
+profileScope = input.string("New York", "Profile Scope", options=["Asia", "London", "New York", "Day"], group=groupTiming)
+valueReference = input.string("Daily", "VWAP Reference", options=["Active Session", "Daily", "Weekly", "Monthly"], group=groupTiming)
+
+groupDetection = "Candidate Detection"
+atrLen = input.int(14, "ATR Length", minval=1, group=groupDetection)
+minDisplacementAtr = input.float(0.35, "Minimum Displacement Body / ATR", minval=0.05, step=0.05, group=groupDetection)
+fullDisplacementAtr = input.float(1.0, "Full Mechanical Displacement / ATR", minval=0.10, step=0.10, group=groupDetection)
+minFvgAtr = input.float(0.05, "Minimum FVG Width / ATR", minval=0.0, step=0.01, group=groupDetection)
+maxZoneWidthAtr = input.float(2.0, "Maximum Zone Width / ATR", minval=0.25, step=0.25, group=groupDetection)
+detectFvg = input.bool(true, "Detect FVG Candidates", group=groupDetection)
+detectOb = input.bool(true, "Detect Order Block Candidates", group=groupDetection)
+detectBreakers = input.bool(true, "Create Breakers From Invalidated OBs", group=groupDetection)
+
+groupP01 = "P01 Participation Evidence"
+volumeLen = input.int(20, "Volume Baseline Length", minval=2, group=groupP01)
+volumeZLen = input.int(50, "Volume Z-Score Length", minval=5, group=groupP01)
+rvolHigh = input.float(1.20, "Expansion RVOL", minval=0.1, step=0.05, group=groupP01)
+rvolExtreme = input.float(1.80, "Extreme RVOL", minval=0.1, step=0.05, group=groupP01)
+volZHigh = input.float(1.50, "High Volume Z", minval=0.0, step=0.10, group=groupP01)
+ltfTf = input.timeframe("1", "Estimated Flow Lower TF", group=groupP01)
+deltaThreshold = input.float(0.20, "Strong Estimated Delta %", minval=0.01, maxval=1.0, step=0.05, group=groupP01)
+
+groupP02 = "P02 Fair-Value Evidence"
+vwapSlopeLookback = input.int(5, "VWAP Slope Lookback", minval=1, maxval=50, group=groupP02)
+vwapAcceptanceBars = input.int(5, "VWAP Acceptance Lookback", minval=2, maxval=30, group=groupP02)
+vwapAcceptanceRatio = input.float(0.70, "VWAP Acceptance Ratio", minval=0.50, maxval=1.0, step=0.05, group=groupP02)
+fullVwapSlopeAtr = input.float(0.50, "Full VWAP Slope / ATR", minval=0.05, step=0.05, group=groupP02)
+fullVwapDistanceAtr = input.float(1.00, "Full Price/VWAP Distance / ATR", minval=0.10, step=0.10, group=groupP02)
+
+groupP03 = "P03 Profile Evidence"
+allocationSource = input.source(hlc3, "Profile Allocation Price", group=groupP03)
+binCount = input.int(24, "Profile Price Bins", minval=8, maxval=80, group=groupP03)
+maxProfileBars = input.int(300, "Maximum Bars Per Profile", minval=25, maxval=1000, group=groupP03)
+valueAreaPct = input.float(70.0, "Value Area %", minval=50.0, maxval=99.0, step=1.0, group=groupP03)
+profileMigrationLookback = input.int(5, "POC Migration Lookback", minval=1, maxval=50, group=groupP03)
+fullPocMigrationAtr = input.float(0.50, "Full POC Migration / ATR", minval=0.05, step=0.05, group=groupP03)
+
+groupP04 = "P04 Auction Evidence"
+auctionAcceptanceBars = input.int(5, "Auction Acceptance Lookback", minval=2, maxval=30, group=groupP04)
+rejectionLookback = input.int(3, "Rejection Lookback", minval=1, maxval=10, group=groupP04)
+fullAuctionDistanceAtr = input.float(1.0, "Full Auction Distance / ATR", minval=0.10, step=0.10, group=groupP04)
+maxRejectExcursionAtr = input.float(1.0, "Full Rejection Excursion / ATR", minval=0.10, step=0.10, group=groupP04)
+
+groupQualification = "Institutional Qualification"
+minQualificationScore = input.float(60.0, "Institutional Qualification Score", minval=0.0, maxval=100.0, step=5.0, group=groupQualification)
+mitigationPenalty = input.float(15.0, "Mitigation Score Penalty", minval=0.0, maxval=50.0, step=5.0, group=groupQualification)
+breakerMechanicFactor = input.float(0.75, "Breaker Mechanical Inheritance", minval=0.25, maxval=1.0, step=0.05, group=groupQualification)
+
+groupLifecycle = "Lifecycle / Object Discipline"
+maxTrackedZones = input.int(24, "Maximum Tracked Zones", minval=4, maxval=80, group=groupLifecycle)
+maxZoneAgeBars = input.int(250, "Maximum Zone Age (Bars)", minval=10, maxval=2000, group=groupLifecycle)
+removeInvalidated = input.bool(true, "Remove Invalidated Zones", group=groupLifecycle)
+removeExpired = input.bool(true, "Remove Expired Zones", group=groupLifecycle)
+
+groupDisplay = "Display"
+showCandidates = input.bool(true, "Show Candidate Zones", group=groupDisplay)
+showOnlyQualified = input.bool(true, "Show Only Qualified Zones", group=groupDisplay)
+showZoneText = input.bool(true, "Show Zone Type / Score", group=groupDisplay)
+showValueLevels = input.bool(false, "Show Profile POC / VAH / VAL", group=groupDisplay)
+showVwap = input.bool(false, "Show Primary VWAP", group=groupDisplay)
+showTable = input.bool(true, "Show Diagnostic Table", group=groupDisplay)
+
+//------------------------------------------------------------------------------
+// Helpers
+//------------------------------------------------------------------------------
+f_clamp(float x, float lo, float hi) =>
+    math.max(lo, math.min(hi, x))
+
+f_support(int direction, float signedScore) =>
+    not na(signedScore) ? f_clamp(direction * signedScore, 0.0, 100.0) : 0.0
+
+f_widthQuality(float widthAtr) =>
+    float q = na(widthAtr) ? 0.0 : widthAtr <= 1.0 ? 100.0 : 100.0 * (1.0 - (widthAtr - 1.0) / math.max(maxZoneWidthAtr - 1.0, 0.01))
+    f_clamp(q, 0.0, 100.0)
+
+f_mechanicQuality(float displacementAtr, float widthAtr) =>
+    float displacementQuality = not na(displacementAtr) ? f_clamp(displacementAtr / fullDisplacementAtr * 100.0, 0.0, 100.0) : 0.0
+    f_clamp(displacementQuality * 0.65 + f_widthQuality(widthAtr) * 0.35, 0.0, 100.0)
+
+// Weighting: mechanics 20%, P01 25%, P02 20%, P03 15%, P04 20%.
+f_zoneScore(float mechanic, float p01Support, float p02Support, float p03Support, float p04Support) =>
+    f_clamp(mechanic * 0.20 + p01Support * 0.25 + p02Support * 0.20 + p03Support * 0.15 + p04Support * 0.20, 0.0, 100.0)
+
+//------------------------------------------------------------------------------
+// Shared timing / sessions
+//------------------------------------------------------------------------------
+string asiaSession = "0000-0800:1234567"
+string londonSession = "0800-1630:1234567"
+string newYorkSession = "1330-2000:1234567"
+
+bool inAsia = not na(time(timeframe.period, asiaSession, sessionTz))
+bool inLondon = not na(time(timeframe.period, londonSession, sessionTz))
+bool inNewYork = not na(time(timeframe.period, newYorkSession, sessionTz))
+bool newAsia = inAsia and not inAsia[1]
+bool newLondon = inLondon and not inLondon[1]
+bool newNewYork = inNewYork and not inNewYork[1]
+
+int localDay = dayofmonth(time, sessionTz)
+int localWeek = weekofyear(time, sessionTz)
+int localMonth = month(time, sessionTz)
+bool newDay = ta.change(localDay) != 0
+bool newWeek = ta.change(localWeek) != 0
+bool newMonth = ta.change(localMonth) != 0
+
+bool profileActive = switch profileScope
+    "Asia" => inAsia
+    "London" => inLondon
+    "New York" => inNewYork
+    => true
+
+bool profileReset = switch profileScope
+    "Asia" => newAsia
+    "London" => newLondon
+    "New York" => newNewYork
+    => barstate.isfirst or newDay
+
+//------------------------------------------------------------------------------
+// P01 — participation / effort-result / estimated flow
+//------------------------------------------------------------------------------
+float atr = ta.atr(atrLen)
+float volumeBase = ta.sma(volume, volumeLen)
+float rvol = not na(volume) and not na(volumeBase) and volumeBase > 0.0 ? volume / volumeBase : na
+float volMean = ta.sma(volume, volumeZLen)
+float volStdev = ta.stdev(volume, volumeZLen)
+float volZ = not na(volume) and not na(volMean) and not na(volStdev) and volStdev > 0.0 ? (volume - volMean) / volStdev : na
+
+float body = math.abs(close - open)
+float candleRange = math.max(high - low, syminfo.mintick)
+float bodyAtr = not na(atr) and atr > 0.0 ? body / atr : na
+float rangeAtr = not na(atr) and atr > 0.0 ? ta.tr(true) / atr : na
+float closeLocation = candleRange > 0.0 ? (close - low) / candleRange : 0.5
+bool bullishBar = close > open
+bool bearishBar = close < open
+bool directionalClose = (bullishBar and closeLocation >= 0.80) or (bearishBar and closeLocation <= 0.20)
+
+int effortScore = 0
+if not na(rvol)
+    effortScore += rvol >= rvolExtreme ? 3 : rvol >= rvolHigh ? 2 : rvol >= 0.70 ? 1 : 0
+if not na(volZ) and volZ >= volZHigh
+    effortScore += volZ >= 2.0 ? 2 : 1
+
+int resultScore = 0
+bool highResult = not na(bodyAtr) and not na(rangeAtr) and bodyAtr >= 0.80 and rangeAtr >= 1.0
+bool lowResult = not na(bodyAtr) and not na(rangeAtr) and bodyAtr <= 0.35 and rangeAtr <= 0.65
+if highResult
+    resultScore += 2
+else if not lowResult
+    resultScore += 1
+if directionalClose
+    resultScore += 1
+
+float chartTfSeconds = timeframe.in_seconds()
+float ltfSeconds = timeframe.in_seconds(ltfTf)
+bool ltfIsLower = not na(chartTfSeconds) and not na(ltfSeconds) and ltfSeconds < chartTfSeconds
+ltfOpen = request.security_lower_tf(syminfo.tickerid, ltfTf, open, ignore_invalid_timeframe=true)
+ltfClose = request.security_lower_tf(syminfo.tickerid, ltfTf, close, ignore_invalid_timeframe=true)
+ltfVolume = request.security_lower_tf(syminfo.tickerid, ltfTf, volume, ignore_invalid_timeframe=true)
+int intrabarCount = math.min(array.size(ltfOpen), math.min(array.size(ltfClose), array.size(ltfVolume)))
+float estBuyVolume = 0.0
+float estSellVolume = 0.0
+if ltfIsLower and intrabarCount > 0
+    for i = 0 to intrabarCount - 1
+        float io = array.get(ltfOpen, i)
+        float ic = array.get(ltfClose, i)
+        float iv = array.get(ltfVolume, i)
+        if not na(iv)
+            if ic > io
+                estBuyVolume += iv
+            else if ic < io
+                estSellVolume += iv
+            else
+                estBuyVolume += iv * 0.5
+                estSellVolume += iv * 0.5
+float estTotalVolume = estBuyVolume + estSellVolume
+float estDeltaPct = estTotalVolume > 0.0 ? (estBuyVolume - estSellVolume) / estTotalVolume : na
+bool proxyAvailable = ltfIsLower and intrabarCount > 1 and not na(estDeltaPct)
+int flowScore = proxyAvailable and estDeltaPct >= deltaThreshold ? 2 : proxyAvailable and estDeltaPct <= -deltaThreshold ? -2 : 0
+int barDirection = bullishBar ? 1 : bearishBar ? -1 : 0
+int netParticipationScore = barDirection * effortScore + flowScore
+float p01Signed = not na(rvol) ? f_clamp(netParticipationScore / 7.0 * 100.0, -100.0, 100.0) : na
+
+//------------------------------------------------------------------------------
+// P02 — institutional fair-value context
+//------------------------------------------------------------------------------
+var float asiaPV = na
+var float asiaVol = na
+if not inAsia
+    asiaPV := na
+    asiaVol := na
+else if newAsia or na(asiaPV) or na(asiaVol)
+    asiaPV := hlc3 * volume
+    asiaVol := volume
+else
+    asiaPV += hlc3 * volume
+    asiaVol += volume
+float asiaVwap = inAsia and not na(asiaVol) and asiaVol > 0.0 ? asiaPV / asiaVol : na
+
+var float londonPV = na
+var float londonVol = na
+if not inLondon
+    londonPV := na
+    londonVol := na
+else if newLondon or na(londonPV) or na(londonVol)
+    londonPV := hlc3 * volume
+    londonVol := volume
+else
+    londonPV += hlc3 * volume
+    londonVol += volume
+float londonVwap = inLondon and not na(londonVol) and londonVol > 0.0 ? londonPV / londonVol : na
+
+var float newYorkPV = na
+var float newYorkVol = na
+if not inNewYork
+    newYorkPV := na
+    newYorkVol := na
+else if newNewYork or na(newYorkPV) or na(newYorkVol)
+    newYorkPV := hlc3 * volume
+    newYorkVol := volume
+else
+    newYorkPV += hlc3 * volume
+    newYorkVol += volume
+float newYorkVwap = inNewYork and not na(newYorkVol) and newYorkVol > 0.0 ? newYorkPV / newYorkVol : na
+
+float dailyVwap = ta.vwap(hlc3, barstate.isfirst or newDay)
+float weeklyVwap = ta.vwap(hlc3, barstate.isfirst or newWeek)
+float monthlyVwap = ta.vwap(hlc3, barstate.isfirst or newMonth)
+float activeSessionVwap = inNewYork ? newYorkVwap : inLondon ? londonVwap : inAsia ? asiaVwap : na
+float valueRef = switch valueReference
+    "Active Session" => activeSessionVwap
+    "Weekly" => weeklyVwap
+    "Monthly" => monthlyVwap
+    => dailyVwap
+
+float vwapDistanceAtr = not na(valueRef) and not na(atr) and atr > 0.0 ? (close - valueRef) / atr : na
+float vwapSlopeAtr = not na(valueRef) and not na(valueRef[vwapSlopeLookback]) and not na(atr) and atr > 0.0 ? (valueRef - valueRef[vwapSlopeLookback]) / atr : na
+float vwapAboveRatio = ta.sma(not na(valueRef) and close > valueRef ? 1.0 : 0.0, vwapAcceptanceBars)
+float vwapBelowRatio = ta.sma(not na(valueRef) and close < valueRef ? 1.0 : 0.0, vwapAcceptanceBars)
+float vwapAcceptanceSigned = not na(vwapAboveRatio) and not na(vwapBelowRatio) ? f_clamp((vwapAboveRatio - vwapBelowRatio) * 100.0, -100.0, 100.0) : na
+float vwapSlopeSigned = not na(vwapSlopeAtr) ? f_clamp(vwapSlopeAtr / fullVwapSlopeAtr * 100.0, -100.0, 100.0) : na
+float vwapDistanceSigned = not na(vwapDistanceAtr) ? f_clamp(vwapDistanceAtr / fullVwapDistanceAtr * 100.0, -100.0, 100.0) : na
+float p02Signed = not na(valueRef) ? f_clamp(nz(vwapSlopeSigned) * 0.40 + nz(vwapAcceptanceSigned) * 0.35 + nz(vwapDistanceSigned) * 0.25, -100.0, 100.0) : na
+
+//------------------------------------------------------------------------------
+// P03 — developing profile / value location / migration
+//------------------------------------------------------------------------------
+var array<float> profilePrices = array.new_float()
+var array<float> profileHighs = array.new_float()
+var array<float> profileLows = array.new_float()
+var array<float> profileVolumes = array.new_float()
+var array<float> bins = array.new_float()
+if barstate.isfirst
+    for i = 0 to binCount - 1
+        array.push(bins, 0.0)
+
+float profileHigh = na
+float profileLow = na
+float pocPrice = na
+float vahPrice = na
+float valPrice = na
+float totalProfileVolume = 0.0
+float valueAreaVolume = 0.0
+float binSize = na
+int pocIndex = na
+int vaLowIndex = na
+int vaHighIndex = na
+var float completedPoc = na
+var float completedVah = na
+var float completedVal = na
+
+if profileReset and not barstate.isfirst
+    completedPoc := pocPrice[1]
+    completedVah := vahPrice[1]
+    completedVal := valPrice[1]
+
+if profileReset
+    array.clear(profilePrices)
+    array.clear(profileHighs)
+    array.clear(profileLows)
+    array.clear(profileVolumes)
+
+if profileActive and not na(volume)
+    array.push(profilePrices, allocationSource)
+    array.push(profileHighs, high)
+    array.push(profileLows, low)
+    array.push(profileVolumes, volume)
+    if array.size(profilePrices) > maxProfileBars
+        array.shift(profilePrices)
+        array.shift(profileHighs)
+        array.shift(profileLows)
+        array.shift(profileVolumes)
+
+int storedProfileBars = array.size(profilePrices)
+if storedProfileBars > 0
+    profileHigh := array.max(profileHighs)
+    profileLow := array.min(profileLows)
+    float profileRange = profileHigh - profileLow
+    binSize := math.max(profileRange > 0.0 ? profileRange / binCount : syminfo.mintick, syminfo.mintick)
+    for i = 0 to binCount - 1
+        array.set(bins, i, 0.0)
+    for i = 0 to storedProfileBars - 1
+        float p = array.get(profilePrices, i)
+        float v = array.get(profileVolumes, i)
+        int idx = int(math.floor((p - profileLow) / binSize))
+        idx := math.max(0, math.min(binCount - 1, idx))
+        array.set(bins, idx, array.get(bins, idx) + v)
+        totalProfileVolume += v
+    float maxBinVol = -1.0
+    pocIndex := 0
+    for i = 0 to binCount - 1
+        float binVol = array.get(bins, i)
+        if binVol > maxBinVol
+            maxBinVol := binVol
+            pocIndex := i
+    pocPrice := profileLow + (pocIndex + 0.5) * binSize
+    float targetVolume = totalProfileVolume * valueAreaPct / 100.0
+    vaLowIndex := pocIndex
+    vaHighIndex := pocIndex
+    valueAreaVolume := array.get(bins, pocIndex)
+    int expansionSteps = 0
+    while valueAreaVolume < targetVolume and expansionSteps < binCount
+        bool canDown = vaLowIndex > 0
+        bool canUp = vaHighIndex < binCount - 1
+        if not canDown and not canUp
+            break
+        float downVol = canDown ? array.get(bins, vaLowIndex - 1) : -1.0
+        float upVol = canUp ? array.get(bins, vaHighIndex + 1) : -1.0
+        if canDown and canUp and downVol == upVol
+            vaLowIndex -= 1
+            vaHighIndex += 1
+            valueAreaVolume += downVol + upVol
+        else if canUp and (not canDown or upVol > downVol)
+            vaHighIndex += 1
+            valueAreaVolume += upVol
+        else if canDown
+            vaLowIndex -= 1
+            valueAreaVolume += downVol
+        expansionSteps += 1
+    valPrice := profileLow + vaLowIndex * binSize
+    vahPrice := profileLow + (vaHighIndex + 1) * binSize
+
+bool profileReady = profileActive and not na(pocPrice) and not na(vahPrice) and not na(valPrice)
+float profileLocationScore = 0.0
+if profileReady
+    profileLocationScore := close > vahPrice ? 100.0 : close < valPrice ? -100.0 : close > pocPrice ? 40.0 : close < pocPrice ? -40.0 : 0.0
+float pocMigrationAtr = profileReady and not na(pocPrice[profileMigrationLookback]) and not na(atr) and atr > 0.0 ? (pocPrice - pocPrice[profileMigrationLookback]) / atr : na
+float profileMigrationScore = not na(pocMigrationAtr) ? f_clamp(pocMigrationAtr / fullPocMigrationAtr * 100.0, -100.0, 100.0) : na
+float p03Signed = profileReady ? f_clamp(nz(profileMigrationScore) * 0.65 + profileLocationScore * 0.35, -100.0, 100.0) : na
+
+//------------------------------------------------------------------------------
+// P04 — acceptance / rejection / inter-profile value analysis
+//------------------------------------------------------------------------------
+float auctionAboveRatio = ta.sma(profileReady and close > vahPrice ? 1.0 : 0.0, auctionAcceptanceBars)
+float auctionBelowRatio = ta.sma(profileReady and close < valPrice ? 1.0 : 0.0, auctionAcceptanceBars)
+float auctionInsideRatio = ta.sma(profileReady and close <= vahPrice and close >= valPrice ? 1.0 : 0.0, auctionAcceptanceBars)
+float acceptanceDirectional = profileReady ? f_clamp((nz(auctionAboveRatio) - nz(auctionBelowRatio)) * 100.0, -100.0, 100.0) : na
+
+float recentHigh = ta.highest(high, rejectionLookback)
+float recentLow = ta.lowest(low, rejectionLookback)
+float rejectAboveExcAtr = profileReady and not na(atr) and atr > 0.0 ? math.max(0.0, recentHigh - vahPrice) / atr : na
+float rejectBelowExcAtr = profileReady and not na(atr) and atr > 0.0 ? math.max(0.0, valPrice - recentLow) / atr : na
+bool rejectedAbove = profileReady and rejectAboveExcAtr > 0.0 and close <= vahPrice
+bool rejectedBelow = profileReady and rejectBelowExcAtr > 0.0 and close >= valPrice
+float rejectionDirectional = rejectedAbove ? -f_clamp(rejectAboveExcAtr / maxRejectExcursionAtr * 100.0, 0.0, 100.0) : rejectedBelow ? f_clamp(rejectBelowExcAtr / maxRejectExcursionAtr * 100.0, 0.0, 100.0) : 0.0
+
+float priceDirectional = profileReady and not na(atr) and atr > 0.0 ? f_clamp((close - pocPrice) / atr / fullAuctionDistanceAtr * 100.0, -100.0, 100.0) : na
+bool previousProfileReady = not na(completedVah) and not na(completedVal) and completedVah > completedVal
+float currentMid = profileReady ? (vahPrice + valPrice) * 0.5 : na
+float previousMid = previousProfileReady ? (completedVah + completedVal) * 0.5 : na
+float previousWidth = previousProfileReady ? completedVah - completedVal : na
+float relationshipDirectional = profileReady and previousProfileReady and previousWidth > 0.0 ? f_clamp((currentMid - previousMid) / previousWidth * 100.0, -100.0, 100.0) : 0.0
+float p04Signed = profileReady ? f_clamp(nz(acceptanceDirectional) * 0.30 + rejectionDirectional * 0.20 + nz(priceDirectional) * 0.25 + relationshipDirectional * 0.25, -100.0, 100.0) : na
+
+//------------------------------------------------------------------------------
+// Candidate mechanics
+//------------------------------------------------------------------------------
+bool bullishDisplacement = bullishBar and not na(bodyAtr) and bodyAtr >= minDisplacementAtr
+bool bearishDisplacement = bearishBar and not na(bodyAtr) and bodyAtr >= minDisplacementAtr
+
+bool bullFvg = detectFvg and bar_index >= 2 and low > high[2]
+bool bearFvg = detectFvg and bar_index >= 2 and high < low[2]
+float bullFvgWidthAtr = bullFvg and not na(atr) and atr > 0.0 ? (low - high[2]) / atr : na
+float bearFvgWidthAtr = bearFvg and not na(atr) and atr > 0.0 ? (low[2] - high) / atr : na
+bullFvg := bullFvg and bullishDisplacement and not na(bullFvgWidthAtr) and bullFvgWidthAtr >= minFvgAtr and bullFvgWidthAtr <= maxZoneWidthAtr
+bearFvg := bearFvg and bearishDisplacement and not na(bearFvgWidthAtr) and bearFvgWidthAtr >= minFvgAtr and bearFvgWidthAtr <= maxZoneWidthAtr
+
+bool bullOb = detectOb and bar_index >= 1 and close[1] < open[1] and bullishDisplacement and close > high[1]
+bool bearOb = detectOb and bar_index >= 1 and close[1] > open[1] and bearishDisplacement and close < low[1]
+float bullObWidthAtr = bullOb and not na(atr) and atr > 0.0 ? (high[1] - low[1]) / atr : na
+float bearObWidthAtr = bearOb and not na(atr) and atr > 0.0 ? (high[1] - low[1]) / atr : na
+bullOb := bullOb and not na(bullObWidthAtr) and bullObWidthAtr <= maxZoneWidthAtr
+bearOb := bearOb and not na(bearObWidthAtr) and bearObWidthAtr <= maxZoneWidthAtr
+
+//------------------------------------------------------------------------------
+// Zone storage
+// direction: +1 bullish, -1 bearish
+// status: 0 fresh, 1 mitigated, 2 invalidated, 3 expired
+//------------------------------------------------------------------------------
+var array<box> zoneBoxes = array.new_box()
+var array<float> zoneTops = array.new_float()
+var array<float> zoneBottoms = array.new_float()
+var array<float> zoneScores = array.new_float()
+var array<float> zoneMechanics = array.new_float()
+var array<float> zoneP01 = array.new_float()
+var array<float> zoneP02 = array.new_float()
+var array<float> zoneP03 = array.new_float()
+var array<float> zoneP04 = array.new_float()
+var array<int> zoneDirections = array.new_int()
+var array<int> zoneBornBars = array.new_int()
+var array<int> zoneStatuses = array.new_int()
+var array<string> zoneTypes = array.new_string()
+
+var string lastCandidateType = "NONE"
+var int lastCandidateDirection = 0
+var float lastCandidateScore = na
+var float lastMechanic = na
+var float lastP01Support = na
+var float lastP02Support = na
+var float lastP03Support = na
+var float lastP04Support = na
+
+//------------------------------------------------------------------------------
+// Candidate creation — evidence is snapshotted at birth.
+//------------------------------------------------------------------------------
+if bullFvg
+    int zDir = 1
+    float mechanic = f_mechanicQuality(bodyAtr, bullFvgWidthAtr)
+    float p1 = f_support(zDir, p01Signed)
+    float p2 = f_support(zDir, p02Signed)
+    float p3 = f_support(zDir, p03Signed)
+    float p4 = f_support(zDir, p04Signed)
+    float score = f_zoneScore(mechanic, p1, p2, p3, p4)
+    bool qualified = score >= minQualificationScore
+    box b = na
+    bool displayZone = showCandidates and (not showOnlyQualified or qualified)
+    if displayZone
+        b := box.new(bar_index - 2, low, bar_index, high[2], xloc=xloc.bar_index, extend=extend.right, border_color=color.new(color.teal, qualified ? 20 : 70), bgcolor=color.new(color.teal, qualified ? 80 : 93))
+        if showZoneText
+            box.set_text(b, "FVG B " + str.tostring(score, "#.0"))
+            box.set_text_color(b, color.white)
+    array.push(zoneBoxes, b), array.push(zoneTops, low), array.push(zoneBottoms, high[2]), array.push(zoneScores, score)
+    array.push(zoneMechanics, mechanic), array.push(zoneP01, p1), array.push(zoneP02, p2), array.push(zoneP03, p3), array.push(zoneP04, p4)
+    array.push(zoneDirections, zDir), array.push(zoneBornBars, bar_index), array.push(zoneStatuses, 0), array.push(zoneTypes, "FVG")
+    lastCandidateType := "FVG", lastCandidateDirection := zDir, lastCandidateScore := score, lastMechanic := mechanic, lastP01Support := p1, lastP02Support := p2, lastP03Support := p3, lastP04Support := p4
+
+if bearFvg
+    int zDir = -1
+    float mechanic = f_mechanicQuality(bodyAtr, bearFvgWidthAtr)
+    float p1 = f_support(zDir, p01Signed)
+    float p2 = f_support(zDir, p02Signed)
+    float p3 = f_support(zDir, p03Signed)
+    float p4 = f_support(zDir, p04Signed)
+    float score = f_zoneScore(mechanic, p1, p2, p3, p4)
+    bool qualified = score >= minQualificationScore
+    box b = na
+    bool displayZone = showCandidates and (not showOnlyQualified or qualified)
+    if displayZone
+        b := box.new(bar_index - 2, low[2], bar_index, high, xloc=xloc.bar_index, extend=extend.right, border_color=color.new(color.red, qualified ? 20 : 70), bgcolor=color.new(color.red, qualified ? 82 : 93))
+        if showZoneText
+            box.set_text(b, "FVG S " + str.tostring(score, "#.0"))
+            box.set_text_color(b, color.white)
+    array.push(zoneBoxes, b), array.push(zoneTops, low[2]), array.push(zoneBottoms, high), array.push(zoneScores, score)
+    array.push(zoneMechanics, mechanic), array.push(zoneP01, p1), array.push(zoneP02, p2), array.push(zoneP03, p3), array.push(zoneP04, p4)
+    array.push(zoneDirections, zDir), array.push(zoneBornBars, bar_index), array.push(zoneStatuses, 0), array.push(zoneTypes, "FVG")
+    lastCandidateType := "FVG", lastCandidateDirection := zDir, lastCandidateScore := score, lastMechanic := mechanic, lastP01Support := p1, lastP02Support := p2, lastP03Support := p3, lastP04Support := p4
+
+if bullOb
+    int zDir = 1
+    float mechanic = f_mechanicQuality(bodyAtr, bullObWidthAtr)
+    float p1 = f_support(zDir, p01Signed)
+    float p2 = f_support(zDir, p02Signed)
+    float p3 = f_support(zDir, p03Signed)
+    float p4 = f_support(zDir, p04Signed)
+    float score = f_zoneScore(mechanic, p1, p2, p3, p4)
+    bool qualified = score >= minQualificationScore
+    box b = na
+    bool displayZone = showCandidates and (not showOnlyQualified or qualified)
+    if displayZone
+        b := box.new(bar_index - 1, high[1], bar_index, low[1], xloc=xloc.bar_index, extend=extend.right, border_color=color.new(color.green, qualified ? 20 : 70), bgcolor=color.new(color.green, qualified ? 82 : 93))
+        if showZoneText
+            box.set_text(b, "OB B " + str.tostring(score, "#.0"))
+            box.set_text_color(b, color.white)
+    array.push(zoneBoxes, b), array.push(zoneTops, high[1]), array.push(zoneBottoms, low[1]), array.push(zoneScores, score)
+    array.push(zoneMechanics, mechanic), array.push(zoneP01, p1), array.push(zoneP02, p2), array.push(zoneP03, p3), array.push(zoneP04, p4)
+    array.push(zoneDirections, zDir), array.push(zoneBornBars, bar_index), array.push(zoneStatuses, 0), array.push(zoneTypes, "OB")
+    lastCandidateType := "OB", lastCandidateDirection := zDir, lastCandidateScore := score, lastMechanic := mechanic, lastP01Support := p1, lastP02Support := p2, lastP03Support := p3, lastP04Support := p4
+
+if bearOb
+    int zDir = -1
+    float mechanic = f_mechanicQuality(bodyAtr, bearObWidthAtr)
+    float p1 = f_support(zDir, p01Signed)
+    float p2 = f_support(zDir, p02Signed)
+    float p3 = f_support(zDir, p03Signed)
+    float p4 = f_support(zDir, p04Signed)
+    float score = f_zoneScore(mechanic, p1, p2, p3, p4)
+    bool qualified = score >= minQualificationScore
+    box b = na
+    bool displayZone = showCandidates and (not showOnlyQualified or qualified)
+    if displayZone
+        b := box.new(bar_index - 1, high[1], bar_index, low[1], xloc=xloc.bar_index, extend=extend.right, border_color=color.new(color.red, qualified ? 20 : 70), bgcolor=color.new(color.red, qualified ? 82 : 93))
+        if showZoneText
+            box.set_text(b, "OB S " + str.tostring(score, "#.0"))
+            box.set_text_color(b, color.white)
+    array.push(zoneBoxes, b), array.push(zoneTops, high[1]), array.push(zoneBottoms, low[1]), array.push(zoneScores, score)
+    array.push(zoneMechanics, mechanic), array.push(zoneP01, p1), array.push(zoneP02, p2), array.push(zoneP03, p3), array.push(zoneP04, p4)
+    array.push(zoneDirections, zDir), array.push(zoneBornBars, bar_index), array.push(zoneStatuses, 0), array.push(zoneTypes, "OB")
+    lastCandidateType := "OB", lastCandidateDirection := zDir, lastCandidateScore := score, lastMechanic := mechanic, lastP01Support := p1, lastP02Support := p2, lastP03Support := p3, lastP04Support := p4
+
+//------------------------------------------------------------------------------
+// Lifecycle + breaker queue
+//------------------------------------------------------------------------------
+var array<float> pendingBrkTops = array.new_float()
+var array<float> pendingBrkBottoms = array.new_float()
+var array<float> pendingBrkMechanics = array.new_float()
+var array<int> pendingBrkDirections = array.new_int()
+array.clear(pendingBrkTops), array.clear(pendingBrkBottoms), array.clear(pendingBrkMechanics), array.clear(pendingBrkDirections)
+
+int trackedNow = array.size(zoneBoxes)
+if trackedNow > 0
+    for i = 0 to trackedNow - 1
+        int status = array.get(zoneStatuses, i)
+        if status < 2
+            float zTop = array.get(zoneTops, i)
+            float zBottom = array.get(zoneBottoms, i)
+            float zScore = array.get(zoneScores, i)
+            float zMechanic = array.get(zoneMechanics, i)
+            int zDir = array.get(zoneDirections, i)
+            int born = array.get(zoneBornBars, i)
+            string zType = array.get(zoneTypes, i)
+            box b = array.get(zoneBoxes, i)
+            bool touched = high >= zBottom and low <= zTop
+            bool invalid = (zDir == 1 and close < zBottom) or (zDir == -1 and close > zTop)
+            bool expired = bar_index - born > maxZoneAgeBars
+
+            if invalid
+                array.set(zoneStatuses, i, 2)
+                if not na(b)
+                    box.set_extend(b, extend.none)
+                    box.set_right(b, bar_index)
+                    if removeInvalidated
+                        box.delete(b)
+                        array.set(zoneBoxes, i, na)
+                    else
+                        box.set_bgcolor(b, color.new(color.gray, 94))
+                        box.set_border_color(b, color.new(color.gray, 80))
+                if detectBreakers and zType == "OB"
+                    array.push(pendingBrkTops, zTop)
+                    array.push(pendingBrkBottoms, zBottom)
+                    array.push(pendingBrkMechanics, f_clamp(zMechanic * breakerMechanicFactor, 0.0, 100.0))
+                    array.push(pendingBrkDirections, -zDir)
+
+            else if expired
+                array.set(zoneStatuses, i, 3)
+                if not na(b)
+                    box.set_extend(b, extend.none)
+                    box.set_right(b, bar_index)
+                    if removeExpired
+                        box.delete(b)
+                        array.set(zoneBoxes, i, na)
+                    else
+                        box.set_bgcolor(b, color.new(color.gray, 96))
+                        box.set_border_color(b, color.new(color.gray, 85))
+
+            else if touched and status == 0 and bar_index > born
+                float newScore = f_clamp(zScore - mitigationPenalty, 0.0, 100.0)
+                array.set(zoneStatuses, i, 1)
+                array.set(zoneScores, i, newScore)
+                if not na(b)
+                    if showOnlyQualified and newScore < minQualificationScore
+                        box.delete(b)
+                        array.set(zoneBoxes, i, na)
+                    else
+                        box.set_bgcolor(b, color.new(zDir == 1 ? color.green : color.red, 91))
+                        if showZoneText
+                            box.set_text(b, zType + (zDir == 1 ? " B " : " S ") + str.tostring(newScore, "#.0") + " M")
+
+// Add breakers using current P01-P04 context in the new direction.
+int pendingCount = array.size(pendingBrkTops)
+if pendingCount > 0
+    for j = 0 to pendingCount - 1
+        float zTop = array.get(pendingBrkTops, j)
+        float zBottom = array.get(pendingBrkBottoms, j)
+        float mechanic = array.get(pendingBrkMechanics, j)
+        int zDir = array.get(pendingBrkDirections, j)
+        float p1 = f_support(zDir, p01Signed)
+        float p2 = f_support(zDir, p02Signed)
+        float p3 = f_support(zDir, p03Signed)
+        float p4 = f_support(zDir, p04Signed)
+        float score = f_zoneScore(mechanic, p1, p2, p3, p4)
+        bool qualified = score >= minQualificationScore
+        box b = na
+        bool displayZone = showCandidates and (not showOnlyQualified or qualified)
+        if displayZone
+            color brkColor = zDir == 1 ? color.aqua : color.fuchsia
+            b := box.new(bar_index, zTop, bar_index, zBottom, xloc=xloc.bar_index, extend=extend.right, border_color=color.new(brkColor, qualified ? 20 : 70), bgcolor=color.new(brkColor, qualified ? 84 : 94))
+            if showZoneText
+                box.set_text(b, "BRK " + (zDir == 1 ? "B " : "S ") + str.tostring(score, "#.0"))
+                box.set_text_color(b, color.white)
+        array.push(zoneBoxes, b), array.push(zoneTops, zTop), array.push(zoneBottoms, zBottom), array.push(zoneScores, score)
+        array.push(zoneMechanics, mechanic), array.push(zoneP01, p1), array.push(zoneP02, p2), array.push(zoneP03, p3), array.push(zoneP04, p4)
+        array.push(zoneDirections, zDir), array.push(zoneBornBars, bar_index), array.push(zoneStatuses, 0), array.push(zoneTypes, "BRK")
+        lastCandidateType := "BRK", lastCandidateDirection := zDir, lastCandidateScore := score, lastMechanic := mechanic, lastP01Support := p1, lastP02Support := p2, lastP03Support := p3, lastP04Support := p4
+
+// Bound all tracking arrays and delete the oldest displayed object when needed.
+while array.size(zoneBoxes) > maxTrackedZones
+    box oldBox = array.shift(zoneBoxes)
+    if not na(oldBox)
+        box.delete(oldBox)
+    array.shift(zoneTops), array.shift(zoneBottoms), array.shift(zoneScores), array.shift(zoneMechanics)
+    array.shift(zoneP01), array.shift(zoneP02), array.shift(zoneP03), array.shift(zoneP04)
+    array.shift(zoneDirections), array.shift(zoneBornBars), array.shift(zoneStatuses), array.shift(zoneTypes)
+
+//------------------------------------------------------------------------------
+// Optional context plots
+//------------------------------------------------------------------------------
+plot(showVwap ? valueRef : na, "Primary VWAP", color=color.new(color.blue, 20), linewidth=2, style=plot.style_linebr)
+plot(showValueLevels and profileActive ? pocPrice : na, "Profile POC", color=color.orange, linewidth=2, style=plot.style_linebr)
+plot(showValueLevels and profileActive ? vahPrice : na, "Profile VAH", color=color.new(color.green, 20), linewidth=1, style=plot.style_linebr)
+plot(showValueLevels and profileActive ? valPrice : na, "Profile VAL", color=color.new(color.red, 20), linewidth=1, style=plot.style_linebr)
+
+//------------------------------------------------------------------------------
+// Diagnostics
+//------------------------------------------------------------------------------
+int activeZones = 0
+int qualifiedZones = 0
+int mitigatedZones = 0
+int fvgZones = 0
+int obZones = 0
+int breakerZones = 0
+int zoneCount = array.size(zoneScores)
+if zoneCount > 0
+    for i = 0 to zoneCount - 1
+        int s = array.get(zoneStatuses, i)
+        if s < 2
+            activeZones += 1
+            if array.get(zoneScores, i) >= minQualificationScore
+                qualifiedZones += 1
+            if s == 1
+                mitigatedZones += 1
+            string t = array.get(zoneTypes, i)
+            if t == "FVG"
+                fvgZones += 1
+            else if t == "OB"
+                obZones += 1
+            else if t == "BRK"
+                breakerZones += 1
+
+string ltfStatus = ltfIsLower ? (proxyAvailable ? "VALID" : "LOWER_NO_DATA") : "INVALID_USE_LOWER_TF"
+string lastDirText = lastCandidateDirection == 1 ? "BULLISH" : lastCandidateDirection == -1 ? "BEARISH" : "NONE"
+
+var table diag = table.new(position.top_right, 2, 26, border_width=1, frame_width=1, bgcolor=color.new(color.black, 15))
+f_setRow(int row, string labelText, string valueText) =>
+    table.cell(diag, 0, row, labelText, text_color=color.silver, bgcolor=color.new(color.black, 15), text_halign=text.align_left)
+    table.cell(diag, 1, row, valueText, text_color=color.white, bgcolor=color.new(color.black, 15), text_halign=text.align_right)
+
+if barstate.islast
+    if showTable
+        table.clear(diag, 0, 0, 1, 25)
+        f_setRow(0, "PLUTUS", "P05.1 Qualification")
+        f_setRow(1, "LTF Status", ltfStatus)
+        f_setRow(2, "Intrabars", str.tostring(intrabarCount))
+        f_setRow(3, "P01 Signed", not na(p01Signed) ? str.tostring(p01Signed, "#.0") : "N/A")
+        f_setRow(4, "P02 Fair Value", not na(p02Signed) ? str.tostring(p02Signed, "#.0") : "N/A")
+        f_setRow(5, "P03 Profile", not na(p03Signed) ? str.tostring(p03Signed, "#.0") : "N/A")
+        f_setRow(6, "P04 Value", not na(p04Signed) ? str.tostring(p04Signed, "#.0") : "N/A")
+        f_setRow(7, "Profile Scope", profileScope)
+        f_setRow(8, "Stored Profile Bars", str.tostring(storedProfileBars))
+        f_setRow(9, "Active Zones", str.tostring(activeZones))
+        f_setRow(10, "Qualified Zones", str.tostring(qualifiedZones))
+        f_setRow(11, "Mitigated Zones", str.tostring(mitigatedZones))
+        f_setRow(12, "FVG / OB / BRK", str.tostring(fvgZones) + " / " + str.tostring(obZones) + " / " + str.tostring(breakerZones))
+        f_setRow(13, "Last Type", lastCandidateType)
+        f_setRow(14, "Last Direction", lastDirText)
+        f_setRow(15, "Last Mechanics", not na(lastMechanic) ? str.tostring(lastMechanic, "#.0") : "N/A")
+        f_setRow(16, "Last P01 Support", not na(lastP01Support) ? str.tostring(lastP01Support, "#.0") : "N/A")
+        f_setRow(17, "Last P02 Support", not na(lastP02Support) ? str.tostring(lastP02Support, "#.0") : "N/A")
+        f_setRow(18, "Last P03 Support", not na(lastP03Support) ? str.tostring(lastP03Support, "#.0") : "N/A")
+        f_setRow(19, "Last P04 Support", not na(lastP04Support) ? str.tostring(lastP04Support, "#.0") : "N/A")
+        f_setRow(20, "Last Zone Score", not na(lastCandidateScore) ? str.tostring(lastCandidateScore, "#.1") : "N/A")
+        f_setRow(21, "Threshold", str.tostring(minQualificationScore, "#.0"))
+        f_setRow(22, "POC", not na(pocPrice) ? str.tostring(pocPrice, format.mintick) : "N/A")
+        f_setRow(23, "VAH", not na(vahPrice) ? str.tostring(vahPrice, format.mintick) : "N/A")
+        f_setRow(24, "VAL", not na(valPrice) ? str.tostring(valPrice, format.mintick) : "N/A")
+        f_setRow(25, "VWAP", not na(valueRef) ? str.tostring(valueRef, format.mintick) : "N/A")
+    else
+        table.clear(diag, 0, 0, 1, 25)
