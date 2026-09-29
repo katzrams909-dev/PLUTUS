@@ -1,0 +1,209 @@
+//@version=6
+indicator("PLUTUS P06.0 — Divergence Baseline", shorttitle="PLUTUS P06.0", overlay=true, max_lines_count=120, max_labels_count=120)
+
+//==============================================================================
+// PLUTUS P06.0 — Divergence Baseline Engine
+// Confirmed price-pivot divergences using RSI or MACD Histogram.
+// Context engine only. No trade signals.
+//==============================================================================
+
+//------------------------------------------------------------------------------
+// Inputs
+//------------------------------------------------------------------------------
+groupPivot = "Pivot Model"
+leftBars = input.int(3, "Pivot Left Bars", minval=1, maxval=20, group=groupPivot)
+rightBars = input.int(3, "Pivot Right Bars", minval=1, maxval=20, group=groupPivot)
+pairTolerance = input.int(1, "Oscillator Pairing Tolerance", minval=0, maxval=5, group=groupPivot)
+maxPivotGapBars = input.int(120, "Maximum Pivot Separation (Bars)", minval=5, maxval=1000, group=groupPivot)
+atrLen = input.int(14, "ATR Length", minval=1, group=groupPivot)
+minPriceSepAtr = input.float(0.10, "Minimum Price Separation / ATR", minval=0.0, step=0.05, group=groupPivot)
+
+groupOsc = "Oscillator"
+oscillator = input.string("RSI", "Oscillator", options=["RSI", "MACD Histogram"], group=groupOsc)
+rsiLen = input.int(14, "RSI Length", minval=2, group=groupOsc)
+macdFast = input.int(12, "MACD Fast", minval=1, group=groupOsc)
+macdSlow = input.int(26, "MACD Slow", minval=2, group=groupOsc)
+macdSignal = input.int(9, "MACD Signal", minval=1, group=groupOsc)
+minOscSep = input.float(2.0, "Minimum Oscillator Separation", minval=0.0, step=0.1, group=groupOsc)
+
+groupTypes = "Divergence Types"
+showRegular = input.bool(true, "Regular Divergence", group=groupTypes)
+showHidden = input.bool(true, "Hidden Divergence", group=groupTypes)
+
+groupDisplay = "Display"
+showLines = input.bool(true, "Show Divergence Lines", group=groupDisplay)
+showLabels = input.bool(true, "Show Divergence Labels", group=groupDisplay)
+showDiagnostics = input.bool(true, "Show Diagnostic Table", group=groupDisplay)
+maxEvents = input.int(40, "Maximum Drawn Events", minval=5, maxval=100, group=groupDisplay)
+
+//------------------------------------------------------------------------------
+// Oscillator
+//------------------------------------------------------------------------------
+float rsi = ta.rsi(close, rsiLen)
+[macdLine, macdSignalLine, macdHist] = ta.macd(close, macdFast, macdSlow, macdSignal)
+float osc = oscillator == "RSI" ? rsi : macdHist
+float atr = ta.atr(atrLen)
+
+//------------------------------------------------------------------------------
+// Confirmed price pivots
+//------------------------------------------------------------------------------
+float pivotLowPrice = ta.pivotlow(low, leftBars, rightBars)
+float pivotHighPrice = ta.pivothigh(high, leftBars, rightBars)
+bool newLowPivot = not na(pivotLowPrice)
+bool newHighPivot = not na(pivotHighPrice)
+
+// Sample oscillator around the confirmed price pivot. We intentionally allow a
+// small local tolerance because oscillator extrema need not occur on the exact
+// same bar as the price wick.
+f_oscNearPivot(bool wantLow) =>
+    int tol = math.min(pairTolerance, rightBars)
+    float sampled = osc[rightBars]
+    if tol > 0
+        for d = -tol to tol
+            int idx = rightBars + d
+            float v = osc[idx]
+            if not na(v)
+                sampled := na(sampled) ? v : wantLow ? math.min(sampled, v) : math.max(sampled, v)
+    sampled
+
+float lowPivotOsc = newLowPivot ? f_oscNearPivot(true) : na
+float highPivotOsc = newHighPivot ? f_oscNearPivot(false) : na
+int lowPivotBar = bar_index - rightBars
+int highPivotBar = bar_index - rightBars
+
+//------------------------------------------------------------------------------
+// Previous confirmed pivot memory
+//------------------------------------------------------------------------------
+var float prevLowPrice = na
+var float prevLowOsc = na
+var int prevLowBar = na
+var float prevHighPrice = na
+var float prevHighOsc = na
+var int prevHighBar = na
+
+// Event outputs for current bar.
+bool regularBull = false
+bool hiddenBull = false
+bool regularBear = false
+bool hiddenBear = false
+float bullStrength = na
+float bearStrength = na
+
+//------------------------------------------------------------------------------
+// Bounded drawing storage
+//------------------------------------------------------------------------------
+var array<line> divLines = array.new_line()
+var array<label> divLabels = array.new_label()
+
+f_storeLine(line ln) =>
+    array.push(divLines, ln)
+    while array.size(divLines) > maxEvents
+        line old = array.shift(divLines)
+        line.delete(old)
+
+f_storeLabel(label lb) =>
+    array.push(divLabels, lb)
+    while array.size(divLabels) > maxEvents
+        label old = array.shift(divLabels)
+        label.delete(old)
+
+f_drawEvent(int x1, float y1, int x2, float y2, string txt, bool bullish, bool hidden) =>
+    color c = bullish ? color.new(color.lime, hidden ? 25 : 0) : color.new(color.red, hidden ? 25 : 0)
+    if showLines
+        line ln = line.new(x1, y1, x2, y2, xloc=xloc.bar_index, extend=extend.none, color=c, width=2, style=hidden ? line.style_dashed : line.style_solid)
+        f_storeLine(ln)
+    if showLabels
+        label lb = label.new(x2, y2, txt, xloc=xloc.bar_index, style=bullish ? label.style_label_up : label.style_label_down, textcolor=color.white, color=color.new(c, 70), size=size.tiny)
+        f_storeLabel(lb)
+
+//------------------------------------------------------------------------------
+// Low-pivot divergences
+// Regular bullish: price LL + oscillator HL.
+// Hidden bullish: price HL + oscillator LL.
+//------------------------------------------------------------------------------
+if newLowPivot and not na(lowPivotOsc)
+    if not na(prevLowPrice) and not na(prevLowOsc) and not na(prevLowBar)
+        int gapBars = lowPivotBar - prevLowBar
+        float atrAtPivot = atr[rightBars]
+        float priceSepAtr = not na(atrAtPivot) and atrAtPivot > 0.0 ? math.abs(pivotLowPrice - prevLowPrice) / atrAtPivot : na
+        float oscDelta = lowPivotOsc - prevLowOsc
+        bool validGap = gapBars > 0 and gapBars <= maxPivotGapBars
+        bool validPriceSep = not na(priceSepAtr) and priceSepAtr >= minPriceSepAtr
+        regularBull := showRegular and validGap and validPriceSep and pivotLowPrice < prevLowPrice and oscDelta >= minOscSep
+        hiddenBull := showHidden and validGap and validPriceSep and pivotLowPrice > prevLowPrice and oscDelta <= -minOscSep
+        if regularBull or hiddenBull
+            bullStrength := math.min(100.0, nz(priceSepAtr) * 35.0 + math.abs(oscDelta) * 5.0)
+            f_drawEvent(prevLowBar, prevLowPrice, lowPivotBar, pivotLowPrice, regularBull ? "REG BULL" : "HID BULL", true, hiddenBull)
+    prevLowPrice := pivotLowPrice
+    prevLowOsc := lowPivotOsc
+    prevLowBar := lowPivotBar
+
+//------------------------------------------------------------------------------
+// High-pivot divergences
+// Regular bearish: price HH + oscillator LH.
+// Hidden bearish: price LH + oscillator HH.
+//------------------------------------------------------------------------------
+if newHighPivot and not na(highPivotOsc)
+    if not na(prevHighPrice) and not na(prevHighOsc) and not na(prevHighBar)
+        int gapBars = highPivotBar - prevHighBar
+        float atrAtPivot = atr[rightBars]
+        float priceSepAtr = not na(atrAtPivot) and atrAtPivot > 0.0 ? math.abs(pivotHighPrice - prevHighPrice) / atrAtPivot : na
+        float oscDelta = highPivotOsc - prevHighOsc
+        bool validGap = gapBars > 0 and gapBars <= maxPivotGapBars
+        bool validPriceSep = not na(priceSepAtr) and priceSepAtr >= minPriceSepAtr
+        regularBear := showRegular and validGap and validPriceSep and pivotHighPrice > prevHighPrice and oscDelta <= -minOscSep
+        hiddenBear := showHidden and validGap and validPriceSep and pivotHighPrice < prevHighPrice and oscDelta >= minOscSep
+        if regularBear or hiddenBear
+            bearStrength := math.min(100.0, nz(priceSepAtr) * 35.0 + math.abs(oscDelta) * 5.0)
+            f_drawEvent(prevHighBar, prevHighPrice, highPivotBar, pivotHighPrice, regularBear ? "REG BEAR" : "HID BEAR", false, hiddenBear)
+    prevHighPrice := pivotHighPrice
+    prevHighOsc := highPivotOsc
+    prevHighBar := highPivotBar
+
+//------------------------------------------------------------------------------
+// Confirmed state
+//------------------------------------------------------------------------------
+string candidateState = "DIVERGENCE_NONE"
+float signedScore = 0.0
+if regularBull
+    candidateState := "DIVERGENCE_REGULAR_BULLISH"
+    signedScore := nz(bullStrength)
+else if hiddenBull
+    candidateState := "DIVERGENCE_HIDDEN_BULLISH"
+    signedScore := nz(bullStrength) * 0.85
+else if regularBear
+    candidateState := "DIVERGENCE_REGULAR_BEARISH"
+    signedScore := -nz(bearStrength)
+else if hiddenBear
+    candidateState := "DIVERGENCE_HIDDEN_BEARISH"
+    signedScore := -nz(bearStrength) * 0.85
+
+string state = barstate.isconfirmed ? candidateState : "FORMING"
+float divergenceScore = barstate.isconfirmed ? signedScore : 0.0
+
+//------------------------------------------------------------------------------
+// Diagnostics
+//------------------------------------------------------------------------------
+var table diag = table.new(position.top_right, 2, 13, border_width=1, frame_width=1, bgcolor=color.new(color.black, 15))
+f_setRow(int row, string k, string v) =>
+    table.cell(diag, 0, row, k, text_color=color.silver, bgcolor=color.new(color.black, 15), text_halign=text.align_left)
+    table.cell(diag, 1, row, v, text_color=color.white, bgcolor=color.new(color.black, 15), text_halign=text.align_right)
+
+if barstate.islast
+    if showDiagnostics
+        table.clear(diag, 0, 0, 1, 12)
+        f_setRow(0, "PLUTUS", "P06.0 Divergence")
+        f_setRow(1, "Oscillator", oscillator)
+        f_setRow(2, "Pivot L / R", str.tostring(leftBars) + " / " + str.tostring(rightBars))
+        f_setRow(3, "Pair Tolerance", str.tostring(math.min(pairTolerance, rightBars)))
+        f_setRow(4, "Last Low Price", not na(prevLowPrice) ? str.tostring(prevLowPrice, format.mintick) : "N/A")
+        f_setRow(5, "Last Low Osc", not na(prevLowOsc) ? str.tostring(prevLowOsc, "#.##") : "N/A")
+        f_setRow(6, "Last High Price", not na(prevHighPrice) ? str.tostring(prevHighPrice, format.mintick) : "N/A")
+        f_setRow(7, "Last High Osc", not na(prevHighOsc) ? str.tostring(prevHighOsc, "#.##") : "N/A")
+        f_setRow(8, "Regular", showRegular ? "ON" : "OFF")
+        f_setRow(9, "Hidden", showHidden ? "ON" : "OFF")
+        f_setRow(10, "Score", str.tostring(divergenceScore, "#.1"))
+        f_setRow(11, "Confirmed", barstate.isconfirmed ? "YES" : "NO")
+        f_setRow(12, "State", state)
+    else
+        table.clear(diag, 0, 0, 1, 12)
