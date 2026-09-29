@@ -1,0 +1,499 @@
+//@version=6
+indicator("PLUTUS P03.4 — Unified Volume Profile", shorttitle="PLUTUS P03.4", overlay=true, max_boxes_count=120, max_labels_count=50)
+
+//==============================================================================
+// PLUTUS P03.4 — Unified Profile State + Histogram
+// Consolidates P03.0-P03.3 into one profile engine:
+// - bounded price-bin volume profile
+// - POC / VAH / VAL
+// - HVN / LVN detection
+// - profile migration / developing value
+// - unified downstream-ready state + scores
+// - bounded reusable right-side histogram
+//==============================================================================
+
+//------------------------------------------------------------------------------
+// Inputs
+//------------------------------------------------------------------------------
+groupTiming = "Timing / Timezone"
+timezoneInput = input.string("Exchange", "Session Timezone", options=["Exchange", "UTC-2", "UTC-1", "UTC+0", "UTC+1", "UTC+2", "America/New_York", "Europe/London", "Asia/Tokyo"], group=groupTiming)
+string sessionTz = timezoneInput == "Exchange" ? syminfo.timezone : timezoneInput
+
+groupProfile = "Profile Engine"
+profileScope = input.string("New York", "Profile Scope", options=["Asia", "London", "New York", "Day"], group=groupProfile)
+allocationSource = input.source(hlc3, "Allocation Price", group=groupProfile)
+binCount = input.int(24, "Price Bins", minval=8, maxval=80, group=groupProfile)
+maxProfileBars = input.int(300, "Maximum Bars Per Profile", minval=25, maxval=1000, group=groupProfile)
+valueAreaPct = input.float(70.0, "Value Area %", minval=50.0, maxval=99.0, step=1.0, group=groupProfile)
+
+groupNodes = "HVN / LVN Model"
+smoothingRadius = input.int(1, "Smoothing Radius (Bins)", minval=0, maxval=4, group=groupNodes)
+hvnThreshold = input.float(1.35, "HVN Min Volume / Mean", minval=1.0, step=0.05, group=groupNodes)
+lvnThreshold = input.float(0.65, "LVN Max Volume / Mean", minval=0.05, maxval=1.0, step=0.05, group=groupNodes)
+minNodeSeparation = input.int(2, "Minimum Node Separation (Bins)", minval=1, maxval=10, group=groupNodes)
+
+groupMigration = "Profile Migration Model"
+migrationLookback = input.int(5, "Migration Lookback Bars", minval=1, maxval=50, group=groupMigration)
+atrLen = input.int(14, "ATR Length", minval=1, group=groupMigration)
+minMigrationAtr = input.float(0.10, "Min POC Migration / ATR", minval=0.0, step=0.01, group=groupMigration)
+widthChangePct = input.float(10.0, "VA Width Change Threshold %", minval=1.0, step=1.0, group=groupMigration)
+persistenceLookback = input.int(5, "Persistence Lookback", minval=2, maxval=50, group=groupMigration)
+persistenceRatio = input.float(0.60, "Persistence Ratio", minval=0.50, maxval=1.0, step=0.05, group=groupMigration)
+
+groupUnified = "Unified State"
+nodeProximityBins = input.float(1.0, "Node Proximity (Bins)", minval=0.25, maxval=5.0, step=0.25, group=groupUnified)
+conflictThreshold = input.float(25.0, "Conflict Score Threshold", minval=5.0, maxval=75.0, step=5.0, group=groupUnified)
+
+groupHistogram = "Histogram"
+showHistogram = input.bool(true, "Show Current Profile Histogram", group=groupHistogram)
+histogramOffset = input.int(4, "Right Offset (Bars)", minval=1, maxval=50, group=groupHistogram)
+histogramMaxWidth = input.int(24, "Maximum Width (Bars)", minval=5, maxval=100, group=groupHistogram)
+showValueAreaHighlight = input.bool(true, "Highlight Value Area", group=groupHistogram)
+showPocHighlight = input.bool(true, "Highlight POC Bin", group=groupHistogram)
+
+groupDisplay = "Display"
+showValueLevels = input.bool(true, "Show Developing POC / VAH / VAL", group=groupDisplay)
+showNodes = input.bool(false, "Show Strongest HVN / LVN", group=groupDisplay)
+showPreviousLevels = input.bool(false, "Show Previous Completed POC / VAH / VAL", group=groupDisplay)
+showTable = input.bool(true, "Show Diagnostic Table", group=groupDisplay)
+lineWidth = input.int(2, "Line Width", minval=1, maxval=4, group=groupDisplay)
+
+//------------------------------------------------------------------------------
+// Helpers
+//------------------------------------------------------------------------------
+f_clamp(float x, float lo, float hi) =>
+    math.max(lo, math.min(hi, x))
+
+//------------------------------------------------------------------------------
+// Fixed ARTHA sessions
+//------------------------------------------------------------------------------
+string asiaSession = "0000-0800:1234567"
+string londonSession = "0800-1630:1234567"
+string newYorkSession = "1330-2000:1234567"
+
+bool inAsia = not na(time(timeframe.period, asiaSession, sessionTz))
+bool inLondon = not na(time(timeframe.period, londonSession, sessionTz))
+bool inNewYork = not na(time(timeframe.period, newYorkSession, sessionTz))
+
+bool newAsia = inAsia and not inAsia[1]
+bool newLondon = inLondon and not inLondon[1]
+bool newNewYork = inNewYork and not inNewYork[1]
+
+int localDay = dayofmonth(time, sessionTz)
+bool newDay = ta.change(localDay) != 0
+
+bool scopeActive = switch profileScope
+    "Asia" => inAsia
+    "London" => inLondon
+    "New York" => inNewYork
+    => true
+
+bool scopeReset = switch profileScope
+    "Asia" => newAsia
+    "London" => newLondon
+    "New York" => newNewYork
+    => barstate.isfirst or newDay
+
+//------------------------------------------------------------------------------
+// Bounded profile storage
+//------------------------------------------------------------------------------
+var array<float> profilePrices = array.new_float()
+var array<float> profileHighs = array.new_float()
+var array<float> profileLows = array.new_float()
+var array<float> profileVolumes = array.new_float()
+var array<float> bins = array.new_float()
+var array<float> smoothBins = array.new_float()
+var array<box> histBoxes = array.new_box()
+
+if barstate.isfirst
+    for i = 0 to binCount - 1
+        array.push(bins, 0.0)
+        array.push(smoothBins, 0.0)
+        box b = box.new(bar_index, close, bar_index, close, xloc=xloc.bar_index, border_width=0, bgcolor=color.new(color.gray, 100))
+        array.push(histBoxes, b)
+
+//------------------------------------------------------------------------------
+// Current + completed profile outputs
+//------------------------------------------------------------------------------
+float profileHigh = na
+float profileLow = na
+float pocPrice = na
+float vahPrice = na
+float valPrice = na
+float totalProfileVolume = 0.0
+float valueAreaVolume = 0.0
+float binSize = na
+int pocIndex = na
+int vaLowIndex = na
+int vaHighIndex = na
+
+var float completedPoc = na
+var float completedVah = na
+var float completedVal = na
+var float completedWidth = na
+
+if scopeReset and not barstate.isfirst
+    completedPoc := pocPrice[1]
+    completedVah := vahPrice[1]
+    completedVal := valPrice[1]
+    completedWidth := not na(vahPrice[1]) and not na(valPrice[1]) ? vahPrice[1] - valPrice[1] : na
+
+if scopeReset
+    array.clear(profilePrices)
+    array.clear(profileHighs)
+    array.clear(profileLows)
+    array.clear(profileVolumes)
+
+if scopeActive and not na(volume)
+    array.push(profilePrices, allocationSource)
+    array.push(profileHighs, high)
+    array.push(profileLows, low)
+    array.push(profileVolumes, volume)
+
+    if array.size(profilePrices) > maxProfileBars
+        array.shift(profilePrices)
+        array.shift(profileHighs)
+        array.shift(profileLows)
+        array.shift(profileVolumes)
+
+//------------------------------------------------------------------------------
+// Rebuild profile + value area
+//------------------------------------------------------------------------------
+int storedBars = array.size(profilePrices)
+float maxBinVolume = na
+
+if storedBars > 0
+    profileHigh := array.max(profileHighs)
+    profileLow := array.min(profileLows)
+    float profileRange = profileHigh - profileLow
+    binSize := math.max(profileRange > 0.0 ? profileRange / binCount : syminfo.mintick, syminfo.mintick)
+
+    for i = 0 to binCount - 1
+        array.set(bins, i, 0.0)
+        array.set(smoothBins, i, 0.0)
+
+    for i = 0 to storedBars - 1
+        float p = array.get(profilePrices, i)
+        float v = array.get(profileVolumes, i)
+        int idx = int(math.floor((p - profileLow) / binSize))
+        idx := math.max(0, math.min(binCount - 1, idx))
+        array.set(bins, idx, array.get(bins, idx) + v)
+        totalProfileVolume += v
+
+    maxBinVolume := -1.0
+    pocIndex := 0
+    for i = 0 to binCount - 1
+        float binVol = array.get(bins, i)
+        if binVol > maxBinVolume
+            maxBinVolume := binVol
+            pocIndex := i
+
+    pocPrice := profileLow + (pocIndex + 0.5) * binSize
+
+    float targetVolume = totalProfileVolume * valueAreaPct / 100.0
+    vaLowIndex := pocIndex
+    vaHighIndex := pocIndex
+    valueAreaVolume := array.get(bins, pocIndex)
+    int expansionSteps = 0
+
+    while valueAreaVolume < targetVolume and expansionSteps < binCount
+        bool canDown = vaLowIndex > 0
+        bool canUp = vaHighIndex < binCount - 1
+        if not canDown and not canUp
+            break
+
+        float downVol = canDown ? array.get(bins, vaLowIndex - 1) : -1.0
+        float upVol = canUp ? array.get(bins, vaHighIndex + 1) : -1.0
+
+        if canDown and canUp and downVol == upVol
+            vaLowIndex -= 1
+            vaHighIndex += 1
+            valueAreaVolume += downVol + upVol
+        else if canUp and (not canDown or upVol > downVol)
+            vaHighIndex += 1
+            valueAreaVolume += upVol
+        else if canDown
+            vaLowIndex -= 1
+            valueAreaVolume += downVol
+
+        expansionSteps += 1
+
+    valPrice := profileLow + vaLowIndex * binSize
+    vahPrice := profileLow + (vaHighIndex + 1) * binSize
+
+    for i = 0 to binCount - 1
+        float sumVol = 0.0
+        int count = 0
+        int left = math.max(0, i - smoothingRadius)
+        int right = math.min(binCount - 1, i + smoothingRadius)
+        for j = left to right
+            sumVol += array.get(bins, j)
+            count += 1
+        array.set(smoothBins, i, count > 0 ? sumVol / count : 0.0)
+
+//------------------------------------------------------------------------------
+// HVN / LVN detection
+//------------------------------------------------------------------------------
+float meanSmoothVolume = na
+float strongestHvnPrice = na
+float strongestLvnPrice = na
+float strongestHvnStrength = na
+float strongestLvnStrength = na
+int strongestHvnIndex = na
+int strongestLvnIndex = na
+int hvnCandidateCount = 0
+int lvnCandidateCount = 0
+
+if storedBars > 0 and totalProfileVolume > 0.0
+    float smoothTotal = 0.0
+    for i = 0 to binCount - 1
+        smoothTotal += array.get(smoothBins, i)
+    meanSmoothVolume := smoothTotal / binCount
+
+    if meanSmoothVolume > 0.0
+        for i = 1 to binCount - 2
+            float curr = array.get(smoothBins, i)
+            float prev = array.get(smoothBins, i - 1)
+            float next = array.get(smoothBins, i + 1)
+            float rel = curr / meanSmoothVolume
+
+            bool hvnCandidate = curr >= prev and curr >= next and rel >= hvnThreshold
+            bool lvnCandidate = curr <= prev and curr <= next and rel <= lvnThreshold
+
+            if hvnCandidate
+                hvnCandidateCount += 1
+                if na(strongestHvnStrength) or rel > strongestHvnStrength
+                    strongestHvnStrength := rel
+                    strongestHvnIndex := i
+
+            if lvnCandidate
+                lvnCandidateCount += 1
+                float safeCurr = math.max(curr, meanSmoothVolume * 0.01)
+                float strength = meanSmoothVolume / safeCurr
+                if na(strongestLvnStrength) or strength > strongestLvnStrength
+                    strongestLvnStrength := strength
+                    strongestLvnIndex := i
+
+        strongestHvnPrice := not na(strongestHvnIndex) ? profileLow + (strongestHvnIndex + 0.5) * binSize : na
+        strongestLvnPrice := not na(strongestLvnIndex) ? profileLow + (strongestLvnIndex + 0.5) * binSize : na
+
+//------------------------------------------------------------------------------
+// Migration / developing value
+//------------------------------------------------------------------------------
+float atr = ta.atr(atrLen)
+float pocMigrationAtr = not na(pocPrice) and not na(pocPrice[migrationLookback]) and not na(atr) and atr != 0.0 ? (pocPrice - pocPrice[migrationLookback]) / atr : na
+float vahMigrationAtr = not na(vahPrice) and not na(vahPrice[migrationLookback]) and not na(atr) and atr != 0.0 ? (vahPrice - vahPrice[migrationLookback]) / atr : na
+float valMigrationAtr = not na(valPrice) and not na(valPrice[migrationLookback]) and not na(atr) and atr != 0.0 ? (valPrice - valPrice[migrationLookback]) / atr : na
+
+bool pocRising = not na(pocMigrationAtr) and pocMigrationAtr >= minMigrationAtr
+bool pocFalling = not na(pocMigrationAtr) and pocMigrationAtr <= -minMigrationAtr
+bool pocFlat = not na(pocMigrationAtr) and not pocRising and not pocFalling
+
+bool valueRising = not na(vahMigrationAtr) and not na(valMigrationAtr) and vahMigrationAtr > 0.0 and valMigrationAtr > 0.0
+bool valueFalling = not na(vahMigrationAtr) and not na(valMigrationAtr) and vahMigrationAtr < 0.0 and valMigrationAtr < 0.0
+bool valueDivergent = not na(vahMigrationAtr) and not na(valMigrationAtr) and ((vahMigrationAtr > 0.0 and valMigrationAtr < 0.0) or (vahMigrationAtr < 0.0 and valMigrationAtr > 0.0))
+
+float currentWidth = not na(vahPrice) and not na(valPrice) ? vahPrice - valPrice : na
+float priorWidth = currentWidth[migrationLookback]
+float widthChange = not na(currentWidth) and not na(priorWidth) and priorWidth > 0.0 ? (currentWidth - priorWidth) / priorWidth * 100.0 : na
+bool widthExpanding = not na(widthChange) and widthChange >= widthChangePct
+bool widthContracting = not na(widthChange) and widthChange <= -widthChangePct
+
+float risingRatio = ta.sma((pocRising and valueRising) ? 1.0 : 0.0, persistenceLookback)
+float fallingRatio = ta.sma((pocFalling and valueFalling) ? 1.0 : 0.0, persistenceLookback)
+bool persistentHigher = not na(risingRatio) and risingRatio >= persistenceRatio
+bool persistentLower = not na(fallingRatio) and fallingRatio >= persistenceRatio
+
+float pocVsCompletedAtr = not na(pocPrice) and not na(completedPoc) and not na(atr) and atr != 0.0 ? (pocPrice - completedPoc) / atr : na
+
+//------------------------------------------------------------------------------
+// Price location + scores
+//------------------------------------------------------------------------------
+string priceLocation = "UNAVAILABLE"
+float locationScore = 0.0
+if not na(pocPrice) and not na(vahPrice) and not na(valPrice)
+    if close > vahPrice
+        priceLocation := "ABOVE_VALUE"
+        locationScore := 100.0
+    else if close < valPrice
+        priceLocation := "BELOW_VALUE"
+        locationScore := -100.0
+    else if close > pocPrice
+        priceLocation := "UPPER_VALUE"
+        locationScore := 50.0
+    else if close < pocPrice
+        priceLocation := "LOWER_VALUE"
+        locationScore := -50.0
+    else
+        priceLocation := "AT_POC"
+        locationScore := 0.0
+
+float migrationScore = 0.0
+if not na(pocMigrationAtr)
+    migrationScore += f_clamp(pocMigrationAtr / math.max(minMigrationAtr, 0.01) * 25.0, -50.0, 50.0)
+if valueRising
+    migrationScore += 25.0
+else if valueFalling
+    migrationScore -= 25.0
+if persistentHigher
+    migrationScore += 25.0
+else if persistentLower
+    migrationScore -= 25.0
+migrationScore := f_clamp(migrationScore, -100.0, 100.0)
+
+float nearestNodeDistanceBins = na
+string nearestNodeType = "NONE"
+if not na(binSize) and binSize > 0.0
+    float hvnDist = not na(strongestHvnPrice) ? math.abs(close - strongestHvnPrice) / binSize : na
+    float lvnDist = not na(strongestLvnPrice) ? math.abs(close - strongestLvnPrice) / binSize : na
+    if not na(hvnDist) and (na(lvnDist) or hvnDist <= lvnDist)
+        nearestNodeDistanceBins := hvnDist
+        nearestNodeType := "HVN"
+    else if not na(lvnDist)
+        nearestNodeDistanceBins := lvnDist
+        nearestNodeType := "LVN"
+
+float nodeContextScore = not na(nearestNodeDistanceBins) ? f_clamp((nodeProximityBins - nearestNodeDistanceBins) / nodeProximityBins * 100.0, 0.0, 100.0) : 0.0
+
+float profileDirectionScore = f_clamp(migrationScore * 0.65 + locationScore * 0.35, -100.0, 100.0)
+
+bool bullishConflict = migrationScore <= -conflictThreshold and locationScore >= conflictThreshold
+bool bearishConflict = migrationScore >= conflictThreshold and locationScore <= -conflictThreshold
+bool profileConflict = bullishConflict or bearishConflict
+bool nearHvn = nearestNodeType == "HVN" and nodeContextScore > 0.0
+bool nearLvn = nearestNodeType == "LVN" and nodeContextScore > 0.0
+
+//------------------------------------------------------------------------------
+// Unified profile state
+//------------------------------------------------------------------------------
+string candidateState = "PROFILE_BALANCED"
+if not scopeActive or na(pocPrice) or na(vahPrice) or na(valPrice)
+    candidateState := "PROFILE_UNAVAILABLE"
+else if profileConflict
+    candidateState := "PROFILE_CONFLICT"
+else if close > vahPrice and migrationScore > 20.0
+    candidateState := "PROFILE_ACCEPTED_HIGHER"
+else if close < valPrice and migrationScore < -20.0
+    candidateState := "PROFILE_ACCEPTED_LOWER"
+else if close > vahPrice
+    candidateState := "PROFILE_EXTENDED_ABOVE"
+else if close < valPrice
+    candidateState := "PROFILE_EXTENDED_BELOW"
+else if nearLvn
+    candidateState := "PROFILE_LVN_TRANSITION"
+else if nearHvn and math.abs(migrationScore) < 25.0
+    candidateState := "PROFILE_HVN_ACCEPTANCE"
+else if persistentHigher
+    candidateState := widthExpanding ? "PROFILE_MIGRATING_HIGHER_EXPANDING" : "PROFILE_MIGRATING_HIGHER"
+else if persistentLower
+    candidateState := widthExpanding ? "PROFILE_MIGRATING_LOWER_EXPANDING" : "PROFILE_MIGRATING_LOWER"
+else if widthExpanding and valueDivergent
+    candidateState := "PROFILE_VALUE_EXPANDING"
+else if widthContracting and pocFlat
+    candidateState := "PROFILE_VALUE_CONTRACTING"
+else if pocRising and valueRising
+    candidateState := "PROFILE_LEANING_HIGHER"
+else if pocFalling and valueFalling
+    candidateState := "PROFILE_LEANING_LOWER"
+else if pocFlat
+    candidateState := "PROFILE_BALANCED"
+else
+    candidateState := "PROFILE_TRANSITION"
+
+string state = barstate.isconfirmed ? candidateState : "FORMING"
+
+//------------------------------------------------------------------------------
+// Horizontal histogram — fixed reusable box pool
+//------------------------------------------------------------------------------
+if barstate.islast
+    for i = 0 to binCount - 1
+        box b = array.get(histBoxes, i)
+        if showHistogram and scopeActive and storedBars > 0 and not na(maxBinVolume) and maxBinVolume > 0.0 and not na(binSize)
+            float vol = array.get(bins, i)
+            float ratio = vol / maxBinVolume
+            int widthBars = math.max(1, int(math.round(ratio * histogramMaxWidth)))
+            int rightX = bar_index + histogramOffset + histogramMaxWidth
+            int leftX = rightX - widthBars
+            float bottomY = profileLow + i * binSize
+            float topY = bottomY + binSize
+            bool inValueArea = not na(vaLowIndex) and not na(vaHighIndex) and i >= vaLowIndex and i <= vaHighIndex
+            bool isPocBin = not na(pocIndex) and i == pocIndex
+            color fillColor = isPocBin and showPocHighlight ? color.new(color.orange, 15) : inValueArea and showValueAreaHighlight ? color.new(color.blue, 55) : color.new(color.gray, 78)
+            box.set_left(b, leftX)
+            box.set_right(b, rightX)
+            box.set_bottom(b, bottomY)
+            box.set_top(b, topY)
+            box.set_bgcolor(b, fillColor)
+            box.set_border_color(b, color.new(fillColor, 100))
+        else
+            box.set_left(b, bar_index)
+            box.set_right(b, bar_index)
+            box.set_bottom(b, close)
+            box.set_top(b, close)
+            box.set_bgcolor(b, color.new(color.gray, 100))
+            box.set_border_color(b, color.new(color.gray, 100))
+
+//------------------------------------------------------------------------------
+// Plots
+//------------------------------------------------------------------------------
+float pocPlot = showValueLevels and scopeActive ? pocPrice : na
+float vahPlot = showValueLevels and scopeActive ? vahPrice : na
+float valPlot = showValueLevels and scopeActive ? valPrice : na
+float hvnPlot = showNodes and scopeActive ? strongestHvnPrice : na
+float lvnPlot = showNodes and scopeActive ? strongestLvnPrice : na
+
+pocPlot := scopeReset ? na : pocPlot
+vahPlot := scopeReset ? na : vahPlot
+valPlot := scopeReset ? na : valPlot
+hvnPlot := scopeReset ? na : hvnPlot
+lvnPlot := scopeReset ? na : lvnPlot
+
+plot(pocPlot, "Developing POC", color=color.orange, linewidth=lineWidth, style=plot.style_linebr)
+plot(vahPlot, "Developing VAH", color=color.new(color.green, 10), linewidth=1, style=plot.style_linebr)
+plot(valPlot, "Developing VAL", color=color.new(color.red, 10), linewidth=1, style=plot.style_linebr)
+plot(hvnPlot, "Strongest HVN", color=color.new(color.blue, 15), linewidth=1, style=plot.style_linebr)
+plot(lvnPlot, "Strongest LVN", color=color.new(color.purple, 15), linewidth=1, style=plot.style_linebr)
+plot(showPreviousLevels ? completedPoc : na, "Previous POC", color=color.new(color.orange, 65), linewidth=1, style=plot.style_linebr)
+plot(showPreviousLevels ? completedVah : na, "Previous VAH", color=color.new(color.green, 75), linewidth=1, style=plot.style_linebr)
+plot(showPreviousLevels ? completedVal : na, "Previous VAL", color=color.new(color.red, 75), linewidth=1, style=plot.style_linebr)
+
+//------------------------------------------------------------------------------
+// Diagnostics
+//------------------------------------------------------------------------------
+float achievedValueAreaPct = totalProfileVolume > 0.0 ? valueAreaVolume / totalProfileVolume * 100.0 : na
+
+var table diag = table.new(position.top_right, 2, 24, border_width=1, frame_width=1, bgcolor=color.new(color.black, 15))
+
+f_setRow(int row, string labelText, string valueText) =>
+    table.cell(diag, 0, row, labelText, text_color=color.silver, bgcolor=color.new(color.black, 15), text_halign=text.align_left)
+    table.cell(diag, 1, row, valueText, text_color=color.white, bgcolor=color.new(color.black, 15), text_halign=text.align_right)
+
+if barstate.islast
+    if showTable
+        table.clear(diag, 0, 0, 1, 23)
+        f_setRow(0, "PLUTUS", "P03.4 Unified Profile")
+        f_setRow(1, "Timezone", sessionTz)
+        f_setRow(2, "Scope", profileScope)
+        f_setRow(3, "Scope State", scopeActive ? "ACTIVE" : "CLOSED")
+        f_setRow(4, "Stored Bars", str.tostring(storedBars))
+        f_setRow(5, "Bins", str.tostring(binCount))
+        f_setRow(6, "VA Achieved", not na(achievedValueAreaPct) ? str.tostring(achievedValueAreaPct, "#.1") + "%" : "N/A")
+        f_setRow(7, "VAH", not na(vahPrice) ? str.tostring(vahPrice, format.mintick) : "N/A")
+        f_setRow(8, "POC", not na(pocPrice) ? str.tostring(pocPrice, format.mintick) : "N/A")
+        f_setRow(9, "VAL", not na(valPrice) ? str.tostring(valPrice, format.mintick) : "N/A")
+        f_setRow(10, "Price Location", priceLocation)
+        f_setRow(11, "POC Migration / ATR", not na(pocMigrationAtr) ? str.tostring(pocMigrationAtr, "#.###") : "N/A")
+        f_setRow(12, "Width Change", not na(widthChange) ? str.tostring(widthChange, "#.1") + "%" : "N/A")
+        f_setRow(13, "Previous POC Δ / ATR", not na(pocVsCompletedAtr) ? str.tostring(pocVsCompletedAtr, "#.###") : "N/A")
+        f_setRow(14, "HVN Candidates", str.tostring(hvnCandidateCount))
+        f_setRow(15, "LVN Candidates", str.tostring(lvnCandidateCount))
+        f_setRow(16, "Strongest HVN", not na(strongestHvnPrice) ? str.tostring(strongestHvnPrice, format.mintick) : "N/A")
+        f_setRow(17, "Strongest LVN", not na(strongestLvnPrice) ? str.tostring(strongestLvnPrice, format.mintick) : "N/A")
+        f_setRow(18, "Nearest Node", nearestNodeType)
+        f_setRow(19, "Node Proximity", str.tostring(nodeContextScore, "#.0"))
+        f_setRow(20, "Migration Score", str.tostring(migrationScore, "#.0"))
+        f_setRow(21, "Location Score", str.tostring(locationScore, "#.0"))
+        f_setRow(22, "Profile Direction", str.tostring(profileDirectionScore, "#.0"))
+        f_setRow(23, "Unified State", state)
+    else
+        table.clear(diag, 0, 0, 1, 23)
