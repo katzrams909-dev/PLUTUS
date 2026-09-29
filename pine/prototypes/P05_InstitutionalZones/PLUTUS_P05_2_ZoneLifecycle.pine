@@ -329,8 +329,6 @@ var array<int> zoneRetests = array.new_int()
 var array<int> zoneLastTouchBars = array.new_int()
 var array<string> zoneTypes = array.new_string()
 
-// Persistent inversion candidates. They are armed on decisive invalidation and
-// must confirm on a later bar; this avoids instant mechanical flip-flopping.
 var array<float> invTops = array.new_float()
 var array<float> invBottoms = array.new_float()
 var array<float> invMechanics = array.new_float()
@@ -382,12 +380,6 @@ f_addZone(string zType, int zDir, float zTop, float zBottom, float mechanic, flo
         array.push(zoneLastTouchBars, -1)
         array.push(zoneTypes, zType)
 
-//------------------------------------------------------------------------------
-// Refined candidate mechanics
-// FVG displacement is evaluated on the middle candle of the 3-bar pattern.
-// OB requires an opposing candle immediately before a close through recent
-// structure, not merely a close through that candle itself.
-//------------------------------------------------------------------------------
 float middleBody = bar_index >= 2 ? math.abs(close[1] - open[1]) : na
 float middleRange = bar_index >= 2 ? math.max(high[1] - low[1], syminfo.mintick) : na
 float middleBodyAtr = bar_index >= 2 and not na(atr[1]) and atr[1] > 0.0 ? middleBody / atr[1] : na
@@ -417,7 +409,6 @@ float bearObWidthAtr = bearObRaw and not na(atr) and atr > 0.0 ? (bearObTop - be
 bool bullOb = bullObRaw and bullObWidthAtr > 0.0 and bullObWidthAtr <= maxZoneWidthAtr
 bool bearOb = bearObRaw and bearObWidthAtr > 0.0 and bearObWidthAtr <= maxZoneWidthAtr
 
-// Candidate creation.
 if bullFvg
     float mechanic = f_mechanicQuality(middleBodyAtr, middleEfficiency, bullFvgWidthAtr)
     float score = f_zoneScore(mechanic, f_support(1, p01Signed), f_support(1, p02Signed), f_support(1, p03Signed), f_support(1, p04Signed))
@@ -435,9 +426,6 @@ if bearOb
     float score = f_zoneScore(mechanic, f_support(-1, p01Signed), f_support(-1, p02Signed), f_support(-1, p03Signed), f_support(-1, p04Signed))
     f_addZone("OB", -1, bearObTop, bearObBottom, mechanic, score, bar_index - 1)
 
-//------------------------------------------------------------------------------
-// Zone lifecycle
-//------------------------------------------------------------------------------
 int trackedNow = array.size(zoneScores)
 if trackedNow > 0
     for i = 0 to trackedNow - 1
@@ -492,8 +480,6 @@ if trackedNow > 0
                         box.set_bgcolor(b, color.new(color.gray, 94))
                         box.set_border_color(b, color.new(color.gray, 80))
 
-                // Only original FVG/OB may arm an inversion. Require a decisive
-                // close through the zone in the new direction before arming.
                 bool sourceCanInvert = (createIfvg and zType == "FVG") or (createBreaker and zType == "OB")
                 float breakDistanceAtr = not na(atr) and atr > 0.0 ? (zDir == 1 ? (zBottom - close) / atr : (close - zTop) / atr) : 0.0
                 bool decisiveBreak = breakDistanceAtr >= minInversionBreakAtr and (zDir == 1 ? close < open : close > open)
@@ -538,13 +524,9 @@ if trackedNow > 0
                 if not na(b) and showZoneText
                     box.set_text(b, zType + (zDir == 1 ? " B " : " S ") + str.tostring(currentScore, "#.0") + " F R" + str.tostring(retests))
 
-//------------------------------------------------------------------------------
-// Confirm armed IFVG / Breaker candidates on a later bar.
-// The invalidation bar itself can never create the inverted box.
-//------------------------------------------------------------------------------
 int invCount = array.size(invTops)
 if invCount > 0
-    for j = invCount - 1 to 0 by -1
+    for j = invCount - 1 to 0
         float zTop = array.get(invTops, j)
         float zBottom = array.get(invBottoms, j)
         float mechanic = array.get(invMechanics, j)
@@ -575,7 +557,6 @@ if invCount > 0
             array.remove(invArmedBars, j)
             array.remove(invTypes, j)
 
-// Bound tracking arrays.
 while array.size(zoneScores) > maxTrackedZones
     box oldBox = array.shift(zoneBoxes)
     if not na(oldBox)
@@ -593,9 +574,6 @@ while array.size(zoneScores) > maxTrackedZones
     array.shift(zoneLastTouchBars)
     array.shift(zoneTypes)
 
-//------------------------------------------------------------------------------
-// Histogram — row size aggregates adjacent profile bins.
-//------------------------------------------------------------------------------
 if barstate.islast
     for i = 0 to binCount - 1
         box hb = array.get(histBoxes, i)
@@ -629,9 +607,6 @@ if barstate.islast
             box.set_bgcolor(hb, color.new(color.gray, 100))
             box.set_border_color(hb, color.new(color.gray, 100))
 
-//------------------------------------------------------------------------------
-// Reset-aware context plots
-//------------------------------------------------------------------------------
 float vwapPlot = showVwap and not valueReset ? valueRef : na
 float pocPlot = showValueLevels and profileActive and not profileReset ? pocPrice : na
 float vahPlot = showValueLevels and profileActive and not profileReset ? vahPrice : na
@@ -641,9 +616,6 @@ plot(pocPlot, "Profile POC", color=color.orange, linewidth=2, style=plot.style_l
 plot(vahPlot, "Profile VAH", color=color.new(color.green, 20), linewidth=1, style=plot.style_linebr)
 plot(valPlot, "Profile VAL", color=color.new(color.red, 20), linewidth=1, style=plot.style_linebr)
 
-//------------------------------------------------------------------------------
-// Diagnostics
-//------------------------------------------------------------------------------
 int freshZones = 0
 int partialZones = 0
 int mitigatedZones = 0
