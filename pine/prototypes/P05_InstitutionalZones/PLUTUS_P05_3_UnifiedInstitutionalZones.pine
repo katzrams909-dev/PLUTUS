@@ -1,0 +1,670 @@
+//@version=6
+indicator("PLUTUS P05.3 — Unified Institutional Zones", shorttitle="PLUTUS P05.3", overlay=true, max_boxes_count=500, max_labels_count=50)
+
+//==============================================================================
+// PLUTUS P05.3 — Unified Institutional Zone Engine
+// Consolidates validated P05 detection, qualification and lifecycle mechanics.
+// Context engine only. No trade signals.
+//==============================================================================
+
+//------------------------------------------------------------------------------
+// Inputs
+//------------------------------------------------------------------------------
+groupTiming = "Timing / Context"
+timezoneInput = input.string("Exchange", "Session Timezone", options=["Exchange", "UTC-2", "UTC-1", "UTC+0", "UTC+1", "UTC+2", "America/New_York", "Europe/London", "Asia/Tokyo"], group=groupTiming)
+string sessionTz = timezoneInput == "Exchange" ? syminfo.timezone : timezoneInput
+profileScope = input.string("Day", "Profile Scope", options=["Asia", "London", "New York", "Day"], group=groupTiming)
+valueReference = input.string("Daily", "VWAP Reference", options=["Active Session", "Daily", "Weekly", "Monthly"], group=groupTiming)
+
+groupDetection = "Candidate Detection"
+atrLen = input.int(14, "ATR Length", minval=1, group=groupDetection)
+volumeLen = input.int(20, "Volume Baseline Length", minval=2, group=groupDetection)
+structureLookback = input.int(5, "OB Structure Break Lookback", minval=2, maxval=30, group=groupDetection)
+minDisplacementAtr = input.float(0.50, "Minimum Displacement Body / ATR", minval=0.05, step=0.05, group=groupDetection)
+minDisplacementEfficiency = input.float(0.55, "Minimum Displacement Body / Range", minval=0.10, maxval=1.0, step=0.05, group=groupDetection)
+fullDisplacementAtr = input.float(1.0, "Full Mechanical Displacement / ATR", minval=0.10, step=0.10, group=groupDetection)
+minFvgAtr = input.float(0.10, "Minimum FVG Width / ATR", minval=0.0, step=0.01, group=groupDetection)
+minFvgTicks = input.int(3, "Minimum FVG Width (Ticks)", minval=1, maxval=100, group=groupDetection)
+maxZoneWidthAtr = input.float(1.50, "Maximum Zone Width / ATR", minval=0.25, step=0.25, group=groupDetection)
+requireDisplacementFvg = input.bool(true, "Reject Opening-Gap FVG Artifacts", group=groupDetection)
+suppressNestedFvg = input.bool(true, "Suppress Nested / Overlapping FVGs", group=groupDetection)
+fvgFamilyOverlapPct = input.float(50.0, "FVG Family Overlap Threshold %", minval=10.0, maxval=100.0, step=5.0, group=groupDetection)
+obRangeMode = input.string("Body", "Order Block Range", options=["Body", "Full Candle"], group=groupDetection)
+detectFvg = input.bool(true, "Detect FVG Candidates", group=groupDetection)
+detectOb = input.bool(true, "Detect Order Block Candidates", group=groupDetection)
+duplicateOverlapPct = input.float(70.0, "Duplicate Overlap Threshold %", minval=25.0, maxval=100.0, step=5.0, group=groupDetection)
+minZoneSeparationAtr = input.float(0.10, "Minimum Same-Type Zone Separation / ATR", minval=0.0, step=0.05, group=groupDetection)
+
+groupQualification = "Qualification"
+minQualificationScore = input.float(60.0, "Institutional Qualification Score", minval=0.0, maxval=100.0, step=5.0, group=groupQualification)
+strongZoneScore = input.float(70.0, "Strong Active Zone Score", minval=0.0, maxval=100.0, step=5.0, group=groupQualification)
+conflictScoreTolerance = input.float(15.0, "Opposing Zone Conflict Tolerance", minval=0.0, maxval=50.0, step=5.0, group=groupQualification)
+fullRvol = input.float(2.0, "Full Participation RVOL", minval=1.0, step=0.1, group=groupQualification)
+fullVwapDistanceAtr = input.float(1.0, "Full VWAP Distance / ATR", minval=0.10, step=0.10, group=groupQualification)
+fullPocDistanceAtr = input.float(1.0, "Full POC Distance / ATR", minval=0.10, step=0.10, group=groupQualification)
+
+groupLifecycle = "Lifecycle / Mitigation"
+mitigationBasis = input.string("Wick", "Mitigation Basis", options=["Wick", "Close"], group=groupLifecycle)
+partialMitigationPct = input.float(25.0, "Partial Mitigation Threshold %", minval=1.0, maxval=95.0, step=5.0, group=groupLifecycle)
+fullMitigationPct = input.float(95.0, "Full Mitigation Threshold %", minval=5.0, maxval=100.0, step=5.0, group=groupLifecycle)
+mitigationPenaltyMax = input.float(25.0, "Maximum Mitigation Score Penalty", minval=0.0, maxval=75.0, step=5.0, group=groupLifecycle)
+retestPenalty = input.float(5.0, "Penalty Per Retest", minval=0.0, maxval=25.0, step=1.0, group=groupLifecycle)
+freshnessDecayPer100Bars = input.float(10.0, "Freshness Decay Per 100 Bars", minval=0.0, maxval=50.0, step=1.0, group=groupLifecycle)
+maxZoneAgeBars = input.int(250, "Maximum Zone Age (Bars)", minval=10, maxval=2000, group=groupLifecycle)
+maxTrackedZones = input.int(30, "Maximum Tracked Zones", minval=4, maxval=80, group=groupLifecycle)
+removeFullyMitigated = input.bool(true, "Remove Fully Mitigated Zones", group=groupLifecycle)
+removeInvalidated = input.bool(true, "Remove Invalidated Zones", group=groupLifecycle)
+removeExpired = input.bool(true, "Remove Expired Zones", group=groupLifecycle)
+
+groupInversion = "Inversion / Breakers"
+createIfvg = input.bool(true, "Create IFVG From Invalidated FVG", group=groupInversion)
+createBreaker = input.bool(true, "Create Breaker From Invalidated OB", group=groupInversion)
+inversionMechanicFactor = input.float(0.70, "Inherited Mechanical Quality", minval=0.25, maxval=1.0, step=0.05, group=groupInversion)
+minInversionBreakAtr = input.float(0.10, "Minimum Close Through Zone / ATR", minval=0.0, step=0.05, group=groupInversion)
+inversionConfirmBars = input.int(2, "Inversion Confirmation Window", minval=1, maxval=5, group=groupInversion)
+minInversionScore = input.float(60.0, "Minimum Inversion Qualification", minval=0.0, maxval=100.0, step=5.0, group=groupInversion)
+
+groupProfile = "Profile Context"
+allocationSource = input.source(hlc3, "Profile Allocation Price", group=groupProfile)
+binCount = input.int(24, "Profile Price Bins", minval=8, maxval=80, group=groupProfile)
+maxProfileBars = input.int(300, "Maximum Bars Per Profile", minval=25, maxval=1000, group=groupProfile)
+valueAreaPct = input.float(70.0, "Value Area %", minval=50.0, maxval=99.0, step=1.0, group=groupProfile)
+
+groupDisplay = "Display"
+showZones = input.bool(true, "Show Institutional Zones", group=groupDisplay)
+showOnlyQualified = input.bool(true, "Show Only Qualified Zones", group=groupDisplay)
+showZoneText = input.bool(true, "Show Type / Score / Lifecycle", group=groupDisplay)
+showVwap = input.bool(false, "Show Primary VWAP", group=groupDisplay)
+showValueLevels = input.bool(false, "Show Profile POC / VAH / VAL", group=groupDisplay)
+showHistogram = input.bool(false, "Show Volume Profile Histogram", group=groupDisplay)
+histogramRows = input.int(80, "Histogram Rows", minval=16, maxval=160, step=8, group=groupDisplay)
+histogramAllocation = input.string("Range Overlap", "Histogram Volume Allocation", options=["Range Overlap", "HLC3 Point"], group=groupDisplay)
+histogramOffset = input.int(4, "Histogram Right Offset", minval=1, maxval=50, group=groupDisplay)
+histogramMaxWidth = input.int(24, "Histogram Maximum Width", minval=5, maxval=100, group=groupDisplay)
+showTable = input.bool(true, "Show Diagnostic Table", group=groupDisplay)
+
+f_clamp(float x, float lo, float hi) => math.max(lo, math.min(hi, x))
+f_widthQuality(float widthAtr) =>
+    float q = na(widthAtr) ? 0.0 : widthAtr <= 0.75 ? 100.0 : 100.0 * (1.0 - (widthAtr - 0.75) / math.max(maxZoneWidthAtr - 0.75, 0.01))
+    f_clamp(q, 0.0, 100.0)
+f_mechanicQuality(float displacementAtr, float efficiency, float widthAtr) =>
+    float d = not na(displacementAtr) ? f_clamp(displacementAtr / fullDisplacementAtr * 100.0, 0.0, 100.0) : 0.0
+    float e = f_clamp(efficiency * 100.0, 0.0, 100.0)
+    f_clamp(d * 0.50 + e * 0.20 + f_widthQuality(widthAtr) * 0.30, 0.0, 100.0)
+f_support(int direction, float signedScore) => f_clamp(direction * nz(signedScore), 0.0, 100.0)
+f_zoneScore(float mechanic, float p01, float p02, float p03, float p04) => f_clamp(mechanic * 0.25 + p01 * 0.25 + p02 * 0.20 + p03 * 0.15 + p04 * 0.15, 0.0, 100.0)
+
+//------------------------------------------------------------------------------
+// Shared timing
+//------------------------------------------------------------------------------
+string asiaSession = "0000-0800:1234567"
+string londonSession = "0800-1630:1234567"
+string newYorkSession = "1330-2000:1234567"
+bool inAsia = not na(time(timeframe.period, asiaSession, sessionTz))
+bool inLondon = not na(time(timeframe.period, londonSession, sessionTz))
+bool inNewYork = not na(time(timeframe.period, newYorkSession, sessionTz))
+bool newAsia = inAsia and not inAsia[1]
+bool newLondon = inLondon and not inLondon[1]
+bool newNewYork = inNewYork and not inNewYork[1]
+int localDay = dayofmonth(time, sessionTz)
+int localWeek = weekofyear(time, sessionTz)
+int localMonth = month(time, sessionTz)
+bool newDay = ta.change(localDay) != 0
+bool newWeek = ta.change(localWeek) != 0
+bool newMonth = ta.change(localMonth) != 0
+bool profileActive = switch profileScope
+    "Asia" => inAsia
+    "London" => inLondon
+    "New York" => inNewYork
+    => true
+bool profileReset = switch profileScope
+    "Asia" => newAsia
+    "London" => newLondon
+    "New York" => newNewYork
+    => barstate.isfirst or newDay
+
+//------------------------------------------------------------------------------
+// Compact P01 / P02 context
+//------------------------------------------------------------------------------
+float atr = ta.atr(atrLen)
+float body = math.abs(close - open)
+float candleRange = math.max(high - low, syminfo.mintick)
+float bodyAtr = not na(atr) and atr > 0.0 ? body / atr : na
+float bodyEfficiency = body / candleRange
+float volumeBase = ta.sma(volume, volumeLen)
+float rvol = not na(volume) and not na(volumeBase) and volumeBase > 0.0 ? volume / volumeBase : na
+float participationMagnitude = not na(rvol) ? f_clamp((rvol - 0.75) / math.max(fullRvol - 0.75, 0.01) * 100.0, 0.0, 100.0) : 0.0
+int candleDirection = close > open ? 1 : close < open ? -1 : 0
+float p01Signed = candleDirection * f_clamp(participationMagnitude * 0.65 + bodyEfficiency * 35.0, 0.0, 100.0)
+
+var float asiaPV = na
+var float asiaVol = na
+if not inAsia
+    asiaPV := na
+    asiaVol := na
+else if newAsia or na(asiaPV)
+    asiaPV := hlc3 * volume
+    asiaVol := volume
+else
+    asiaPV += hlc3 * volume
+    asiaVol += volume
+float asiaVwap = inAsia and asiaVol > 0.0 ? asiaPV / asiaVol : na
+var float londonPV = na
+var float londonVol = na
+if not inLondon
+    londonPV := na
+    londonVol := na
+else if newLondon or na(londonPV)
+    londonPV := hlc3 * volume
+    londonVol := volume
+else
+    londonPV += hlc3 * volume
+    londonVol += volume
+float londonVwap = inLondon and londonVol > 0.0 ? londonPV / londonVol : na
+var float nyPV = na
+var float nyVol = na
+if not inNewYork
+    nyPV := na
+    nyVol := na
+else if newNewYork or na(nyPV)
+    nyPV := hlc3 * volume
+    nyVol := volume
+else
+    nyPV += hlc3 * volume
+    nyVol += volume
+float nyVwap = inNewYork and nyVol > 0.0 ? nyPV / nyVol : na
+float dailyVwap = ta.vwap(hlc3, barstate.isfirst or newDay)
+float weeklyVwap = ta.vwap(hlc3, barstate.isfirst or newWeek)
+float monthlyVwap = ta.vwap(hlc3, barstate.isfirst or newMonth)
+float activeSessionVwap = inNewYork ? nyVwap : inLondon ? londonVwap : inAsia ? asiaVwap : na
+float valueRef = switch valueReference
+    "Active Session" => activeSessionVwap
+    "Weekly" => weeklyVwap
+    "Monthly" => monthlyVwap
+    => dailyVwap
+bool valueReset = switch valueReference
+    "Active Session" => newAsia or newLondon or newNewYork
+    "Weekly" => newWeek
+    "Monthly" => newMonth
+    => newDay
+float p02Signed = not na(valueRef) and not na(atr) and atr > 0.0 ? f_clamp((close - valueRef) / atr / fullVwapDistanceAtr * 100.0, -100.0, 100.0) : na
+
+//------------------------------------------------------------------------------
+// Profile context and corrected histogram backing data
+//------------------------------------------------------------------------------
+var array<float> profilePrices = array.new_float()
+var array<float> profileHighs = array.new_float()
+var array<float> profileLows = array.new_float()
+var array<float> profileVolumes = array.new_float()
+var array<float> bins = array.new_float()
+var array<float> histBins = array.new_float()
+var array<box> histBoxes = array.new_box()
+if barstate.isfirst
+    for i = 0 to binCount - 1
+        array.push(bins, 0.0)
+    for i = 0 to histogramRows - 1
+        array.push(histBins, 0.0)
+        array.push(histBoxes, box.new(bar_index, close, bar_index, close, xloc=xloc.bar_index, border_width=0, bgcolor=color.new(color.gray, 100)))
+
+float profileHigh = na
+float profileLow = na
+float pocPrice = na
+float vahPrice = na
+float valPrice = na
+float binSize = na
+float totalProfileVolume = 0.0
+int pocIndex = na
+int vaLowIndex = na
+int vaHighIndex = na
+var float completedVah = na
+var float completedVal = na
+if profileReset and not barstate.isfirst
+    completedVah := vahPrice[1]
+    completedVal := valPrice[1]
+if profileReset
+    array.clear(profilePrices)
+    array.clear(profileHighs)
+    array.clear(profileLows)
+    array.clear(profileVolumes)
+if profileActive and not na(volume)
+    array.push(profilePrices, allocationSource)
+    array.push(profileHighs, high)
+    array.push(profileLows, low)
+    array.push(profileVolumes, volume)
+    if array.size(profilePrices) > maxProfileBars
+        array.shift(profilePrices)
+        array.shift(profileHighs)
+        array.shift(profileLows)
+        array.shift(profileVolumes)
+int storedProfileBars = array.size(profilePrices)
+if storedProfileBars > 0
+    profileHigh := array.max(profileHighs)
+    profileLow := array.min(profileLows)
+    binSize := math.max((profileHigh - profileLow) / binCount, syminfo.mintick)
+    for i = 0 to binCount - 1
+        array.set(bins, i, 0.0)
+    for i = 0 to storedProfileBars - 1
+        int idx = int(math.floor((array.get(profilePrices, i) - profileLow) / binSize))
+        idx := math.max(0, math.min(binCount - 1, idx))
+        float v = array.get(profileVolumes, i)
+        array.set(bins, idx, array.get(bins, idx) + v)
+        totalProfileVolume += v
+    float maxVol = -1.0
+    pocIndex := 0
+    for i = 0 to binCount - 1
+        if array.get(bins, i) > maxVol
+            maxVol := array.get(bins, i)
+            pocIndex := i
+    pocPrice := profileLow + (pocIndex + 0.5) * binSize
+    float target = totalProfileVolume * valueAreaPct / 100.0
+    vaLowIndex := pocIndex
+    vaHighIndex := pocIndex
+    float vaVol = array.get(bins, pocIndex)
+    int steps = 0
+    while vaVol < target and steps < binCount
+        bool canDown = vaLowIndex > 0
+        bool canUp = vaHighIndex < binCount - 1
+        if not canDown and not canUp
+            break
+        float downVol = canDown ? array.get(bins, vaLowIndex - 1) : -1.0
+        float upVol = canUp ? array.get(bins, vaHighIndex + 1) : -1.0
+        if canUp and (not canDown or upVol >= downVol)
+            vaHighIndex += 1
+            vaVol += upVol
+        else
+            vaLowIndex -= 1
+            vaVol += downVol
+        steps += 1
+    valPrice := profileLow + vaLowIndex * binSize
+    vahPrice := profileLow + (vaHighIndex + 1) * binSize
+bool profileReady = profileActive and not na(pocPrice) and not na(vahPrice) and not na(valPrice)
+float p03Signed = profileReady and not na(atr) and atr > 0.0 ? f_clamp((close - pocPrice) / atr / fullPocDistanceAtr * 100.0, -100.0, 100.0) : na
+float previousMid = not na(completedVah) and not na(completedVal) ? (completedVah + completedVal) * 0.5 : na
+float currentMid = profileReady ? (vahPrice + valPrice) * 0.5 : na
+float previousWidth = not na(completedVah) and not na(completedVal) ? completedVah - completedVal : na
+float valueShift = not na(currentMid) and not na(previousMid) and not na(previousWidth) and previousWidth > 0.0 ? f_clamp((currentMid - previousMid) / previousWidth * 100.0, -100.0, 100.0) : 0.0
+float outsideDirection = profileReady ? (close > vahPrice ? 1.0 : close < valPrice ? -1.0 : 0.0) : 0.0
+float p04Signed = profileReady ? f_clamp(outsideDirection * 60.0 + valueShift * 0.40, -100.0, 100.0) : na
+
+//------------------------------------------------------------------------------
+// Zone registry
+//------------------------------------------------------------------------------
+var array<box> zoneBoxes = array.new_box()
+var array<float> zoneTops = array.new_float()
+var array<float> zoneBottoms = array.new_float()
+var array<float> zoneBirthScores = array.new_float()
+var array<float> zoneScores = array.new_float()
+var array<float> zoneMechanics = array.new_float()
+var array<float> zoneMitigation = array.new_float()
+var array<int> zoneDirections = array.new_int()
+var array<int> zoneBornBars = array.new_int()
+var array<int> zoneStatuses = array.new_int()
+var array<int> zoneRetests = array.new_int()
+var array<int> zoneLastTouchBars = array.new_int()
+var array<string> zoneTypes = array.new_string()
+var array<float> invTops = array.new_float()
+var array<float> invBottoms = array.new_float()
+var array<float> invMechanics = array.new_float()
+var array<int> invDirections = array.new_int()
+var array<int> invArmedBars = array.new_int()
+var array<string> invTypes = array.new_string()
+
+f_isDuplicate(string zType, int zDir, float zTop, float zBottom) =>
+    bool duplicate = false
+    float zWidth = math.max(zTop - zBottom, syminfo.mintick)
+    int n = array.size(zoneTops)
+    if n > 0
+        for k = 0 to n - 1
+            if array.get(zoneStatuses, k) < 2 and array.get(zoneDirections, k) == zDir and array.get(zoneTypes, k) == zType
+                float eTop = array.get(zoneTops, k)
+                float eBottom = array.get(zoneBottoms, k)
+                float overlap = math.max(0.0, math.min(zTop, eTop) - math.max(zBottom, eBottom))
+                float minWidth = math.max(math.min(zWidth, eTop - eBottom), syminfo.mintick)
+                float overlapPct = overlap / minWidth * 100.0
+                float centerDistAtr = not na(atr) and atr > 0.0 ? math.abs((zTop + zBottom - eTop - eBottom) * 0.5) / atr : 999.0
+                if overlapPct >= duplicateOverlapPct or centerDistAtr < minZoneSeparationAtr
+                    duplicate := true
+    duplicate
+
+f_fvgFamilyBlocked(float zTop, float zBottom) =>
+    bool blocked = false
+    float zWidth = math.max(zTop - zBottom, syminfo.mintick)
+    int n = array.size(zoneTops)
+    if suppressNestedFvg and n > 0
+        for k = 0 to n - 1
+            string t = array.get(zoneTypes, k)
+            if array.get(zoneStatuses, k) < 2 and (t == "FVG" or t == "IFVG")
+                float eTop = array.get(zoneTops, k)
+                float eBottom = array.get(zoneBottoms, k)
+                float eWidth = math.max(eTop - eBottom, syminfo.mintick)
+                float overlap = math.max(0.0, math.min(zTop, eTop) - math.max(zBottom, eBottom))
+                bool contained = (zTop <= eTop and zBottom >= eBottom) or (eTop <= zTop and eBottom >= zBottom)
+                if contained or overlap / zWidth * 100.0 >= fvgFamilyOverlapPct or overlap / eWidth * 100.0 >= fvgFamilyOverlapPct
+                    blocked := true
+    blocked
+
+f_addZone(string zType, int zDir, float zTop, float zBottom, float mechanic, float score, int leftBar) =>
+    bool familyBlocked = (zType == "FVG" or zType == "IFVG") and f_fvgFamilyBlocked(zTop, zBottom)
+    if zTop > zBottom and not familyBlocked and not f_isDuplicate(zType, zDir, zTop, zBottom)
+        bool qualified = score >= minQualificationScore
+        box b = na
+        if showZones and (not showOnlyQualified or qualified)
+            color base = zType == "FVG" ? (zDir == 1 ? color.teal : color.red) : zType == "OB" ? (zDir == 1 ? color.green : color.red) : zType == "IFVG" ? (zDir == 1 ? color.aqua : color.fuchsia) : (zDir == 1 ? color.lime : color.maroon)
+            b := box.new(leftBar, zTop, bar_index, zBottom, xloc=xloc.bar_index, extend=extend.right, border_color=color.new(base, 25), bgcolor=color.new(base, 86))
+            if showZoneText
+                box.set_text(b, zType + (zDir == 1 ? " B " : " S ") + str.tostring(score, "#.0") + " F")
+                box.set_text_color(b, color.white)
+        array.push(zoneBoxes, b)
+        array.push(zoneTops, zTop)
+        array.push(zoneBottoms, zBottom)
+        array.push(zoneBirthScores, score)
+        array.push(zoneScores, score)
+        array.push(zoneMechanics, mechanic)
+        array.push(zoneMitigation, 0.0)
+        array.push(zoneDirections, zDir)
+        array.push(zoneBornBars, bar_index)
+        array.push(zoneStatuses, 0)
+        array.push(zoneRetests, 0)
+        array.push(zoneLastTouchBars, -1)
+        array.push(zoneTypes, zType)
+
+//------------------------------------------------------------------------------
+// Validated FVG / OB detection
+//------------------------------------------------------------------------------
+float middleBody = bar_index >= 2 ? math.abs(close[1] - open[1]) : na
+float middleRange = bar_index >= 2 ? math.max(high[1] - low[1], syminfo.mintick) : na
+float middleBodyAtr = bar_index >= 2 and not na(atr[1]) and atr[1] > 0.0 ? middleBody / atr[1] : na
+float middleEfficiency = bar_index >= 2 ? middleBody / middleRange : na
+bool middleBullDisp = bar_index >= 2 and close[1] > open[1] and not na(middleBodyAtr) and middleBodyAtr >= minDisplacementAtr and middleEfficiency >= minDisplacementEfficiency
+bool middleBearDisp = bar_index >= 2 and close[1] < open[1] and not na(middleBodyAtr) and middleBodyAtr >= minDisplacementAtr and middleEfficiency >= minDisplacementEfficiency
+bool rawBullGap = detectFvg and bar_index >= 2 and low > high[2]
+bool rawBearGap = detectFvg and bar_index >= 2 and high < low[2]
+float bullGap = rawBullGap ? low - high[2] : na
+float bearGap = rawBearGap ? low[2] - high : na
+float bullFvgWidthAtr = rawBullGap and not na(atr) and atr > 0.0 ? bullGap / atr : na
+float bearFvgWidthAtr = rawBearGap and not na(atr) and atr > 0.0 ? bearGap / atr : na
+float minGapPrice = syminfo.mintick * minFvgTicks
+bool bullContinuity = not requireDisplacementFvg or (low[1] <= high[2] and open <= high[1])
+bool bearContinuity = not requireDisplacementFvg or (high[1] >= low[2] and open >= low[1])
+bool bullFvg = rawBullGap and middleBullDisp and close[1] > high[2] and close > high[2] and bullContinuity and bullGap >= minGapPrice and bullFvgWidthAtr >= minFvgAtr and bullFvgWidthAtr <= maxZoneWidthAtr
+bool bearFvg = rawBearGap and middleBearDisp and close[1] < low[2] and close < low[2] and bearContinuity and bearGap >= minGapPrice and bearFvgWidthAtr >= minFvgAtr and bearFvgWidthAtr <= maxZoneWidthAtr
+bool bullishDispNow = close > open and not na(bodyAtr) and bodyAtr >= minDisplacementAtr and bodyEfficiency >= minDisplacementEfficiency
+bool bearishDispNow = close < open and not na(bodyAtr) and bodyAtr >= minDisplacementAtr and bodyEfficiency >= minDisplacementEfficiency
+float recentHighBefore = ta.highest(high[1], structureLookback)
+float recentLowBefore = ta.lowest(low[1], structureLookback)
+bool bullObRaw = detectOb and bar_index >= structureLookback + 1 and close[1] < open[1] and bullishDispNow and close > recentHighBefore
+bool bearObRaw = detectOb and bar_index >= structureLookback + 1 and close[1] > open[1] and bearishDispNow and close < recentLowBefore
+float bullObTop = bullObRaw ? (obRangeMode == "Body" ? math.max(open[1], close[1]) : high[1]) : na
+float bullObBottom = bullObRaw ? (obRangeMode == "Body" ? math.min(open[1], close[1]) : low[1]) : na
+float bearObTop = bearObRaw ? (obRangeMode == "Body" ? math.max(open[1], close[1]) : high[1]) : na
+float bearObBottom = bearObRaw ? (obRangeMode == "Body" ? math.min(open[1], close[1]) : low[1]) : na
+float bullObWidthAtr = bullObRaw and not na(atr) and atr > 0.0 ? (bullObTop - bullObBottom) / atr : na
+float bearObWidthAtr = bearObRaw and not na(atr) and atr > 0.0 ? (bearObTop - bearObBottom) / atr : na
+bool bullOb = bullObRaw and bullObWidthAtr > 0.0 and bullObWidthAtr <= maxZoneWidthAtr
+bool bearOb = bearObRaw and bearObWidthAtr > 0.0 and bearObWidthAtr <= maxZoneWidthAtr
+
+if bullFvg
+    float mech = f_mechanicQuality(middleBodyAtr, middleEfficiency, bullFvgWidthAtr)
+    f_addZone("FVG", 1, low, high[2], mech, f_zoneScore(mech, f_support(1,p01Signed), f_support(1,p02Signed), f_support(1,p03Signed), f_support(1,p04Signed)), bar_index - 2)
+if bearFvg
+    float mech = f_mechanicQuality(middleBodyAtr, middleEfficiency, bearFvgWidthAtr)
+    f_addZone("FVG", -1, low[2], high, mech, f_zoneScore(mech, f_support(-1,p01Signed), f_support(-1,p02Signed), f_support(-1,p03Signed), f_support(-1,p04Signed)), bar_index - 2)
+if bullOb
+    float mech = f_mechanicQuality(bodyAtr, bodyEfficiency, bullObWidthAtr)
+    f_addZone("OB", 1, bullObTop, bullObBottom, mech, f_zoneScore(mech, f_support(1,p01Signed), f_support(1,p02Signed), f_support(1,p03Signed), f_support(1,p04Signed)), bar_index - 1)
+if bearOb
+    float mech = f_mechanicQuality(bodyAtr, bodyEfficiency, bearObWidthAtr)
+    f_addZone("OB", -1, bearObTop, bearObBottom, mech, f_zoneScore(mech, f_support(-1,p01Signed), f_support(-1,p02Signed), f_support(-1,p03Signed), f_support(-1,p04Signed)), bar_index - 1)
+
+//------------------------------------------------------------------------------
+// Lifecycle + inversion
+//------------------------------------------------------------------------------
+int trackedNow = array.size(zoneScores)
+if trackedNow > 0
+    for i = 0 to trackedNow - 1
+        int status = array.get(zoneStatuses, i)
+        if status < 2
+            float zTop = array.get(zoneTops, i)
+            float zBottom = array.get(zoneBottoms, i)
+            float zWidth = math.max(zTop - zBottom, syminfo.mintick)
+            float birthScore = array.get(zoneBirthScores, i)
+            float mechanic = array.get(zoneMechanics, i)
+            float priorMitigation = array.get(zoneMitigation, i)
+            int zDir = array.get(zoneDirections, i)
+            int born = array.get(zoneBornBars, i)
+            int retests = array.get(zoneRetests, i)
+            int lastTouch = array.get(zoneLastTouchBars, i)
+            string zType = array.get(zoneTypes, i)
+            box b = array.get(zoneBoxes, i)
+            bool invalid = (zDir == 1 and close < zBottom) or (zDir == -1 and close > zTop)
+            bool expired = bar_index - born > maxZoneAgeBars
+            float probe = mitigationBasis == "Close" ? close : zDir == 1 ? low : high
+            bool touched = probe >= zBottom and probe <= zTop
+            float penetration = priorMitigation
+            if touched
+                float currentPen = zDir == 1 ? (zTop - probe) / zWidth : (probe - zBottom) / zWidth
+                penetration := math.max(priorMitigation, f_clamp(currentPen, 0.0, 1.0))
+            bool newRetest = touched and bar_index > born and lastTouch != bar_index - 1
+            if newRetest
+                retests += 1
+                array.set(zoneRetests, i, retests)
+            if touched
+                array.set(zoneLastTouchBars, i, bar_index)
+            array.set(zoneMitigation, i, penetration)
+            float currentScore = f_clamp(birthScore - freshnessDecayPer100Bars * (bar_index - born) / 100.0 - mitigationPenaltyMax * penetration - retestPenalty * retests, 0.0, 100.0)
+            array.set(zoneScores, i, currentScore)
+            bool fullMit = penetration * 100.0 >= fullMitigationPct
+            bool partialMit = penetration * 100.0 >= partialMitigationPct and not fullMit
+            if invalid
+                array.set(zoneStatuses, i, 3)
+                if not na(b)
+                    box.set_extend(b, extend.none)
+                    box.set_right(b, bar_index)
+                    if removeInvalidated
+                        box.delete(b)
+                        array.set(zoneBoxes, i, na)
+                bool sourceCanInvert = (createIfvg and zType == "FVG") or (createBreaker and zType == "OB")
+                float breakAtr = not na(atr) and atr > 0.0 ? (zDir == 1 ? (zBottom - close) / atr : (close - zTop) / atr) : 0.0
+                bool decisiveBreak = breakAtr >= minInversionBreakAtr and (zDir == 1 ? close < open : close > open)
+                if sourceCanInvert and decisiveBreak
+                    array.push(invTops, zTop)
+                    array.push(invBottoms, zBottom)
+                    array.push(invMechanics, f_clamp(mechanic * inversionMechanicFactor, 0.0, 100.0))
+                    array.push(invDirections, -zDir)
+                    array.push(invArmedBars, bar_index)
+                    array.push(invTypes, zType == "FVG" ? "IFVG" : "BRK")
+            else if expired
+                array.set(zoneStatuses, i, 4)
+                if not na(b)
+                    box.set_extend(b, extend.none)
+                    box.set_right(b, bar_index)
+                    if removeExpired
+                        box.delete(b)
+                        array.set(zoneBoxes, i, na)
+            else if fullMit
+                array.set(zoneStatuses, i, 2)
+                if not na(b)
+                    box.set_extend(b, extend.none)
+                    box.set_right(b, bar_index)
+                    if removeFullyMitigated
+                        box.delete(b)
+                        array.set(zoneBoxes, i, na)
+            else if partialMit
+                array.set(zoneStatuses, i, 1)
+                if not na(b) and showZoneText
+                    box.set_text(b, zType + (zDir == 1 ? " B " : " S ") + str.tostring(currentScore, "#.0") + " P" + str.tostring(penetration*100.0, "#.0") + "%")
+            else
+                array.set(zoneStatuses, i, 0)
+                if not na(b) and showZoneText
+                    box.set_text(b, zType + (zDir == 1 ? " B " : " S ") + str.tostring(currentScore, "#.0") + " F")
+
+int invCount = array.size(invTops)
+if invCount > 0
+    for j = invCount - 1 to 0
+        float zTop = array.get(invTops, j)
+        float zBottom = array.get(invBottoms, j)
+        float mechanic = array.get(invMechanics, j)
+        int zDir = array.get(invDirections, j)
+        int armedBar = array.get(invArmedBars, j)
+        string zType = array.get(invTypes, j)
+        int age = bar_index - armedBar
+        bool confirmed = age >= 1 and age <= inversionConfirmBars and (zDir == 1 ? close > zTop and close > open : close < zBottom and close < open)
+        bool failed = age > inversionConfirmBars or (age >= 1 and (zDir == 1 ? close < zBottom : close > zTop))
+        if confirmed
+            float score = f_zoneScore(mechanic, f_support(zDir,p01Signed), f_support(zDir,p02Signed), f_support(zDir,p03Signed), f_support(zDir,p04Signed))
+            if score >= minInversionScore
+                f_addZone(zType, zDir, zTop, zBottom, mechanic, score, armedBar)
+            array.remove(invTops,j), array.remove(invBottoms,j), array.remove(invMechanics,j), array.remove(invDirections,j), array.remove(invArmedBars,j), array.remove(invTypes,j)
+        else if failed
+            array.remove(invTops,j), array.remove(invBottoms,j), array.remove(invMechanics,j), array.remove(invDirections,j), array.remove(invArmedBars,j), array.remove(invTypes,j)
+
+while array.size(zoneScores) > maxTrackedZones
+    box old = array.shift(zoneBoxes)
+    if not na(old)
+        box.delete(old)
+    array.shift(zoneTops), array.shift(zoneBottoms), array.shift(zoneBirthScores), array.shift(zoneScores), array.shift(zoneMechanics), array.shift(zoneMitigation), array.shift(zoneDirections), array.shift(zoneBornBars), array.shift(zoneStatuses), array.shift(zoneRetests), array.shift(zoneLastTouchBars), array.shift(zoneTypes)
+
+//------------------------------------------------------------------------------
+// Unified active-zone outputs
+//------------------------------------------------------------------------------
+float bestBullScore = na
+float bestBearScore = na
+float bestBullTop = na
+float bestBullBottom = na
+float bestBearTop = na
+float bestBearBottom = na
+string bestBullType = "NONE"
+string bestBearType = "NONE"
+int activeBullCount = 0
+int activeBearCount = 0
+int zoneCount = array.size(zoneScores)
+if zoneCount > 0
+    for i = 0 to zoneCount - 1
+        int s = array.get(zoneStatuses, i)
+        if s < 2
+            float zs = array.get(zoneScores, i)
+            int zd = array.get(zoneDirections, i)
+            if zd == 1
+                activeBullCount += 1
+                if na(bestBullScore) or zs > bestBullScore
+                    bestBullScore := zs
+                    bestBullTop := array.get(zoneTops, i)
+                    bestBullBottom := array.get(zoneBottoms, i)
+                    bestBullType := array.get(zoneTypes, i)
+            else
+                activeBearCount += 1
+                if na(bestBearScore) or zs > bestBearScore
+                    bestBearScore := zs
+                    bestBearTop := array.get(zoneTops, i)
+                    bestBearBottom := array.get(zoneBottoms, i)
+                    bestBearType := array.get(zoneTypes, i)
+
+float bullStrength = nz(bestBullScore)
+float bearStrength = nz(bestBearScore)
+float institutionalZoneScore = f_clamp(bullStrength - bearStrength, -100.0, 100.0)
+bool opposingStrong = bullStrength >= strongZoneScore and bearStrength >= strongZoneScore
+bool nearEqualConflict = opposingStrong and math.abs(bullStrength - bearStrength) <= conflictScoreTolerance
+string candidateState = "ZONE_NEUTRAL"
+if activeBullCount == 0 and activeBearCount == 0
+    candidateState := "ZONE_UNAVAILABLE"
+else if nearEqualConflict
+    candidateState := "ZONE_CONFLICT"
+else if institutionalZoneScore >= 40.0
+    candidateState := bullStrength >= strongZoneScore ? "ZONE_STRONGLY_BULLISH" : "ZONE_BULLISH"
+else if institutionalZoneScore <= -40.0
+    candidateState := bearStrength >= strongZoneScore ? "ZONE_STRONGLY_BEARISH" : "ZONE_BEARISH"
+else if bullStrength > bearStrength
+    candidateState := "ZONE_LEANING_BULLISH"
+else if bearStrength > bullStrength
+    candidateState := "ZONE_LEANING_BEARISH"
+else
+    candidateState := "ZONE_BALANCED"
+string zoneState = barstate.isconfirmed ? candidateState : "FORMING"
+
+//------------------------------------------------------------------------------
+// Corrected visual histogram
+//------------------------------------------------------------------------------
+if barstate.islast
+    float histRowHeight = storedProfileBars > 0 and not na(profileHigh) and not na(profileLow) ? math.max((profileHigh-profileLow)/histogramRows, syminfo.mintick) : na
+    float histMaxVolume = 0.0
+    if showHistogram and profileActive and storedProfileBars > 0 and not na(histRowHeight)
+        for h = 0 to histogramRows - 1
+            array.set(histBins,h,0.0)
+        for pIdx = 0 to storedProfileBars - 1
+            float hp = array.get(profilePrices,pIdx)
+            float hh = array.get(profileHighs,pIdx)
+            float hl = array.get(profileLows,pIdx)
+            float hv = array.get(profileVolumes,pIdx)
+            if histogramAllocation == "Range Overlap" and hh > hl
+                float barRange = math.max(hh-hl, syminfo.mintick)
+                int firstRow = math.max(0, math.min(histogramRows-1, int(math.floor((hl-profileLow)/histRowHeight))))
+                int lastRow = math.max(0, math.min(histogramRows-1, int(math.floor((hh-profileLow)/histRowHeight))))
+                if lastRow >= firstRow
+                    for r = firstRow to lastRow
+                        float rowLow = profileLow + r*histRowHeight
+                        float rowHigh = r == histogramRows-1 ? profileHigh : rowLow + histRowHeight
+                        float overlap = math.max(0.0, math.min(hh,rowHigh)-math.max(hl,rowLow))
+                        if overlap > 0.0
+                            array.set(histBins,r,array.get(histBins,r)+hv*overlap/barRange)
+            else
+                int hIdx = math.max(0, math.min(histogramRows-1, int(math.floor((hp-profileLow)/histRowHeight))))
+                array.set(histBins,hIdx,array.get(histBins,hIdx)+hv)
+        for h = 0 to histogramRows - 1
+            histMaxVolume := math.max(histMaxVolume,array.get(histBins,h))
+    for h = 0 to histogramRows - 1
+        box hb = array.get(histBoxes,h)
+        if showHistogram and profileActive and storedProfileBars > 0 and not na(histRowHeight) and histMaxVolume > 0.0
+            float rowVol = array.get(histBins,h)
+            if rowVol > 0.0
+                int widthBars = math.max(1,int(math.round(f_clamp(rowVol/histMaxVolume,0.0,1.0)*histogramMaxWidth)))
+                int rightX = bar_index + histogramOffset + histogramMaxWidth
+                float bottomY = profileLow + h*histRowHeight
+                float topY = h == histogramRows-1 ? profileHigh : bottomY+histRowHeight
+                bool rowHasPoc = not na(pocPrice) and pocPrice >= bottomY and pocPrice <= topY
+                bool rowInValue = not na(vahPrice) and not na(valPrice) and topY >= valPrice and bottomY <= vahPrice
+                color fc = rowHasPoc ? color.new(color.orange,15) : rowInValue ? color.new(color.blue,55) : color.new(color.gray,78)
+                box.set_left(hb,rightX-widthBars), box.set_right(hb,rightX), box.set_bottom(hb,bottomY), box.set_top(hb,topY), box.set_bgcolor(hb,fc), box.set_border_color(hb,color.new(fc,100))
+            else
+                box.set_left(hb,bar_index), box.set_right(hb,bar_index), box.set_bottom(hb,close), box.set_top(hb,close), box.set_bgcolor(hb,color.new(color.gray,100)), box.set_border_color(hb,color.new(color.gray,100))
+        else
+            box.set_left(hb,bar_index), box.set_right(hb,bar_index), box.set_bottom(hb,close), box.set_top(hb,close), box.set_bgcolor(hb,color.new(color.gray,100)), box.set_border_color(hb,color.new(color.gray,100))
+
+float vwapPlot = showVwap and not valueReset ? valueRef : na
+float pocPlot = showValueLevels and profileActive and not profileReset ? pocPrice : na
+float vahPlot = showValueLevels and profileActive and not profileReset ? vahPrice : na
+float valPlot = showValueLevels and profileActive and not profileReset ? valPrice : na
+plot(vwapPlot,"Primary VWAP",color=color.new(color.blue,20),linewidth=2,style=plot.style_linebr)
+plot(pocPlot,"Profile POC",color=color.orange,linewidth=2,style=plot.style_linebr)
+plot(vahPlot,"Profile VAH",color=color.new(color.green,20),linewidth=1,style=plot.style_linebr)
+plot(valPlot,"Profile VAL",color=color.new(color.red,20),linewidth=1,style=plot.style_linebr)
+
+//------------------------------------------------------------------------------
+// Diagnostics
+//------------------------------------------------------------------------------
+var table diag = table.new(position.top_right,2,18,border_width=1,frame_width=1,bgcolor=color.new(color.black,15))
+f_setRow(int row,string l,string v) =>
+    table.cell(diag,0,row,l,text_color=color.silver,bgcolor=color.new(color.black,15),text_halign=text.align_left)
+    table.cell(diag,1,row,v,text_color=color.white,bgcolor=color.new(color.black,15),text_halign=text.align_right)
+if barstate.islast
+    if showTable
+        table.clear(diag,0,0,1,17)
+        f_setRow(0,"PLUTUS","P05.3 Unified Zones")
+        f_setRow(1,"State",zoneState)
+        f_setRow(2,"Zone Score",str.tostring(institutionalZoneScore,"#.1"))
+        f_setRow(3,"Bull / Bear Count",str.tostring(activeBullCount)+" / "+str.tostring(activeBearCount))
+        f_setRow(4,"Best Bull",bestBullType+" "+(not na(bestBullScore)?str.tostring(bestBullScore,"#.1"):"N/A"))
+        f_setRow(5,"Best Bear",bestBearType+" "+(not na(bestBearScore)?str.tostring(bestBearScore,"#.1"):"N/A"))
+        f_setRow(6,"Bull Zone",not na(bestBullTop)?str.tostring(bestBullBottom,"#.##")+"–"+str.tostring(bestBullTop,"#.##"):"N/A")
+        f_setRow(7,"Bear Zone",not na(bestBearTop)?str.tostring(bestBearBottom,"#.##")+"–"+str.tostring(bestBearTop,"#.##"):"N/A")
+        f_setRow(8,"Conflict",nearEqualConflict?"YES":"NO")
+        f_setRow(9,"P01",not na(p01Signed)?str.tostring(p01Signed,"#.0"):"N/A")
+        f_setRow(10,"P02",not na(p02Signed)?str.tostring(p02Signed,"#.0"):"N/A")
+        f_setRow(11,"P03",not na(p03Signed)?str.tostring(p03Signed,"#.0"):"N/A")
+        f_setRow(12,"P04",not na(p04Signed)?str.tostring(p04Signed,"#.0"):"N/A")
+        f_setRow(13,"Armed Inversions",str.tostring(array.size(invTops)))
+        f_setRow(14,"Histogram",showHistogram?"ON "+str.tostring(histogramRows):"OFF")
+        f_setRow(15,"Hist Allocation",histogramAllocation)
+        f_setRow(16,"Profile Scope",profileScope)
+        f_setRow(17,"Tracked Zones",str.tostring(zoneCount))
+    else
+        table.clear(diag,0,0,1,17)
