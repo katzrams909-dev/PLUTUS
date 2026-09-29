@@ -77,6 +77,7 @@ showVwap = input.bool(false, "Show Primary VWAP", group=groupDisplay)
 showValueLevels = input.bool(false, "Show Profile POC / VAH / VAL", group=groupDisplay)
 showHistogram = input.bool(false, "Show Volume Profile Histogram", group=groupDisplay)
 histogramRows = input.int(80, "Histogram Rows", minval=16, maxval=160, step=8, group=groupDisplay)
+histogramAllocation = input.string("Range Overlap", "Histogram Volume Allocation", options=["Range Overlap", "HLC3 Point"], group=groupDisplay)
 histogramOffset = input.int(4, "Histogram Right Offset", minval=1, maxval=50, group=groupDisplay)
 histogramMaxWidth = input.int(24, "Histogram Maximum Width", minval=5, maxval=100, group=groupDisplay)
 showTable = input.bool(true, "Show Diagnostic Table", group=groupDisplay)
@@ -412,9 +413,6 @@ f_addZone(string zType, int zDir, float zTop, float zBottom, float mechanic, flo
 
 //------------------------------------------------------------------------------
 // Refined FVG mechanics
-// True FVG: candle 3 wick does not overlap candle 1 wick, and candle 2 is a
-// genuine displacement candle. Optional anti-gap filters reject bar-to-bar
-// opening gaps that create tiny visual dashes but are not imbalance delivery.
 //------------------------------------------------------------------------------
 float middleBody = bar_index >= 2 ? math.abs(close[1] - open[1]) : na
 float middleRange = bar_index >= 2 ? math.max(high[1] - low[1], syminfo.mintick) : na
@@ -430,18 +428,10 @@ float bearGap = rawBearGap ? low[2] - high : na
 float bullFvgWidthAtr = rawBullGap and not na(atr) and atr > 0.0 ? bullGap / atr : na
 float bearFvgWidthAtr = rawBearGap and not na(atr) and atr > 0.0 ? bearGap / atr : na
 float minGapPrice = syminfo.mintick * minFvgTicks
-
-// Reject gaps primarily caused by discontinuous opens. A displacement FVG should
-// be delivered through traded price, not produced by candle 2 or candle 3 simply
-// opening beyond the prior candle's range.
 bool bullContinuity = not requireDisplacementFvg or (low[1] <= high[2] and open <= high[1])
 bool bearContinuity = not requireDisplacementFvg or (high[1] >= low[2] and open >= low[1])
-
-// Candle 2 must close through candle 1's extreme; candle 3 must preserve the gap
-// without itself being the entire source of the discontinuity.
 bool bullDelivery = middleBullDisp and close[1] > high[2] and close > high[2] and bullContinuity
 bool bearDelivery = middleBearDisp and close[1] < low[2] and close < low[2] and bearContinuity
-
 bool bullFvg = rawBullGap and bullDelivery and bullGap >= minGapPrice and not na(bullFvgWidthAtr) and bullFvgWidthAtr >= minFvgAtr and bullFvgWidthAtr <= maxZoneWidthAtr
 bool bearFvg = rawBearGap and bearDelivery and bearGap >= minGapPrice and not na(bearFvgWidthAtr) and bearFvgWidthAtr >= minFvgAtr and bearFvgWidthAtr <= maxZoneWidthAtr
 
@@ -638,7 +628,10 @@ while array.size(zoneScores) > maxTrackedZones
     array.shift(zoneTypes)
 
 //------------------------------------------------------------------------------
-// Histogram — independent visual resolution
+// Histogram — independent visual resolution with range-overlap allocation.
+// Range Overlap spreads each candle's volume across every price row traversed by
+// its high-low range, proportional to overlap. HLC3 Point preserves the earlier
+// sparse point-allocation model for comparison/debugging.
 //------------------------------------------------------------------------------
 if barstate.islast
     float histRowHeight = storedProfileBars > 0 and not na(profileHigh) and not na(profileLow) ? math.max((profileHigh - profileLow) / histogramRows, syminfo.mintick) : na
@@ -646,14 +639,34 @@ if barstate.islast
     if showHistogram and profileActive and storedProfileBars > 0 and not na(histRowHeight)
         for h = 0 to histogramRows - 1
             array.set(histBins, h, 0.0)
+
         for pIdx = 0 to storedProfileBars - 1
             float hp = array.get(profilePrices, pIdx)
+            float hh = array.get(profileHighs, pIdx)
+            float hl = array.get(profileLows, pIdx)
             float hv = array.get(profileVolumes, pIdx)
-            int hIdx = int(math.floor((hp - profileLow) / histRowHeight))
-            hIdx := math.max(0, math.min(histogramRows - 1, hIdx))
-            float newVol = array.get(histBins, hIdx) + hv
-            array.set(histBins, hIdx, newVol)
-            histMaxVolume := math.max(histMaxVolume, newVol)
+
+            if histogramAllocation == "Range Overlap" and not na(hh) and not na(hl) and hh > hl
+                float barRange = math.max(hh - hl, syminfo.mintick)
+                int firstRow = int(math.floor((hl - profileLow) / histRowHeight))
+                int lastRow = int(math.floor((hh - profileLow) / histRowHeight))
+                firstRow := math.max(0, math.min(histogramRows - 1, firstRow))
+                lastRow := math.max(0, math.min(histogramRows - 1, lastRow))
+                if lastRow >= firstRow
+                    for r = firstRow to lastRow
+                        float rowLow = profileLow + r * histRowHeight
+                        float rowHigh = r == histogramRows - 1 ? profileHigh : rowLow + histRowHeight
+                        float overlap = math.max(0.0, math.min(hh, rowHigh) - math.max(hl, rowLow))
+                        if overlap > 0.0
+                            float allocated = hv * overlap / barRange
+                            array.set(histBins, r, array.get(histBins, r) + allocated)
+            else
+                int hIdx = int(math.floor((hp - profileLow) / histRowHeight))
+                hIdx := math.max(0, math.min(histogramRows - 1, hIdx))
+                array.set(histBins, hIdx, array.get(histBins, hIdx) + hv)
+
+        for h = 0 to histogramRows - 1
+            histMaxVolume := math.max(histMaxVolume, array.get(histBins, h))
 
     for h = 0 to histogramRows - 1
         box hb = array.get(histBoxes, h)
@@ -739,14 +752,14 @@ if zoneCount > 0
             else if t == "BRK"
                 breakerZones += 1
 
-var table diag = table.new(position.top_right, 2, 22, border_width=1, frame_width=1, bgcolor=color.new(color.black, 15))
+var table diag = table.new(position.top_right, 2, 23, border_width=1, frame_width=1, bgcolor=color.new(color.black, 15))
 f_setRow(int row, string labelText, string valueText) =>
     table.cell(diag, 0, row, labelText, text_color=color.silver, bgcolor=color.new(color.black, 15), text_halign=text.align_left)
     table.cell(diag, 1, row, valueText, text_color=color.white, bgcolor=color.new(color.black, 15), text_halign=text.align_right)
 
 if barstate.islast
     if showTable
-        table.clear(diag, 0, 0, 1, 21)
+        table.clear(diag, 0, 0, 1, 22)
         f_setRow(0, "PLUTUS", "P05.2 Refined Lifecycle")
         f_setRow(1, "Fresh / Partial", str.tostring(freshZones) + " / " + str.tostring(partialZones))
         f_setRow(2, "Mitigated", str.tostring(mitigatedZones))
@@ -767,7 +780,8 @@ if barstate.islast
         f_setRow(17, "P03", not na(p03Signed) ? str.tostring(p03Signed, "#.0") : "N/A")
         f_setRow(18, "P04", not na(p04Signed) ? str.tostring(p04Signed, "#.0") : "N/A")
         f_setRow(19, "Histogram", showHistogram ? "ON " + str.tostring(histogramRows) + " rows" : "OFF")
-        f_setRow(20, "Profile Scope", profileScope)
-        f_setRow(21, "Tracked Zones", str.tostring(zoneCount))
+        f_setRow(20, "Hist Allocation", histogramAllocation)
+        f_setRow(21, "Profile Scope", profileScope)
+        f_setRow(22, "Tracked Zones", str.tostring(zoneCount))
     else
-        table.clear(diag, 0, 0, 1, 21)
+        table.clear(diag, 0, 0, 1, 22)
