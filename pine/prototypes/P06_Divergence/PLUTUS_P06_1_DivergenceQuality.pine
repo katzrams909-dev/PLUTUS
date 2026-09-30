@@ -1,0 +1,311 @@
+//@version=6
+indicator("PLUTUS P06.1 — Divergence Quality", shorttitle="PLUTUS P06.1", overlay=true, max_lines_count=120, max_labels_count=120)
+
+//==============================================================================
+// PLUTUS P06.1 — Divergence Quality / Confirmation
+// Confirmed price-pivot divergences with prominence, extremity, participation,
+// fair-value context, duplicate suppression and event expiry.
+// Context engine only. No trade signals.
+//==============================================================================
+
+//------------------------------------------------------------------------------
+// Inputs
+//------------------------------------------------------------------------------
+groupPivot = "Pivot Model"
+leftBars = input.int(3, "Pivot Left Bars", minval=1, maxval=20, group=groupPivot)
+rightBars = input.int(3, "Pivot Right Bars", minval=1, maxval=20, group=groupPivot)
+pairTolerance = input.int(1, "Oscillator Pairing Tolerance", minval=0, maxval=5, group=groupPivot)
+minPivotGapBars = input.int(5, "Minimum Pivot Separation (Bars)", minval=1, maxval=100, group=groupPivot)
+maxPivotGapBars = input.int(120, "Maximum Pivot Separation (Bars)", minval=5, maxval=1000, group=groupPivot)
+atrLen = input.int(14, "ATR Length", minval=1, group=groupPivot)
+minPriceSepAtr = input.float(0.10, "Minimum Price Separation / ATR", minval=0.0, step=0.05, group=groupPivot)
+minProminenceAtr = input.float(0.50, "Minimum Pivot Prominence / ATR", minval=0.0, step=0.10, group=groupPivot)
+fullProminenceAtr = input.float(2.0, "Full Pivot Prominence / ATR", minval=0.25, step=0.25, group=groupPivot)
+
+groupOsc = "Oscillator"
+oscillator = input.string("RSI", "Oscillator", options=["RSI", "MACD Histogram"], group=groupOsc)
+rsiLen = input.int(14, "RSI Length", minval=2, group=groupOsc)
+rsiLowExtreme = input.float(35.0, "RSI Low Extremity", minval=1.0, maxval=50.0, step=1.0, group=groupOsc)
+rsiHighExtreme = input.float(65.0, "RSI High Extremity", minval=50.0, maxval=99.0, step=1.0, group=groupOsc)
+macdFast = input.int(12, "MACD Fast", minval=1, group=groupOsc)
+macdSlow = input.int(26, "MACD Slow", minval=2, group=groupOsc)
+macdSignal = input.int(9, "MACD Signal", minval=1, group=groupOsc)
+macdNormLen = input.int(50, "MACD Extremity Normalization", minval=10, maxval=300, group=groupOsc)
+minOscSep = input.float(2.0, "Minimum Oscillator Separation", minval=0.0, step=0.1, group=groupOsc)
+fullOscSep = input.float(10.0, "Full Oscillator Separation", minval=0.1, step=0.5, group=groupOsc)
+
+groupContext = "Context Confirmation"
+useParticipation = input.bool(true, "Use Participation Confirmation", group=groupContext)
+volumeLen = input.int(20, "Volume Baseline Length", minval=2, group=groupContext)
+fullRvol = input.float(2.0, "Full Participation RVOL", minval=1.0, step=0.1, group=groupContext)
+useValueContext = input.bool(true, "Use Daily VWAP Context", group=groupContext)
+fullVwapDistanceAtr = input.float(1.5, "Full VWAP Context Distance / ATR", minval=0.1, step=0.1, group=groupContext)
+
+groupQuality = "Quality / Lifecycle"
+minQualityScore = input.float(55.0, "Minimum Divergence Quality", minval=0.0, maxval=100.0, step=5.0, group=groupQuality)
+eventExpiryBars = input.int(30, "Divergence Event Expiry (Bars)", minval=1, maxval=500, group=groupQuality)
+duplicateCooldownBars = input.int(8, "Duplicate Cooldown (Bars)", minval=0, maxval=100, group=groupQuality)
+regularWeight = input.float(1.0, "Regular Divergence Weight", minval=0.1, maxval=2.0, step=0.1, group=groupQuality)
+hiddenWeight = input.float(0.85, "Hidden Divergence Weight", minval=0.1, maxval=2.0, step=0.05, group=groupQuality)
+
+groupTypes = "Divergence Types"
+showRegular = input.bool(true, "Regular Divergence", group=groupTypes)
+showHidden = input.bool(true, "Hidden Divergence", group=groupTypes)
+
+groupDisplay = "Display"
+showLines = input.bool(true, "Show Divergence Lines", group=groupDisplay)
+showLabels = input.bool(true, "Show Divergence Labels", group=groupDisplay)
+showDiagnostics = input.bool(true, "Show Diagnostic Table", group=groupDisplay)
+maxEvents = input.int(40, "Maximum Drawn Events", minval=5, maxval=100, group=groupDisplay)
+
+//------------------------------------------------------------------------------
+// Helpers
+//------------------------------------------------------------------------------
+f_clamp(float x, float lo, float hi) =>
+    math.max(lo, math.min(hi, x))
+
+f_score(float x, float full) =>
+    full > 0.0 ? f_clamp(x / full * 100.0, 0.0, 100.0) : 0.0
+
+//------------------------------------------------------------------------------
+// Core series
+//------------------------------------------------------------------------------
+float atr = ta.atr(atrLen)
+float rsi = ta.rsi(close, rsiLen)
+[macdLine, macdSignalLine, macdHist] = ta.macd(close, macdFast, macdSlow, macdSignal)
+float osc = oscillator == "RSI" ? rsi : macdHist
+float macdDev = ta.stdev(macdHist, macdNormLen)
+float volumeBase = ta.sma(volume, volumeLen)
+float rvol = not na(volume) and not na(volumeBase) and volumeBase > 0.0 ? volume / volumeBase : na
+float bodyEfficiency = math.abs(close - open) / math.max(high - low, syminfo.mintick)
+bool newDay = ta.change(dayofmonth(time, syminfo.timezone)) != 0
+float dailyVwap = ta.vwap(hlc3, barstate.isfirst or newDay)
+
+//------------------------------------------------------------------------------
+// Confirmed price pivots
+//------------------------------------------------------------------------------
+float pivotLowPrice = ta.pivotlow(low, leftBars, rightBars)
+float pivotHighPrice = ta.pivothigh(high, leftBars, rightBars)
+bool newLowPivot = not na(pivotLowPrice)
+bool newHighPivot = not na(pivotHighPrice)
+
+f_oscNearPivot(bool wantLow) =>
+    int tol = math.min(pairTolerance, rightBars)
+    float sampled = osc[rightBars]
+    if tol > 0
+        for d = -tol to tol
+            int idx = rightBars + d
+            float v = osc[idx]
+            if not na(v)
+                sampled := na(sampled) ? v : wantLow ? math.min(sampled, v) : math.max(sampled, v)
+    sampled
+
+float lowPivotOsc = newLowPivot ? f_oscNearPivot(true) : na
+float highPivotOsc = newHighPivot ? f_oscNearPivot(false) : na
+int lowPivotBar = bar_index - rightBars
+int highPivotBar = bar_index - rightBars
+
+// Prominence uses the confirmed local window range relative to ATR at pivot.
+int prominenceWindow = leftBars + rightBars + 1
+float localHighest = ta.highest(high, prominenceWindow)
+float localLowest = ta.lowest(low, prominenceWindow)
+float atrAtPivot = atr[rightBars]
+float lowProminenceAtr = newLowPivot and not na(atrAtPivot) and atrAtPivot > 0.0 ? (localHighest - pivotLowPrice) / atrAtPivot : na
+float highProminenceAtr = newHighPivot and not na(atrAtPivot) and atrAtPivot > 0.0 ? (pivotHighPrice - localLowest) / atrAtPivot : na
+
+f_extremity(bool wantLow, float pivotOsc) =>
+    float score = 0.0
+    if oscillator == "RSI"
+        score := wantLow ? f_clamp((50.0 - pivotOsc) / math.max(50.0 - rsiLowExtreme, 1.0) * 100.0, 0.0, 100.0) : f_clamp((pivotOsc - 50.0) / math.max(rsiHighExtreme - 50.0, 1.0) * 100.0, 0.0, 100.0)
+    else
+        float dev = macdDev[rightBars]
+        score := not na(dev) and dev > 0.0 ? f_clamp(math.abs(pivotOsc) / dev * 50.0, 0.0, 100.0) : 0.0
+    score
+
+f_participationScore() =>
+    float rv = rvol[rightBars]
+    float eff = bodyEfficiency[rightBars]
+    float rvScore = not na(rv) ? f_clamp((rv - 0.75) / math.max(fullRvol - 0.75, 0.01) * 100.0, 0.0, 100.0) : 0.0
+    f_clamp(rvScore * 0.70 + nz(eff) * 100.0 * 0.30, 0.0, 100.0)
+
+f_valueScore(bool bullish, float pivotPrice) =>
+    float vw = dailyVwap[rightBars]
+    float a = atr[rightBars]
+    if not useValueContext
+        50.0
+    else if na(vw) or na(a) or a <= 0.0
+        0.0
+    else
+        float dist = bullish ? (vw - pivotPrice) / a : (pivotPrice - vw) / a
+        f_clamp(dist / fullVwapDistanceAtr * 100.0, 0.0, 100.0)
+
+f_quality(float prominenceAtr, float priceSepAtr, float oscSep, float extremity, float participation, float valueScore) =>
+    float prominenceScore = f_score(prominenceAtr, fullProminenceAtr)
+    float priceScore = f_score(priceSepAtr, 1.0)
+    float oscScore = f_score(oscSep, fullOscSep)
+    float participationScore = useParticipation ? participation : 50.0
+    f_clamp(prominenceScore * 0.22 + priceScore * 0.18 + oscScore * 0.22 + extremity * 0.18 + participationScore * 0.10 + valueScore * 0.10, 0.0, 100.0)
+
+//------------------------------------------------------------------------------
+// Pivot memory
+//------------------------------------------------------------------------------
+var float prevLowPrice = na
+var float prevLowOsc = na
+var int prevLowBar = na
+var float prevHighPrice = na
+var float prevHighOsc = na
+var int prevHighBar = na
+
+// Last confirmed event memory for duplicate suppression / expiry.
+var int lastBullEventBar = na
+var int lastBearEventBar = na
+var int activeEventBar = na
+var string activeEventState = "DIVERGENCE_NONE"
+var float activeEventScore = 0.0
+var float activeEventQuality = 0.0
+
+bool regularBull = false
+bool hiddenBull = false
+bool regularBear = false
+bool hiddenBear = false
+float bullQuality = na
+float bearQuality = na
+
+//------------------------------------------------------------------------------
+// Bounded drawings
+//------------------------------------------------------------------------------
+var array<line> divLines = array.new_line()
+var array<label> divLabels = array.new_label()
+
+f_storeLine(line ln) =>
+    array.push(divLines, ln)
+    while array.size(divLines) > maxEvents
+        line old = array.shift(divLines)
+        line.delete(old)
+
+f_storeLabel(label lb) =>
+    array.push(divLabels, lb)
+    while array.size(divLabels) > maxEvents
+        label old = array.shift(divLabels)
+        label.delete(old)
+
+f_drawEvent(int x1, float y1, int x2, float y2, string txt, bool bullish, bool hidden, float quality) =>
+    color c = bullish ? color.new(color.lime, hidden ? 25 : 0) : color.new(color.red, hidden ? 25 : 0)
+    if showLines
+        line ln = line.new(x1, y1, x2, y2, xloc=xloc.bar_index, extend=extend.none, color=c, width=2, style=hidden ? line.style_dashed : line.style_solid)
+        f_storeLine(ln)
+    if showLabels
+        label lb = label.new(x2, y2, txt + " " + str.tostring(quality, "#.0"), xloc=xloc.bar_index, style=bullish ? label.style_label_up : label.style_label_down, textcolor=color.white, color=color.new(c, 70), size=size.tiny)
+        f_storeLabel(lb)
+
+//------------------------------------------------------------------------------
+// Low-pivot divergence qualification
+//------------------------------------------------------------------------------
+if newLowPivot and not na(lowPivotOsc)
+    if not na(prevLowPrice) and not na(prevLowOsc) and not na(prevLowBar)
+        int gapBars = lowPivotBar - prevLowBar
+        float pSepAtr = not na(atrAtPivot) and atrAtPivot > 0.0 ? math.abs(pivotLowPrice - prevLowPrice) / atrAtPivot : na
+        float oscDelta = lowPivotOsc - prevLowOsc
+        bool validGap = gapBars >= minPivotGapBars and gapBars <= maxPivotGapBars
+        bool validPrice = not na(pSepAtr) and pSepAtr >= minPriceSepAtr
+        bool validProminence = not na(lowProminenceAtr) and lowProminenceAtr >= minProminenceAtr
+        bool rawRegular = showRegular and validGap and validPrice and validProminence and pivotLowPrice < prevLowPrice and oscDelta >= minOscSep
+        bool rawHidden = showHidden and validGap and validPrice and validProminence and pivotLowPrice > prevLowPrice and oscDelta <= -minOscSep
+        if rawRegular or rawHidden
+            float extremity = f_extremity(true, lowPivotOsc)
+            float participation = f_participationScore()
+            float valueScore = f_valueScore(true, pivotLowPrice)
+            bullQuality := f_quality(lowProminenceAtr, pSepAtr, math.abs(oscDelta), extremity, participation, valueScore)
+            bool cooldownOk = na(lastBullEventBar) or lowPivotBar - lastBullEventBar >= duplicateCooldownBars
+            bool qualityOk = bullQuality >= minQualityScore
+            regularBull := rawRegular and cooldownOk and qualityOk
+            hiddenBull := rawHidden and cooldownOk and qualityOk
+            if regularBull or hiddenBull
+                lastBullEventBar := lowPivotBar
+                activeEventBar := lowPivotBar
+                activeEventQuality := bullQuality
+                float weight = regularBull ? regularWeight : hiddenWeight
+                activeEventScore := f_clamp(bullQuality * weight, 0.0, 100.0)
+                activeEventState := regularBull ? "DIVERGENCE_REGULAR_BULLISH" : "DIVERGENCE_HIDDEN_BULLISH"
+                f_drawEvent(prevLowBar, prevLowPrice, lowPivotBar, pivotLowPrice, regularBull ? "REG BULL" : "HID BULL", true, hiddenBull, bullQuality)
+    prevLowPrice := pivotLowPrice
+    prevLowOsc := lowPivotOsc
+    prevLowBar := lowPivotBar
+
+//------------------------------------------------------------------------------
+// High-pivot divergence qualification
+//------------------------------------------------------------------------------
+if newHighPivot and not na(highPivotOsc)
+    if not na(prevHighPrice) and not na(prevHighOsc) and not na(prevHighBar)
+        int gapBars = highPivotBar - prevHighBar
+        float pSepAtr = not na(atrAtPivot) and atrAtPivot > 0.0 ? math.abs(pivotHighPrice - prevHighPrice) / atrAtPivot : na
+        float oscDelta = highPivotOsc - prevHighOsc
+        bool validGap = gapBars >= minPivotGapBars and gapBars <= maxPivotGapBars
+        bool validPrice = not na(pSepAtr) and pSepAtr >= minPriceSepAtr
+        bool validProminence = not na(highProminenceAtr) and highProminenceAtr >= minProminenceAtr
+        bool rawRegular = showRegular and validGap and validPrice and validProminence and pivotHighPrice > prevHighPrice and oscDelta <= -minOscSep
+        bool rawHidden = showHidden and validGap and validPrice and validProminence and pivotHighPrice < prevHighPrice and oscDelta >= minOscSep
+        if rawRegular or rawHidden
+            float extremity = f_extremity(false, highPivotOsc)
+            float participation = f_participationScore()
+            float valueScore = f_valueScore(false, pivotHighPrice)
+            bearQuality := f_quality(highProminenceAtr, pSepAtr, math.abs(oscDelta), extremity, participation, valueScore)
+            bool cooldownOk = na(lastBearEventBar) or highPivotBar - lastBearEventBar >= duplicateCooldownBars
+            bool qualityOk = bearQuality >= minQualityScore
+            regularBear := rawRegular and cooldownOk and qualityOk
+            hiddenBear := rawHidden and cooldownOk and qualityOk
+            if regularBear or hiddenBear
+                lastBearEventBar := highPivotBar
+                activeEventBar := highPivotBar
+                activeEventQuality := bearQuality
+                float weight = regularBear ? regularWeight : hiddenWeight
+                activeEventScore := -f_clamp(bearQuality * weight, 0.0, 100.0)
+                activeEventState := regularBear ? "DIVERGENCE_REGULAR_BEARISH" : "DIVERGENCE_HIDDEN_BEARISH"
+                f_drawEvent(prevHighBar, prevHighPrice, highPivotBar, pivotHighPrice, regularBear ? "REG BEAR" : "HID BEAR", false, hiddenBear, bearQuality)
+    prevHighPrice := pivotHighPrice
+    prevHighOsc := highPivotOsc
+    prevHighBar := highPivotBar
+
+//------------------------------------------------------------------------------
+// Event lifecycle / confirmed state
+//------------------------------------------------------------------------------
+bool eventActive = not na(activeEventBar) and bar_index - activeEventBar <= eventExpiryBars
+if not eventActive
+    activeEventState := "DIVERGENCE_NONE"
+    activeEventScore := 0.0
+    activeEventQuality := 0.0
+
+string state = barstate.isconfirmed ? activeEventState : "FORMING"
+float divergenceScore = barstate.isconfirmed ? activeEventScore : 0.0
+float divergenceQuality = barstate.isconfirmed ? activeEventQuality : 0.0
+
+//------------------------------------------------------------------------------
+// Diagnostics
+//------------------------------------------------------------------------------
+var table diag = table.new(position.top_right, 2, 17, border_width=1, frame_width=1, bgcolor=color.new(color.black, 15))
+f_setRow(int row, string k, string v) =>
+    table.cell(diag, 0, row, k, text_color=color.silver, bgcolor=color.new(color.black, 15), text_halign=text.align_left)
+    table.cell(diag, 1, row, v, text_color=color.white, bgcolor=color.new(color.black, 15), text_halign=text.align_right)
+
+if barstate.islast
+    if showDiagnostics
+        table.clear(diag, 0, 0, 1, 16)
+        f_setRow(0, "PLUTUS", "P06.1 Divergence Quality")
+        f_setRow(1, "Oscillator", oscillator)
+        f_setRow(2, "Pivot L / R", str.tostring(leftBars) + " / " + str.tostring(rightBars))
+        f_setRow(3, "Pivot Gap", str.tostring(minPivotGapBars) + "–" + str.tostring(maxPivotGapBars))
+        f_setRow(4, "Min Quality", str.tostring(minQualityScore, "#.0"))
+        f_setRow(5, "Last Low Price", not na(prevLowPrice) ? str.tostring(prevLowPrice, format.mintick) : "N/A")
+        f_setRow(6, "Last Low Osc", not na(prevLowOsc) ? str.tostring(prevLowOsc, "#.##") : "N/A")
+        f_setRow(7, "Last High Price", not na(prevHighPrice) ? str.tostring(prevHighPrice, format.mintick) : "N/A")
+        f_setRow(8, "Last High Osc", not na(prevHighOsc) ? str.tostring(prevHighOsc, "#.##") : "N/A")
+        f_setRow(9, "Participation", useParticipation ? "ON" : "OFF")
+        f_setRow(10, "Value Context", useValueContext ? "ON" : "OFF")
+        f_setRow(11, "Event Expiry", str.tostring(eventExpiryBars))
+        f_setRow(12, "Cooldown", str.tostring(duplicateCooldownBars))
+        f_setRow(13, "Quality", str.tostring(divergenceQuality, "#.1"))
+        f_setRow(14, "Score", str.tostring(divergenceScore, "#.1"))
+        f_setRow(15, "Confirmed", barstate.isconfirmed ? "YES" : "NO")
+        f_setRow(16, "State", state)
+    else
+        table.clear(diag, 0, 0, 1, 16)
