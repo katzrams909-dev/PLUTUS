@@ -1,0 +1,426 @@
+//@version=6
+indicator("PLUTUS P09.1 — Signal Quality", shorttitle="PLUTUS P09.1", overlay=true, max_boxes_count=140, max_labels_count=180, max_lines_count=80)
+
+// P09.1 keeps the validated P09.0 FVG-touch -> close-confirmation state machine
+// and adds quality, regime, session, freshness and conflict filtering.
+// Final P10 integration will replace compact local evidence with exact P01-P07 outputs.
+
+//------------------------------------------------------------------------------
+// Trigger / zone inputs
+//------------------------------------------------------------------------------
+groupFvg = "FVG Trigger"
+atrLen = input.int(14, "ATR Length", minval=1, group=groupFvg)
+volumeLen = input.int(20, "Volume Baseline", minval=2, group=groupFvg)
+minFvgAtr = input.float(0.10, "Minimum FVG Width / ATR", minval=0.0, step=0.01, group=groupFvg)
+minFvgTicks = input.int(3, "Minimum FVG Width (Ticks)", minval=1, group=groupFvg)
+minDispAtr = input.float(0.50, "Minimum Displacement Body / ATR", minval=0.05, step=0.05, group=groupFvg)
+minEfficiency = input.float(0.55, "Minimum Displacement Body / Range", minval=0.10, maxval=1.0, step=0.05, group=groupFvg)
+minTriggerRvol = input.float(1.00, "Minimum Trigger RVOL", minval=0.0, step=0.10, group=groupFvg)
+baseMinZoneScore = input.float(55.0, "Custom Minimum FVG Quality", minval=0, maxval=100, step=5, group=groupFvg)
+maxZoneAge = input.int(150, "Maximum FVG Age", minval=5, maxval=1000, group=groupFvg)
+
+//------------------------------------------------------------------------------
+// Signal quality / context
+//------------------------------------------------------------------------------
+groupQuality = "Signal Quality"
+signalProfile = input.string("Balanced", "Signal Profile", options=["Aggressive", "Balanced", "Conservative", "Custom"], group=groupQuality)
+customMinConfluence = input.float(20.0, "Custom Minimum Confluence", minval=0, maxval=100, step=5, group=groupQuality)
+customMinConfidence = input.float(40.0, "Custom Minimum Confidence", minval=0, maxval=100, step=5, group=groupQuality)
+customMinSetupQuality = input.float(55.0, "Custom Minimum Setup Quality", minval=0, maxval=100, step=5, group=groupQuality)
+minConfirmParticipation = input.float(5.0, "Minimum Confirmation Participation", minval=0, maxval=100, step=5, group=groupQuality)
+requireVwapSide = input.bool(false, "Require Close On Correct Side Of Daily VWAP", group=groupQuality)
+rejectStrongConflict = input.bool(true, "Reject Strong Opposing Evidence", group=groupQuality)
+conflictThreshold = input.float(35.0, "Opposing Evidence Threshold", minval=5, maxval=100, step=5, group=groupQuality)
+allowRepeatSameZone = input.bool(false, "Allow Repeat Signal From Same FVG", group=groupQuality)
+
+participationWeight = input.float(40.0, "Context Participation Weight", minval=0, maxval=100, group=groupQuality)
+vwapWeight = input.float(30.0, "Context VWAP Weight", minval=0, maxval=100, group=groupQuality)
+valueWeight = input.float(30.0, "Context Value Weight", minval=0, maxval=100, group=groupQuality)
+
+//------------------------------------------------------------------------------
+// Regime filter
+//------------------------------------------------------------------------------
+groupRegime = "Regime Filter"
+regimeFilter = input.string("Avoid Compression", "Regime Filter", options=["Off", "Avoid Compression", "Directional Trend"], group=groupRegime)
+adxLen = input.int(14, "ADX Length", minval=2, group=groupRegime)
+adxSmooth = input.int(14, "ADX Smoothing", minval=2, group=groupRegime)
+minAdx = input.float(16.0, "Minimum ADX", minval=0, maxval=100, step=1, group=groupRegime)
+atrRegimeLen = input.int(50, "ATR Regime Baseline", minval=5, group=groupRegime)
+minAtrRatio = input.float(0.80, "Minimum ATR / ATR Baseline", minval=0.2, maxval=3.0, step=0.05, group=groupRegime)
+
+//------------------------------------------------------------------------------
+// Optional session filter
+//------------------------------------------------------------------------------
+groupSession = "Signal Session Filter"
+sessionFilter = input.string("All", "Allowed Session", options=["All", "London", "NY AM", "NY PM", "London + NY"], group=groupSession)
+londonSession = input.session("0800-1630", "London Window", group=groupSession)
+nyAmSession = input.session("0930-1200", "NY AM Window", group=groupSession)
+nyPmSession = input.session("1300-1600", "NY PM Window", group=groupSession)
+
+//------------------------------------------------------------------------------
+// State machine
+//------------------------------------------------------------------------------
+groupSignal = "Signal State Machine"
+confirmationMode = input.string("Directional Close", "Close Confirmation", options=["Directional Close", "Close Back Through Midpoint", "Any Valid Close"], group=groupSignal)
+minCloseLocation = input.float(0.55, "Minimum Directional Close Location", minval=0.0, maxval=1.0, step=0.05, group=groupSignal)
+armedExpiryBars = input.int(3, "Armed Setup Expiry", minval=1, maxval=20, group=groupSignal)
+cooldownBars = input.int(10, "Signal Cooldown Bars", minval=0, maxval=100, group=groupSignal)
+allowSameBarConfirmation = input.bool(true, "Allow Touch-Bar Close Confirmation", group=groupSignal)
+
+//------------------------------------------------------------------------------
+// Risk / reward
+//------------------------------------------------------------------------------
+groupRisk = "Risk / Reward Preview"
+showRiskReward = input.bool(true, "Show Confirmed Trade Preview", group=groupRisk)
+stopBufferAtr = input.float(0.10, "Stop Buffer / ATR", minval=0.0, step=0.05, group=groupRisk)
+targetR = input.float(2.0, "Target R Multiple", minval=0.5, step=0.25, group=groupRisk)
+riskRewardBars = input.int(25, "Preview Width (Bars)", minval=3, maxval=100, group=groupRisk)
+maxTradePreviews = input.int(8, "Maximum Trade Previews", minval=1, maxval=30, group=groupRisk)
+
+//------------------------------------------------------------------------------
+// Visuals
+//------------------------------------------------------------------------------
+groupVisual = "Visuals"
+showFvgZones = input.bool(true, "Show Active Trigger FVGs", group=groupVisual)
+showStateLabel = input.bool(true, "Show Current State", group=groupVisual)
+showDiagnostics = input.bool(false, "Diagnostics Table", group=groupVisual)
+
+//------------------------------------------------------------------------------
+// Helpers
+//------------------------------------------------------------------------------
+f_clamp(float x, float lo, float hi) => math.max(lo, math.min(hi, x))
+f_closeLocation() =>
+    float rr = math.max(high - low, syminfo.mintick)
+    (close - low) / rr
+f_contextScore(float participation, float vwapScore, float valueScore) =>
+    float total = math.max(participationWeight + vwapWeight + valueWeight, 0.0001)
+    f_clamp((participation * participationWeight + vwapScore * vwapWeight + valueScore * valueWeight) / total, -100.0, 100.0)
+f_profileThreshold(float aggressive, float balanced, float conservative, float custom) =>
+    signalProfile == "Aggressive" ? aggressive : signalProfile == "Conservative" ? conservative : signalProfile == "Custom" ? custom : balanced
+
+//------------------------------------------------------------------------------
+// Compact context proxy
+//------------------------------------------------------------------------------
+float atr = ta.atr(atrLen)
+float rng = math.max(high - low, syminfo.mintick)
+float body = math.abs(close - open)
+float efficiency = body / rng
+float bodyAtr = not na(atr) and atr > 0 ? body / atr : 0.0
+float volBase = ta.sma(volume, volumeLen)
+float rvol = not na(volBase) and volBase > 0 ? volume / volBase : na
+int candleDir = close > open ? 1 : close < open ? -1 : 0
+float participation = candleDir * f_clamp((nz(rvol, 0.0) / 2.0) * 55.0 + efficiency * 45.0, 0.0, 100.0)
+
+bool newDay = ta.change(dayofmonth(time, syminfo.timezone)) != 0
+float dailyVwap = ta.vwap(hlc3, barstate.isfirst or newDay)
+float vwapScore = not na(dailyVwap) and not na(atr) and atr > 0 ? f_clamp((close - dailyVwap) / atr * 60.0, -100.0, 100.0) : 0.0
+float rollingValue = ta.sma(hlc3, 20)
+float valueScore = not na(rollingValue) and not na(atr) and atr > 0 ? f_clamp((close - rollingValue) / atr * 50.0 + candleDir * efficiency * 25.0, -100.0, 100.0) : 0.0
+float confluence = f_contextScore(participation, vwapScore, valueScore)
+int availableEvidence = (not na(rvol) ? 1 : 0) + (not na(dailyVwap) ? 1 : 0) + (not na(rollingValue) ? 1 : 0)
+float confidence = availableEvidence / 3.0 * 55.0 + f_clamp(math.abs(confluence), 0.0, 100.0) * 0.45
+
+[plusDI, minusDI, adx] = ta.dmi(adxLen, adxSmooth)
+float atrBase = ta.sma(atr, atrRegimeLen)
+float atrRatio = not na(atrBase) and atrBase > 0 ? atr / atrBase : na
+bool compression = (not na(atrRatio) and atrRatio < minAtrRatio) or (not na(adx) and adx < minAdx)
+bool bullTrendRegime = not na(adx) and adx >= minAdx and plusDI >= minusDI
+bool bearTrendRegime = not na(adx) and adx >= minAdx and minusDI >= plusDI
+
+bool inLondon = not na(time(timeframe.period, londonSession, "Europe/London"))
+bool inNyAm = not na(time(timeframe.period, nyAmSession, "America/New_York"))
+bool inNyPm = not na(time(timeframe.period, nyPmSession, "America/New_York"))
+bool sessionOk = sessionFilter == "All" ? true : sessionFilter == "London" ? inLondon : sessionFilter == "NY AM" ? inNyAm : sessionFilter == "NY PM" ? inNyPm : (inLondon or inNyAm or inNyPm)
+
+float minConfluence = f_profileThreshold(10.0, 20.0, 35.0, customMinConfluence)
+float minConfidence = f_profileThreshold(30.0, 40.0, 55.0, customMinConfidence)
+float minSetupQuality = f_profileThreshold(45.0, 55.0, 70.0, customMinSetupQuality)
+float minZoneScore = f_profileThreshold(45.0, baseMinZoneScore, 70.0, baseMinZoneScore)
+
+//------------------------------------------------------------------------------
+// Qualified FVG candidates
+//------------------------------------------------------------------------------
+bool displacementOk = bodyAtr >= minDispAtr and efficiency >= minEfficiency and nz(rvol, 0.0) >= minTriggerRvol
+bool bullFvgRaw = low > high[2]
+bool bearFvgRaw = high < low[2]
+float bullWidth = bullFvgRaw ? low - high[2] : 0.0
+float bearWidth = bearFvgRaw ? low[2] - high : 0.0
+bool bullWidthOk = bullFvgRaw and bullWidth >= minFvgTicks * syminfo.mintick and (na(atr) or bullWidth >= minFvgAtr * atr)
+bool bearWidthOk = bearFvgRaw and bearWidth >= minFvgTicks * syminfo.mintick and (na(atr) or bearWidth >= minFvgAtr * atr)
+float mechanics = f_clamp(bodyAtr / math.max(minDispAtr * 2.0, 0.01) * 55.0 + efficiency * 45.0, 0.0, 100.0)
+float bullQuality = f_clamp(mechanics * 0.50 + math.max(participation, 0.0) * 0.30 + math.max(confluence, 0.0) * 0.20, 0.0, 100.0)
+float bearQuality = f_clamp(mechanics * 0.50 + math.max(-participation, 0.0) * 0.30 + math.max(-confluence, 0.0) * 0.20, 0.0, 100.0)
+bool newBullFvg = bullWidthOk and displacementOk and bullQuality >= minZoneScore
+bool newBearFvg = bearWidthOk and displacementOk and bearQuality >= minZoneScore
+
+var float bullTop = na
+var float bullBottom = na
+var float bullScore = na
+var int bullBorn = na
+var bool bullValid = false
+var box bullBox = na
+var float bearTop = na
+var float bearBottom = na
+var float bearScore = na
+var int bearBorn = na
+var bool bearValid = false
+var box bearBox = na
+
+if newBullFvg
+    bullTop := low
+    bullBottom := high[2]
+    bullScore := bullQuality
+    bullBorn := bar_index
+    bullValid := true
+    if not na(bullBox)
+        box.delete(bullBox)
+    bullBox := showFvgZones ? box.new(bar_index, bullTop, bar_index, bullBottom, xloc=xloc.bar_index, extend=extend.none, border_color=color.new(color.lime, 20), bgcolor=color.new(color.lime, 88), text="BULL FVG", text_color=color.lime, text_size=size.tiny) : na
+if newBearFvg
+    bearTop := low[2]
+    bearBottom := high
+    bearScore := bearQuality
+    bearBorn := bar_index
+    bearValid := true
+    if not na(bearBox)
+        box.delete(bearBox)
+    bearBox := showFvgZones ? box.new(bar_index, bearTop, bar_index, bearBottom, xloc=xloc.bar_index, extend=extend.none, border_color=color.new(color.red, 20), bgcolor=color.new(color.red, 88), text="BEAR FVG", text_color=color.red, text_size=size.tiny) : na
+
+if bullValid
+    bool expired = bar_index - bullBorn > maxZoneAge
+    bool invalid = close < bullBottom
+    if expired or invalid
+        bullValid := false
+        if not na(bullBox)
+            box.delete(bullBox)
+            bullBox := na
+    else if showFvgZones
+        if na(bullBox)
+            bullBox := box.new(bullBorn, bullTop, bar_index, bullBottom, xloc=xloc.bar_index, extend=extend.none, border_color=color.new(color.lime, 20), bgcolor=color.new(color.lime, 88), text="BULL FVG", text_color=color.lime, text_size=size.tiny)
+        else
+            box.set_right(bullBox, bar_index)
+else if not na(bullBox)
+    box.delete(bullBox)
+    bullBox := na
+
+if bearValid
+    bool expired = bar_index - bearBorn > maxZoneAge
+    bool invalid = close > bearTop
+    if expired or invalid
+        bearValid := false
+        if not na(bearBox)
+            box.delete(bearBox)
+            bearBox := na
+    else if showFvgZones
+        if na(bearBox)
+            bearBox := box.new(bearBorn, bearTop, bar_index, bearBottom, xloc=xloc.bar_index, extend=extend.none, border_color=color.new(color.red, 20), bgcolor=color.new(color.red, 88), text="BEAR FVG", text_color=color.red, text_size=size.tiny)
+        else
+            box.set_right(bearBox, bar_index)
+else if not na(bearBox)
+    box.delete(bearBox)
+    bearBox := na
+
+//------------------------------------------------------------------------------
+// Directional quality gates
+//------------------------------------------------------------------------------
+f_regimeOk(int dir) =>
+    regimeFilter == "Off" ? true : regimeFilter == "Avoid Compression" ? not compression : dir == 1 ? bullTrendRegime : bearTrendRegime
+
+f_conflict(int dir) =>
+    dir == 1 ? (participation <= -conflictThreshold or valueScore <= -conflictThreshold) : (participation >= conflictThreshold or valueScore >= conflictThreshold)
+
+f_setupQuality(int dir, float zoneScore, int bornBar) =>
+    float age = math.max(bar_index - bornBar, 0)
+    float freshness = f_clamp(100.0 * (1.0 - age / math.max(maxZoneAge, 1.0)), 0.0, 100.0)
+    float directionalConfluence = dir == 1 ? math.max(confluence, 0.0) : math.max(-confluence, 0.0)
+    float directionalParticipation = dir == 1 ? math.max(participation, 0.0) : math.max(-participation, 0.0)
+    f_clamp(zoneScore * 0.35 + directionalConfluence * 0.25 + confidence * 0.15 + directionalParticipation * 0.15 + freshness * 0.10, 0.0, 100.0)
+
+//------------------------------------------------------------------------------
+// Signal state machine
+//------------------------------------------------------------------------------
+var string signalState = "IDLE"
+var int setupDir = 0
+var string triggerType = "NONE"
+var float setupTop = na
+var float setupBottom = na
+var float setupZoneScore = na
+var float setupQuality = na
+var int setupBornBar = na
+var int armedBar = na
+var int lastConfirmedBar = na
+var int lastConfirmedDir = 0
+var int lastConfirmedZoneBorn = na
+var float signalEntry = na
+var float signalStop = na
+var float signalTarget = na
+
+bool cooldownActive = not na(lastConfirmedBar) and bar_index - lastConfirmedBar <= cooldownBars
+bool bullConflict = rejectStrongConflict and f_conflict(1)
+bool bearConflict = rejectStrongConflict and f_conflict(-1)
+bool bullRegimeOk = f_regimeOk(1)
+bool bearRegimeOk = f_regimeOk(-1)
+float bullSetupQuality = bullValid ? f_setupQuality(1, bullScore, bullBorn) : 0.0
+float bearSetupQuality = bearValid ? f_setupQuality(-1, bearScore, bearBorn) : 0.0
+bool bullRepeatOk = allowRepeatSameZone or na(lastConfirmedZoneBorn) or lastConfirmedDir != 1 or bullBorn != lastConfirmedZoneBorn
+bool bearRepeatOk = allowRepeatSameZone or na(lastConfirmedZoneBorn) or lastConfirmedDir != -1 or bearBorn != lastConfirmedZoneBorn
+bool bullContext = bullValid and sessionOk and bullRegimeOk and not bullConflict and confluence >= minConfluence and confidence >= minConfidence and bullSetupQuality >= minSetupQuality and bullRepeatOk and (not requireVwapSide or close >= dailyVwap)
+bool bearContext = bearValid and sessionOk and bearRegimeOk and not bearConflict and confluence <= -minConfluence and confidence >= minConfidence and bearSetupQuality >= minSetupQuality and bearRepeatOk and (not requireVwapSide or close <= dailyVwap)
+
+string blockReason = cooldownActive ? "COOLDOWN" : not sessionOk ? "SESSION" : bullValid or bearValid ? "QUALITY / CONTEXT" : "NO ZONE"
+if signalState == "IDLE" and not cooldownActive
+    if bullContext
+        signalState := "SETUP"
+        setupDir := 1
+        triggerType := "FVG"
+        setupTop := bullTop
+        setupBottom := bullBottom
+        setupZoneScore := bullScore
+        setupQuality := bullSetupQuality
+        setupBornBar := bullBorn
+        blockReason := "READY LONG"
+    else if bearContext
+        signalState := "SETUP"
+        setupDir := -1
+        triggerType := "FVG"
+        setupTop := bearTop
+        setupBottom := bearBottom
+        setupZoneScore := bearScore
+        setupQuality := bearSetupQuality
+        setupBornBar := bearBorn
+        blockReason := "READY SHORT"
+
+bool boundZoneValid = setupDir == 1 ? bullValid and bullBorn == setupBornBar : setupDir == -1 ? bearValid and bearBorn == setupBornBar : false
+if (signalState == "SETUP" or signalState == "ARMED") and not boundZoneValid
+    signalState := "INVALIDATED"
+
+bool touched = setupDir == 1 ? low <= setupTop and high >= setupBottom : setupDir == -1 ? high >= setupBottom and low <= setupTop : false
+if signalState == "SETUP" and touched and bar_index > setupBornBar
+    signalState := "ARMED"
+    armedBar := bar_index
+
+float closeLoc = f_closeLocation()
+float zoneMid = (setupTop + setupBottom) * 0.5
+bool directionalClose = setupDir == 1 ? close > open and closeLoc >= minCloseLocation : setupDir == -1 ? close < open and closeLoc <= 1.0 - minCloseLocation : false
+bool midpointClose = setupDir == 1 ? close >= zoneMid : setupDir == -1 ? close <= zoneMid : false
+bool anyValidClose = setupDir == 1 ? close >= setupBottom : setupDir == -1 ? close <= setupTop : false
+bool closeConfirmed = confirmationMode == "Directional Close" ? directionalClose : confirmationMode == "Close Back Through Midpoint" ? midpointClose : anyValidClose
+float liveSetupQuality = setupDir == 1 and bullValid ? f_setupQuality(1, bullScore, bullBorn) : setupDir == -1 and bearValid ? f_setupQuality(-1, bearScore, bearBorn) : 0.0
+bool participationOk = setupDir == 1 ? participation >= minConfirmParticipation : setupDir == -1 ? participation <= -minConfirmParticipation : false
+bool contextStillValid = setupDir == 1 ? bullContext : setupDir == -1 ? bearContext : false
+bool sameBarAllowed = allowSameBarConfirmation or na(armedBar) or bar_index > armedBar
+bool confirmNow = signalState == "ARMED" and sameBarAllowed and barstate.isconfirmed and closeConfirmed and participationOk and contextStillValid and liveSetupQuality >= minSetupQuality and boundZoneValid
+
+bool setupBroken = setupDir == 1 ? close < setupBottom : setupDir == -1 ? close > setupTop : false
+if signalState == "ARMED" and setupBroken
+    signalState := "INVALIDATED"
+if signalState == "ARMED" and not na(armedBar) and bar_index - armedBar > armedExpiryBars
+    signalState := "EXPIRED"
+
+bool longConfirmed = false
+bool shortConfirmed = false
+if confirmNow
+    signalState := "CONFIRMED"
+    setupQuality := liveSetupQuality
+    signalEntry := close
+    float buffer = nz(atr, 0.0) * stopBufferAtr
+    signalStop := setupDir == 1 ? setupBottom - buffer : setupTop + buffer
+    float risk = math.abs(signalEntry - signalStop)
+    signalTarget := setupDir == 1 ? signalEntry + risk * targetR : signalEntry - risk * targetR
+    lastConfirmedBar := bar_index
+    lastConfirmedDir := setupDir
+    lastConfirmedZoneBorn := setupBornBar
+    longConfirmed := setupDir == 1
+    shortConfirmed := setupDir == -1
+
+//------------------------------------------------------------------------------
+// Confirmed trade previews
+//------------------------------------------------------------------------------
+var array<box> riskBoxes = array.new_box()
+var array<box> rewardBoxes = array.new_box()
+var array<label> signalLabels = array.new_label()
+if longConfirmed or shortConfirmed
+    color sigColor = longConfirmed ? color.lime : color.red
+    string sigText = (longConfirmed ? "PLUTUS LONG" : "PLUTUS SHORT") + " · Q " + str.tostring(setupQuality, "#.0")
+    label lb = label.new(bar_index, close, sigText, xloc=xloc.bar_index, style=longConfirmed ? label.style_label_up : label.style_label_down, textcolor=color.white, color=color.new(sigColor, 15), size=size.small)
+    array.push(signalLabels, lb)
+    while array.size(signalLabels) > maxTradePreviews
+        label.delete(array.shift(signalLabels))
+    if showRiskReward and signalEntry != signalStop
+        int rightBar = bar_index + riskRewardBars
+        box rb = box.new(bar_index, math.max(signalEntry, signalStop), rightBar, math.min(signalEntry, signalStop), xloc=xloc.bar_index, extend=extend.none, border_color=color.new(color.gray, 45), bgcolor=color.new(color.gray, 83))
+        box pb = box.new(bar_index, math.max(signalEntry, signalTarget), rightBar, math.min(signalEntry, signalTarget), xloc=xloc.bar_index, extend=extend.none, border_color=color.new(color.green, 45), bgcolor=color.new(color.green, 82))
+        array.push(riskBoxes, rb)
+        array.push(rewardBoxes, pb)
+        while array.size(riskBoxes) > maxTradePreviews
+            box.delete(array.shift(riskBoxes))
+        while array.size(rewardBoxes) > maxTradePreviews
+            box.delete(array.shift(rewardBoxes))
+
+if barstate.isconfirmed and signalState == "CONFIRMED" and not (longConfirmed or shortConfirmed)
+    signalState := cooldownActive ? "COOLDOWN" : "IDLE"
+if barstate.isconfirmed and (signalState == "INVALIDATED" or signalState == "EXPIRED")
+    signalState := "IDLE"
+    setupDir := 0
+    triggerType := "NONE"
+    setupTop := na
+    setupBottom := na
+    setupZoneScore := na
+    setupQuality := na
+    setupBornBar := na
+    armedBar := na
+if signalState == "COOLDOWN" and not cooldownActive
+    signalState := "IDLE"
+    setupDir := 0
+    triggerType := "NONE"
+    setupTop := na
+    setupBottom := na
+    setupZoneScore := na
+    setupQuality := na
+    setupBornBar := na
+    armedBar := na
+
+//------------------------------------------------------------------------------
+// State / diagnostics
+//------------------------------------------------------------------------------
+var label stateLabel = na
+if barstate.islast and showStateLabel
+    if not na(stateLabel)
+        label.delete(stateLabel)
+    string stateText = signalState + (setupDir == 1 ? " · LONG" : setupDir == -1 ? " · SHORT" : "") + (not na(setupQuality) ? " · Q " + str.tostring(setupQuality, "#.0") : "")
+    stateLabel := label.new(bar_index, high + nz(atr) * 0.35, stateText, xloc=xloc.bar_index, style=label.style_label_down, textcolor=color.white, color=color.new(signalState == "ARMED" ? color.orange : signalState == "CONFIRMED" ? color.lime : color.gray, 35), size=size.tiny)
+
+var table diag = table.new(position.bottom_right, 2, 14, border_width=1, frame_width=1, bgcolor=color.new(color.black, 15))
+if barstate.islast
+    table.clear(diag, 0, 0, 1, 13)
+    if showDiagnostics
+        table.cell(diag, 0, 0, "P09.1 " + signalProfile, text_color=color.white)
+        table.cell(diag, 1, 0, signalState, text_color=color.white)
+        table.cell(diag, 0, 1, "Direction", text_color=color.silver)
+        table.cell(diag, 1, 1, setupDir == 1 ? "LONG" : setupDir == -1 ? "SHORT" : "NONE", text_color=setupDir == 1 ? color.lime : setupDir == -1 ? color.red : color.gray)
+        table.cell(diag, 0, 2, "Block / Ready", text_color=color.silver)
+        table.cell(diag, 1, 2, blockReason, text_color=color.white)
+        table.cell(diag, 0, 3, "Confluence", text_color=color.silver)
+        table.cell(diag, 1, 3, str.tostring(confluence, "#.1") + " / " + str.tostring(minConfluence, "#.0"), text_color=confluence > 0 ? color.lime : confluence < 0 ? color.red : color.white)
+        table.cell(diag, 0, 4, "Confidence", text_color=color.silver)
+        table.cell(diag, 1, 4, str.tostring(confidence, "#.0") + "% / " + str.tostring(minConfidence, "#.0"), text_color=color.white)
+        table.cell(diag, 0, 5, "Setup Quality", text_color=color.silver)
+        table.cell(diag, 1, 5, str.tostring(setupDir == 1 ? bullSetupQuality : setupDir == -1 ? bearSetupQuality : math.max(bullSetupQuality, bearSetupQuality), "#.0") + " / " + str.tostring(minSetupQuality, "#.0"), text_color=color.white)
+        table.cell(diag, 0, 6, "Participation", text_color=color.silver)
+        table.cell(diag, 1, 6, str.tostring(participation, "#.1"), text_color=participation > 0 ? color.lime : participation < 0 ? color.red : color.white)
+        table.cell(diag, 0, 7, "Regime", text_color=color.silver)
+        table.cell(diag, 1, 7, compression ? "COMPRESSION" : bullTrendRegime ? "BULL TREND" : bearTrendRegime ? "BEAR TREND" : "MIXED", text_color=color.white)
+        table.cell(diag, 0, 8, "Session", text_color=color.silver)
+        table.cell(diag, 1, 8, sessionOk ? "ALLOWED" : "BLOCKED", text_color=sessionOk ? color.lime : color.orange)
+        table.cell(diag, 0, 9, "Zone score", text_color=color.silver)
+        table.cell(diag, 1, 9, str.tostring(setupZoneScore, "#.0"), text_color=color.white)
+        table.cell(diag, 0, 10, "Touch / Close", text_color=color.silver)
+        table.cell(diag, 1, 10, (touched ? "TOUCH " : "") + (closeConfirmed ? "VALID" : "WAIT"), text_color=color.white)
+        table.cell(diag, 0, 11, "Entry", text_color=color.silver)
+        table.cell(diag, 1, 11, str.tostring(signalEntry, format.mintick), text_color=color.white)
+        table.cell(diag, 0, 12, "Stop", text_color=color.silver)
+        table.cell(diag, 1, 12, str.tostring(signalStop, format.mintick), text_color=color.white)
+        table.cell(diag, 0, 13, "Target", text_color=color.silver)
+        table.cell(diag, 1, 13, str.tostring(signalTarget, format.mintick), text_color=color.white)
+
+alertcondition(longConfirmed, "PLUTUS P09.1 Long Confirmed", "PLUTUS P09.1 confirmed a quality-filtered bullish FVG setup on candle close.")
+alertcondition(shortConfirmed, "PLUTUS P09.1 Short Confirmed", "PLUTUS P09.1 confirmed a quality-filtered bearish FVG setup on candle close.")
