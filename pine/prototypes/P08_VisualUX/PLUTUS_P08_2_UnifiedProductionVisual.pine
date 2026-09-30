@@ -1,8 +1,10 @@
 //@version=6
-indicator("PLUTUS P08.2 — Unified Production Visual", shorttitle="PLUTUS P08.2", overlay=true, max_boxes_count=500, max_lines_count=260, max_labels_count=260)
+indicator("PLUTUS P08.2 — Unified Production Visual", shorttitle="PLUTUS P08.2", overlay=true, max_boxes_count=500, max_lines_count=260, max_labels_count=320)
 
 // PLUTUS P08.2 — final P08 production-facing visual layer.
-// Carries forward P08.1 profile/zone/divergence behavior. No trade signals.
+// POC/VAH/VAL remain internal profile values but are not plotted as standalone chart lines.
+// Session range zones are visual-only and do not alter engine scores or confluence.
+// No trade signals.
 
 //------------------------------------------------------------------------------
 // Display / UX
@@ -11,7 +13,6 @@ groupDisplay = "Display / UX"
 displayPreset = input.string("Balanced", "Display Preset", options=["Minimal", "Balanced", "Full", "Diagnostic"], group=groupDisplay)
 showStatusPanelInput = input.bool(true, "Status Panel", group=groupDisplay)
 showVwapInput = input.bool(true, "VWAP", group=groupDisplay)
-showValueLevelsInput = input.bool(true, "POC / VAH / VAL", group=groupDisplay)
 showHistogramInput = input.bool(false, "Volume Profile Histogram", group=groupDisplay)
 showZonesInput = input.bool(true, "Institutional Zones", group=groupDisplay)
 showDivergenceInput = input.bool(true, "Divergence", group=groupDisplay)
@@ -19,7 +20,7 @@ showTransitionsInput = input.bool(true, "Material Transitions", group=groupDispl
 showBiasBackgroundInput = input.bool(false, "Bias Background", group=groupDisplay)
 showDiagnosticsInput = input.bool(false, "Diagnostics", group=groupDisplay)
 panelPosition = input.string("Top Right", "Status Panel Position", options=["Top Right", "Top Left", "Bottom Right", "Bottom Left"], group=groupDisplay)
-compactPanel = input.bool(true, "Compact Status Panel", group=groupDisplay)
+compactPanel = input.bool(false, "Compact Status Panel", group=groupDisplay)
 
 bool presetMinimal = displayPreset == "Minimal"
 bool presetBalanced = displayPreset == "Balanced"
@@ -27,7 +28,6 @@ bool presetFull = displayPreset == "Full"
 bool presetDiagnostic = displayPreset == "Diagnostic"
 bool showStatusPanel = showStatusPanelInput
 bool showVwap = showVwapInput and not presetMinimal
-bool showValueLevels = showValueLevelsInput and not presetMinimal
 bool showHistogram = showHistogramInput and (presetFull or presetDiagnostic)
 bool showZones = showZonesInput and not presetMinimal
 bool showDivergence = showDivergenceInput and (presetFull or presetDiagnostic)
@@ -45,6 +45,23 @@ profileScope = input.string("Day", "Profile Scope", options=["Asia", "London", "
 valueReference = input.string("Daily", "VWAP Reference", options=["Active Session", "Daily", "Weekly", "Monthly"], group=groupTiming)
 
 //------------------------------------------------------------------------------
+// Session range zones — visual-only
+//------------------------------------------------------------------------------
+groupSessions = "Session Zones"
+showSessionZonesInput = input.bool(true, "Show Session Zones", group=groupSessions)
+showAsiaZone = input.bool(true, "Asia Zone", group=groupSessions)
+showLondonZone = input.bool(true, "London Zone", group=groupSessions)
+showNewYorkZone = input.bool(false, "New York Zone", group=groupSessions)
+sessionHistory = input.int(2, "Completed Sessions To Keep Per Market", minval=0, maxval=10, group=groupSessions)
+showSessionHighLowLabels = input.bool(true, "Show Session High / Low Labels", group=groupSessions)
+showSessionName = input.bool(false, "Show Session Name In Box", group=groupSessions)
+showSessionMidline = input.bool(false, "Show Session Midline", group=groupSessions)
+sessionZoneOpacity = input.int(90, "Session Zone Opacity", minval=70, maxval=98, group=groupSessions)
+sessionBorderOpacity = input.int(50, "Session Border Opacity", minval=0, maxval=100, group=groupSessions)
+
+bool showSessionZones = showSessionZonesInput and not presetMinimal
+
+//------------------------------------------------------------------------------
 // Volume profile
 //------------------------------------------------------------------------------
 groupProfile = "Volume Profile"
@@ -60,7 +77,6 @@ showNodes = input.bool(false, "Show Strongest HVN / LVN", group=groupProfile)
 smoothingRadius = input.int(1, "HVN/LVN Smoothing Radius", minval=0, maxval=4, group=groupProfile)
 hvnThreshold = input.float(1.35, "HVN Min Volume / Mean", minval=1.0, step=0.05, group=groupProfile)
 lvnThreshold = input.float(0.65, "LVN Max Volume / Mean", minval=0.05, maxval=1.0, step=0.05, group=groupProfile)
-lineWidth = input.int(2, "POC / VA Line Width", minval=1, maxval=4, group=groupProfile)
 
 //------------------------------------------------------------------------------
 // Institutional zones
@@ -183,6 +199,9 @@ color cPoc=color.orange
 color cVa=color.silver
 color cHvn=color.fuchsia
 color cLvn=color.gray
+color cAsia=color.gray
+color cLondon=color.silver
+color cNewYork=color.aqua
 
 //------------------------------------------------------------------------------
 // Sessions / resets
@@ -196,6 +215,9 @@ bool inNewYork=not na(time(timeframe.period,newYorkSession,sessionTz))
 bool newAsia=inAsia and not inAsia[1]
 bool newLondon=inLondon and not inLondon[1]
 bool newNewYork=inNewYork and not inNewYork[1]
+bool endAsia=not inAsia and inAsia[1]
+bool endLondon=not inLondon and inLondon[1]
+bool endNewYork=not inNewYork and inNewYork[1]
 int localDay=dayofmonth(time,sessionTz)
 int localWeek=weekofyear(time,sessionTz)
 int localMonth=month(time,sessionTz)
@@ -205,6 +227,202 @@ bool newMonth=ta.change(localMonth)!=0
 bool profileActive=profileScope=="Asia"?inAsia:profileScope=="London"?inLondon:profileScope=="New York"?inNewYork:true
 bool profileReset=profileScope=="Asia"?newAsia:profileScope=="London"?newLondon:profileScope=="New York"?newNewYork:barstate.isfirst or newDay
 bool profileVisualActive=profileScope=="Day"?true:profileActive
+
+//------------------------------------------------------------------------------
+// Session range boxes — finite start-to-end rectangles
+//------------------------------------------------------------------------------
+var box asiaBox=na
+var box londonBox=na
+var box newYorkBox=na
+var line asiaMid=na
+var line londonMid=na
+var line newYorkMid=na
+var label asiaHighLabel=na
+var label asiaLowLabel=na
+var label londonHighLabel=na
+var label londonLowLabel=na
+var label newYorkHighLabel=na
+var label newYorkLowLabel=na
+var float asiaHigh=na
+var float asiaLow=na
+var float londonHigh=na
+var float londonLow=na
+var float newYorkHigh=na
+var float newYorkLow=na
+var int asiaStart=na
+var int londonStart=na
+var int newYorkStart=na
+var array<box> asiaBoxes=array.new_box()
+var array<box> londonBoxes=array.new_box()
+var array<box> newYorkBoxes=array.new_box()
+var array<line> asiaMids=array.new_line()
+var array<line> londonMids=array.new_line()
+var array<line> newYorkMids=array.new_line()
+var array<label> asiaLabels=array.new_label()
+var array<label> londonLabels=array.new_label()
+var array<label> newYorkLabels=array.new_label()
+
+if newAsia and showSessionZones and showAsiaZone
+    asiaHigh:=high
+    asiaLow:=low
+    asiaStart:=bar_index
+    string asiaText=showSessionName?"ASIA":""
+    asiaBox:=box.new(bar_index,asiaHigh,bar_index,asiaLow,xloc=xloc.bar_index,extend=extend.none,border_color=color.new(cAsia,sessionBorderOpacity),bgcolor=color.new(cAsia,sessionZoneOpacity),text=asiaText,text_color=color.new(color.white,25),text_size=size.tiny)
+    array.push(asiaBoxes,asiaBox)
+    if showSessionMidline
+        asiaMid:=line.new(bar_index,(asiaHigh+asiaLow)*0.5,bar_index,(asiaHigh+asiaLow)*0.5,xloc=xloc.bar_index,extend=extend.none,color=color.new(cAsia,55),style=line.style_dotted)
+        array.push(asiaMids,asiaMid)
+    if showSessionHighLowLabels
+        asiaHighLabel:=label.new(bar_index,asiaHigh,"ASIA HIGH",xloc=xloc.bar_index,style=label.style_none,textcolor=color.new(color.white,10),size=size.tiny)
+        asiaLowLabel:=label.new(bar_index,asiaLow,"ASIA LOW",xloc=xloc.bar_index,style=label.style_none,textcolor=color.new(color.white,10),size=size.tiny)
+        array.push(asiaLabels,asiaHighLabel)
+        array.push(asiaLabels,asiaLowLabel)
+    int maxAsiaBoxes=sessionHistory+1
+    while array.size(asiaBoxes)>maxAsiaBoxes
+        box.delete(array.shift(asiaBoxes))
+    while array.size(asiaMids)>maxAsiaBoxes
+        line.delete(array.shift(asiaMids))
+    while array.size(asiaLabels)>maxAsiaBoxes*2
+        label.delete(array.shift(asiaLabels))
+
+if inAsia and showSessionZones and showAsiaZone and not na(asiaBox)
+    asiaHigh:=math.max(nz(asiaHigh,high),high)
+    asiaLow:=math.min(nz(asiaLow,low),low)
+    int midX=int(math.round((asiaStart+bar_index)*0.5))
+    box.set_right(asiaBox,bar_index)
+    box.set_top(asiaBox,asiaHigh)
+    box.set_bottom(asiaBox,asiaLow)
+    if showSessionMidline and not na(asiaMid)
+        float midPrice=(asiaHigh+asiaLow)*0.5
+        line.set_xy1(asiaMid,asiaStart,midPrice)
+        line.set_xy2(asiaMid,bar_index,midPrice)
+    if showSessionHighLowLabels
+        if not na(asiaHighLabel)
+            label.set_xy(asiaHighLabel,midX,asiaHigh)
+        if not na(asiaLowLabel)
+            label.set_xy(asiaLowLabel,midX,asiaLow)
+
+if endAsia and sessionHistory==0
+    if not na(asiaBox)
+        box.delete(asiaBox)
+    if not na(asiaMid)
+        line.delete(asiaMid)
+    if not na(asiaHighLabel)
+        label.delete(asiaHighLabel)
+    if not na(asiaLowLabel)
+        label.delete(asiaLowLabel)
+    asiaBox:=na
+    asiaMid:=na
+    asiaHighLabel:=na
+    asiaLowLabel:=na
+
+if newLondon and showSessionZones and showLondonZone
+    londonHigh:=high
+    londonLow:=low
+    londonStart:=bar_index
+    string londonText=showSessionName?"LONDON":""
+    londonBox:=box.new(bar_index,londonHigh,bar_index,londonLow,xloc=xloc.bar_index,extend=extend.none,border_color=color.new(cLondon,sessionBorderOpacity),bgcolor=color.new(cLondon,sessionZoneOpacity),text=londonText,text_color=color.new(color.white,15),text_size=size.tiny)
+    array.push(londonBoxes,londonBox)
+    if showSessionMidline
+        londonMid:=line.new(bar_index,(londonHigh+londonLow)*0.5,bar_index,(londonHigh+londonLow)*0.5,xloc=xloc.bar_index,extend=extend.none,color=color.new(cLondon,55),style=line.style_dotted)
+        array.push(londonMids,londonMid)
+    if showSessionHighLowLabels
+        londonHighLabel:=label.new(bar_index,londonHigh,"LONDON HIGH",xloc=xloc.bar_index,style=label.style_none,textcolor=color.new(color.white,5),size=size.tiny)
+        londonLowLabel:=label.new(bar_index,londonLow,"LONDON LOW",xloc=xloc.bar_index,style=label.style_none,textcolor=color.new(color.white,5),size=size.tiny)
+        array.push(londonLabels,londonHighLabel)
+        array.push(londonLabels,londonLowLabel)
+    int maxLondonBoxes=sessionHistory+1
+    while array.size(londonBoxes)>maxLondonBoxes
+        box.delete(array.shift(londonBoxes))
+    while array.size(londonMids)>maxLondonBoxes
+        line.delete(array.shift(londonMids))
+    while array.size(londonLabels)>maxLondonBoxes*2
+        label.delete(array.shift(londonLabels))
+
+if inLondon and showSessionZones and showLondonZone and not na(londonBox)
+    londonHigh:=math.max(nz(londonHigh,high),high)
+    londonLow:=math.min(nz(londonLow,low),low)
+    int midX=int(math.round((londonStart+bar_index)*0.5))
+    box.set_right(londonBox,bar_index)
+    box.set_top(londonBox,londonHigh)
+    box.set_bottom(londonBox,londonLow)
+    if showSessionMidline and not na(londonMid)
+        float midPrice=(londonHigh+londonLow)*0.5
+        line.set_xy1(londonMid,londonStart,midPrice)
+        line.set_xy2(londonMid,bar_index,midPrice)
+    if showSessionHighLowLabels
+        if not na(londonHighLabel)
+            label.set_xy(londonHighLabel,midX,londonHigh)
+        if not na(londonLowLabel)
+            label.set_xy(londonLowLabel,midX,londonLow)
+
+if endLondon and sessionHistory==0
+    if not na(londonBox)
+        box.delete(londonBox)
+    if not na(londonMid)
+        line.delete(londonMid)
+    if not na(londonHighLabel)
+        label.delete(londonHighLabel)
+    if not na(londonLowLabel)
+        label.delete(londonLowLabel)
+    londonBox:=na
+    londonMid:=na
+    londonHighLabel:=na
+    londonLowLabel:=na
+
+if newNewYork and showSessionZones and showNewYorkZone
+    newYorkHigh:=high
+    newYorkLow:=low
+    newYorkStart:=bar_index
+    string nyText=showSessionName?"NEW YORK":""
+    newYorkBox:=box.new(bar_index,newYorkHigh,bar_index,newYorkLow,xloc=xloc.bar_index,extend=extend.none,border_color=color.new(cNewYork,sessionBorderOpacity),bgcolor=color.new(cNewYork,sessionZoneOpacity),text=nyText,text_color=color.new(color.white,15),text_size=size.tiny)
+    array.push(newYorkBoxes,newYorkBox)
+    if showSessionMidline
+        newYorkMid:=line.new(bar_index,(newYorkHigh+newYorkLow)*0.5,bar_index,(newYorkHigh+newYorkLow)*0.5,xloc=xloc.bar_index,extend=extend.none,color=color.new(cNewYork,55),style=line.style_dotted)
+        array.push(newYorkMids,newYorkMid)
+    if showSessionHighLowLabels
+        newYorkHighLabel:=label.new(bar_index,newYorkHigh,"NEW YORK HIGH",xloc=xloc.bar_index,style=label.style_none,textcolor=color.new(color.white,5),size=size.tiny)
+        newYorkLowLabel:=label.new(bar_index,newYorkLow,"NEW YORK LOW",xloc=xloc.bar_index,style=label.style_none,textcolor=color.new(color.white,5),size=size.tiny)
+        array.push(newYorkLabels,newYorkHighLabel)
+        array.push(newYorkLabels,newYorkLowLabel)
+    int maxNewYorkBoxes=sessionHistory+1
+    while array.size(newYorkBoxes)>maxNewYorkBoxes
+        box.delete(array.shift(newYorkBoxes))
+    while array.size(newYorkMids)>maxNewYorkBoxes
+        line.delete(array.shift(newYorkMids))
+    while array.size(newYorkLabels)>maxNewYorkBoxes*2
+        label.delete(array.shift(newYorkLabels))
+
+if inNewYork and showSessionZones and showNewYorkZone and not na(newYorkBox)
+    newYorkHigh:=math.max(nz(newYorkHigh,high),high)
+    newYorkLow:=math.min(nz(newYorkLow,low),low)
+    int midX=int(math.round((newYorkStart+bar_index)*0.5))
+    box.set_right(newYorkBox,bar_index)
+    box.set_top(newYorkBox,newYorkHigh)
+    box.set_bottom(newYorkBox,newYorkLow)
+    if showSessionMidline and not na(newYorkMid)
+        float midPrice=(newYorkHigh+newYorkLow)*0.5
+        line.set_xy1(newYorkMid,newYorkStart,midPrice)
+        line.set_xy2(newYorkMid,bar_index,midPrice)
+    if showSessionHighLowLabels
+        if not na(newYorkHighLabel)
+            label.set_xy(newYorkHighLabel,midX,newYorkHigh)
+        if not na(newYorkLowLabel)
+            label.set_xy(newYorkLowLabel,midX,newYorkLow)
+
+if endNewYork and sessionHistory==0
+    if not na(newYorkBox)
+        box.delete(newYorkBox)
+    if not na(newYorkMid)
+        line.delete(newYorkMid)
+    if not na(newYorkHighLabel)
+        label.delete(newYorkHighLabel)
+    if not na(newYorkLowLabel)
+        label.delete(newYorkLowLabel)
+    newYorkBox:=na
+    newYorkMid:=na
+    newYorkHighLabel:=na
+    newYorkLowLabel:=na
 
 //------------------------------------------------------------------------------
 // P01 participation
@@ -272,6 +490,7 @@ plot(showVwap and not valueReset?valueRef:na,"Primary VWAP",color=cVwap,linewidt
 
 //------------------------------------------------------------------------------
 // P03/P04 shared volume-profile grid
+// POC/VAH/VAL are calculated and consumed internally, but not plotted.
 //------------------------------------------------------------------------------
 var array<float> profileHighs=array.new_float()
 var array<float> profileLows=array.new_float()
@@ -293,7 +512,9 @@ if profileActive and not na(volume)
     array.push(profileLows,low)
     array.push(profileVolumes,volume)
     if array.size(profileVolumes)>maxProfileBars
-        array.shift(profileHighs),array.shift(profileLows),array.shift(profileVolumes)
+        array.shift(profileHighs)
+        array.shift(profileLows)
+        array.shift(profileVolumes)
 int storedBars=array.size(profileVolumes)
 float profileHigh=na
 float profileLow=na
@@ -408,12 +629,6 @@ float vaMid=not na(vahPrice) and not na(valPrice)?(vahPrice+valPrice)*0.5:na
 float vaHalf=not na(vahPrice) and not na(valPrice)?math.max((vahPrice-valPrice)*0.5,syminfo.mintick):na
 float p04=not na(vaMid) and not na(vaHalf)?f_clamp((close-vaMid)/vaHalf*65.0,-100.0,100.0):0.0
 bool a04=not na(vahPrice) and not na(valPrice)
-float pocPlot=profileReset or not profileVisualActive?na:pocPrice
-float vahPlot=profileReset or not profileVisualActive?na:vahPrice
-float valPlot=profileReset or not profileVisualActive?na:valPrice
-plot(showValueLevels?pocPlot:na,"POC",color=cPoc,linewidth=lineWidth,style=plot.style_linebr)
-plot(showValueLevels?vahPlot:na,"VAH",color=cVa,linewidth=1,style=plot.style_linebr)
-plot(showValueLevels?valPlot:na,"VAL",color=cVa,linewidth=1,style=plot.style_linebr)
 plot(showNodes and not profileReset and profileVisualActive?strongestHvnPrice:na,"HVN",color=cHvn,linewidth=1,style=plot.style_linebr)
 plot(showNodes and not profileReset and profileVisualActive?strongestLvnPrice:na,"LVN",color=cLvn,linewidth=1,style=plot.style_linebr)
 if barstate.islast
@@ -472,10 +687,14 @@ float priorStructHigh=ta.highest(high[2],structureLookback)
 float priorStructLow=ta.lowest(low[2],structureLookback)
 bool bullOb=detectOb and close>open and displacementOk and close>priorStructHigh and close[1]<open[1]
 bool bearOb=detectOb and close<open and displacementOk and close<priorStructLow and close[1]>open[1]
-float p01Bull=math.max(p01,0.0), p01Bear=math.max(-p01,0.0)
-float p02Bull=math.max(p02,0.0), p02Bear=math.max(-p02,0.0)
-float p03Bull=math.max(p03,0.0), p03Bear=math.max(-p03,0.0)
-float p04Bull=math.max(p04,0.0), p04Bear=math.max(-p04,0.0)
+float p01Bull=math.max(p01,0.0)
+float p01Bear=math.max(-p01,0.0)
+float p02Bull=math.max(p02,0.0)
+float p02Bear=math.max(-p02,0.0)
+float p03Bull=math.max(p03,0.0)
+float p03Bear=math.max(-p03,0.0)
+float p04Bull=math.max(p04,0.0)
+float p04Bear=math.max(-p04,0.0)
 for pass=0 to 3
     bool candidate=pass==0?bullFvg:pass==1?bearFvg:pass==2?bullOb:bearOb
     if candidate
@@ -501,8 +720,32 @@ for pass=0 to 3
                 box old=array.shift(zBox)
                 if not na(old)
                     box.delete(old)
-                array.shift(zDir),array.shift(zType),array.shift(zState),array.shift(zTop),array.shift(zBottom),array.shift(zBaseScore),array.shift(zScore),array.shift(zMitigation),array.shift(zBorn),array.shift(zRetests),array.shift(zTouched),array.shift(zArmedBar),array.shift(zPendingDir)
-            array.push(zDir,dir),array.push(zType,typ),array.push(zState,"FRESH"),array.push(zTop,top),array.push(zBottom,bottom),array.push(zBaseScore,score),array.push(zScore,score),array.push(zMitigation,0.0),array.push(zBorn,bar_index),array.push(zRetests,0),array.push(zTouched,false),array.push(zArmedBar,na),array.push(zPendingDir,0)
+                array.shift(zDir)
+                array.shift(zType)
+                array.shift(zState)
+                array.shift(zTop)
+                array.shift(zBottom)
+                array.shift(zBaseScore)
+                array.shift(zScore)
+                array.shift(zMitigation)
+                array.shift(zBorn)
+                array.shift(zRetests)
+                array.shift(zTouched)
+                array.shift(zArmedBar)
+                array.shift(zPendingDir)
+            array.push(zDir,dir)
+            array.push(zType,typ)
+            array.push(zState,"FRESH")
+            array.push(zTop,top)
+            array.push(zBottom,bottom)
+            array.push(zBaseScore,score)
+            array.push(zScore,score)
+            array.push(zMitigation,0.0)
+            array.push(zBorn,bar_index)
+            array.push(zRetests,0)
+            array.push(zTouched,false)
+            array.push(zArmedBar,na)
+            array.push(zPendingDir,0)
             box nb=na
             if showZones
                 color zc=dir==1?cBull:cBear
@@ -549,7 +792,9 @@ while zi>=0
             armed:=bar_index
             pending:=-dir
             st:="ARMED"
-            array.set(zArmedBar,zi,armed),array.set(zPendingDir,zi,pending),array.set(zState,zi,st)
+            array.set(zArmedBar,zi,armed)
+            array.set(zPendingDir,zi,pending)
+            array.set(zState,zi,st)
         else
             st:="INVALIDATED"
             array.set(zState,zi,st)
@@ -563,7 +808,16 @@ while zi>=0
                 typ:=array.get(zType,zi)=="FVG"?"IFVG":"BREAKER"
                 dir:=pending
                 st:="FRESH"
-                array.set(zType,zi,typ),array.set(zDir,zi,dir),array.set(zState,zi,st),array.set(zBaseScore,zi,invScore),array.set(zScore,zi,invScore),array.set(zMitigation,zi,0.0),array.set(zBorn,zi,bar_index),array.set(zRetests,zi,0),array.set(zArmedBar,zi,na),array.set(zPendingDir,zi,0)
+                array.set(zType,zi,typ)
+                array.set(zDir,zi,dir)
+                array.set(zState,zi,st)
+                array.set(zBaseScore,zi,invScore)
+                array.set(zScore,zi,invScore)
+                array.set(zMitigation,zi,0.0)
+                array.set(zBorn,zi,bar_index)
+                array.set(zRetests,zi,0)
+                array.set(zArmedBar,zi,na)
+                array.set(zPendingDir,zi,0)
                 born:=bar_index
                 age:=0
                 mit:=0.0
@@ -583,7 +837,20 @@ while zi>=0
         if not na(zb)
             box.set_right(zb,bar_index)
             box.delete(zb)
-        array.remove(zDir,zi),array.remove(zType,zi),array.remove(zState,zi),array.remove(zTop,zi),array.remove(zBottom,zi),array.remove(zBaseScore,zi),array.remove(zScore,zi),array.remove(zMitigation,zi),array.remove(zBorn,zi),array.remove(zRetests,zi),array.remove(zTouched,zi),array.remove(zArmedBar,zi),array.remove(zPendingDir,zi),array.remove(zBox,zi)
+        array.remove(zDir,zi)
+        array.remove(zType,zi)
+        array.remove(zState,zi)
+        array.remove(zTop,zi)
+        array.remove(zBottom,zi)
+        array.remove(zBaseScore,zi)
+        array.remove(zScore,zi)
+        array.remove(zMitigation,zi)
+        array.remove(zBorn,zi)
+        array.remove(zRetests,zi)
+        array.remove(zTouched,zi)
+        array.remove(zArmedBar,zi)
+        array.remove(zPendingDir,zi)
+        array.remove(zBox,zi)
     else
         if showZones
             color zc=dir==1?cBull:cBear
@@ -646,6 +913,11 @@ if not na(pl)
                 array.push(divLines,ln)
                 while array.size(divLines)>maxDivergenceObjects
                     line.delete(array.shift(divLines))
+                if presetDiagnostic
+                    label lb=label.new(pb,pl,(reg?"REG BULL ":"HID BULL ")+str.tostring(divBull,"#.0"),xloc=xloc.bar_index,style=label.style_label_up,textcolor=color.white,color=color.new(cBull,65),size=size.tiny)
+                    array.push(divLabels,lb)
+                    while array.size(divLabels)>maxDivergenceObjects
+                        label.delete(array.shift(divLabels))
     prevPL:=pl
     prevPLOsc:=on
     prevPLBar:=pb
@@ -664,6 +936,11 @@ if not na(ph)
                 array.push(divLines,ln)
                 while array.size(divLines)>maxDivergenceObjects
                     line.delete(array.shift(divLines))
+                if presetDiagnostic
+                    label lb=label.new(pb,ph,(reg?"REG BEAR ":"HID BEAR ")+str.tostring(divBear,"#.0"),xloc=xloc.bar_index,style=label.style_label_down,textcolor=color.white,color=color.new(cBear,65),size=size.tiny)
+                    array.push(divLabels,lb)
+                    while array.size(divLabels)>maxDivergenceObjects
+                        label.delete(array.shift(divLabels))
     prevPH:=ph
     prevPHOsc:=on
     prevPHBar:=pb
@@ -731,37 +1008,52 @@ color bgBias=state=="CONFLUENCE_STRONGLY_BULLISH"?color.new(cBull,94):state=="CO
 bgcolor(showBiasBackground?bgBias:na)
 
 //------------------------------------------------------------------------------
-// Production status / diagnostics
+// Production status panel — restored full information set
 //------------------------------------------------------------------------------
 string statusPos=panelPosition=="Top Left"?position.top_left:panelPosition=="Bottom Right"?position.bottom_right:panelPosition=="Bottom Left"?position.bottom_left:position.top_right
-int statusRows=compactPanel?7:10
-var table status=table.new(statusPos,2,10,border_width=1,frame_width=1,bgcolor=color.new(color.black,18))
+var table status=table.new(statusPos,2,12,border_width=1,frame_width=1,bgcolor=color.new(color.black,18))
 if barstate.islast
-    table.clear(status,0,0,1,9)
+    table.clear(status,0,0,1,11)
     if showStatusPanel
         color sc=f_stateColor(state)
         table.cell(status,0,0,"PLUTUS",text_color=color.white,bgcolor=color.new(sc,62))
         table.cell(status,1,0,displayPreset,text_color=color.white,bgcolor=color.new(sc,62))
         table.cell(status,0,1,"Bias",text_color=color.silver)
         table.cell(status,1,1,finalDirection==1?"BULLISH":finalDirection==-1?"BEARISH":"NEUTRAL",text_color=sc)
-        table.cell(status,0,2,"Score / Conf",text_color=color.silver)
-        table.cell(status,1,2,str.tostring(confluenceScore,"#.1")+" / "+str.tostring(confidence,"#.0")+"%",text_color=color.white)
-        table.cell(status,0,3,"VWAP",text_color=color.silver)
-        table.cell(status,1,3,valueReference,text_color=cVwap)
-        table.cell(status,0,4,"Profile / POC",text_color=color.silver)
-        table.cell(status,1,4,profileScope+" / "+str.tostring(pocPrice,format.mintick),text_color=cPoc)
-        table.cell(status,0,5,"Zones",text_color=color.silver)
-        table.cell(status,1,5,str.tostring(array.size(zDir))+" · B "+bestBullType+" · S "+bestBearType,text_color=color.white)
-        table.cell(status,0,6,"Engines",text_color=color.silver)
-        table.cell(status,1,6,str.tostring(activeCount)+"A / "+str.tostring(reliableCount)+"R",text_color=color.white)
-        if not compactPanel
+        table.cell(status,0,2,"Score",text_color=color.silver)
+        table.cell(status,1,2,str.tostring(confluenceScore,"#.1"),text_color=confluenceScore>0?cBull:confluenceScore<0?cBear:color.white)
+        table.cell(status,0,3,"Confidence",text_color=color.silver)
+        table.cell(status,1,3,str.tostring(confidence,"#.0")+"%",text_color=color.white)
+        table.cell(status,0,4,"VWAP",text_color=color.silver)
+        table.cell(status,1,4,valueReference,text_color=cVwap)
+        table.cell(status,0,5,"Profile",text_color=color.silver)
+        table.cell(status,1,5,profileScope+" · "+str.tostring(storedBars)+" bars",text_color=color.white)
+        table.cell(status,0,6,"POC",text_color=color.silver)
+        table.cell(status,1,6,str.tostring(pocPrice,format.mintick),text_color=cPoc)
+        if compactPanel
+            table.cell(status,0,7,"VA",text_color=color.silver)
+            table.cell(status,1,7,str.tostring(vahPrice,format.mintick)+" / "+str.tostring(valPrice,format.mintick),text_color=cVa)
+            table.cell(status,0,8,"Zones",text_color=color.silver)
+            table.cell(status,1,8,str.tostring(array.size(zDir))+" · B "+bestBullType+" · S "+bestBearType,text_color=color.white)
+            table.cell(status,0,9,"Engines",text_color=color.silver)
+            table.cell(status,1,9,str.tostring(activeCount)+"A / "+str.tostring(reliableCount)+"R",text_color=color.white)
+            table.cell(status,0,10,"Sessions",text_color=color.silver)
+            table.cell(status,1,10,(inAsia?"ASIA ":"")+(inLondon?"LONDON ":"")+(inNewYork?"NY":""),text_color=color.white)
+        else
             table.cell(status,0,7,"VAH / VAL",text_color=color.silver)
             table.cell(status,1,7,str.tostring(vahPrice,format.mintick)+" / "+str.tostring(valPrice,format.mintick),text_color=cVa)
-            table.cell(status,0,8,"Best Bull",text_color=color.silver)
+            table.cell(status,0,8,"Best Bull Zone",text_color=color.silver)
             table.cell(status,1,8,bestBullType+" "+str.tostring(bestBullScore,"#.0"),text_color=bestBullScore>0?cBull:color.gray)
-            table.cell(status,0,9,"Best Bear",text_color=color.silver)
+            table.cell(status,0,9,"Best Bear Zone",text_color=color.silver)
             table.cell(status,1,9,bestBearType+" "+str.tostring(bestBearScore,"#.0"),text_color=bestBearScore>0?cBear:color.gray)
+            table.cell(status,0,10,"Zones / Engines",text_color=color.silver)
+            table.cell(status,1,10,str.tostring(array.size(zDir))+" Z · "+str.tostring(activeCount)+"A/"+str.tostring(reliableCount)+"R",text_color=color.white)
+            table.cell(status,0,11,"Active Session",text_color=color.silver)
+            table.cell(status,1,11,inNewYork?"NEW YORK":inLondon?"LONDON":inAsia?"ASIA":"NONE",text_color=color.white)
 
+//------------------------------------------------------------------------------
+// Diagnostics
+//------------------------------------------------------------------------------
 var table diag=table.new(position.bottom_right,4,12,border_width=1,frame_width=1,bgcolor=color.new(color.black,15))
 if barstate.islast
     table.clear(diag,0,0,3,11)
@@ -796,7 +1088,7 @@ if barstate.islast
         table.cell(diag,1,10,str.tostring(array.size(divLines))+" DIV",text_color=color.white)
         table.cell(diag,2,10,str.tostring(array.size(transitionLabels))+" TR",text_color=color.white)
         table.cell(diag,3,10,str.tostring(array.size(zDir))+" Z",text_color=color.white)
-        table.cell(diag,0,11,"Signals",text_color=color.silver)
-        table.cell(diag,1,11,"DISABLED",text_color=color.orange)
-        table.cell(diag,2,11,"Phase",text_color=color.silver)
-        table.cell(diag,3,11,"P08.2",text_color=color.white)
+        table.cell(diag,0,11,"Sessions",text_color=color.silver)
+        table.cell(diag,1,11,str.tostring(array.size(asiaBoxes))+" A",text_color=color.white)
+        table.cell(diag,2,11,str.tostring(array.size(londonBoxes))+" L",text_color=color.white)
+        table.cell(diag,3,11,str.tostring(array.size(newYorkBoxes))+" NY",text_color=color.white)
