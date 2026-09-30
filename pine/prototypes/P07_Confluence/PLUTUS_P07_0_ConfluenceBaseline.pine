@@ -35,6 +35,9 @@ showBiasLabel = input.bool(false, "Show Current Bias Label", group=groupDisplay)
 
 f_clamp(float x, float lo, float hi) => math.max(lo, math.min(hi, x))
 f_norm(float x, float full) => full > 0 ? f_clamp(x / full * 100.0, -100.0, 100.0) : 0.0
+f_rollsum(float src, int len) =>
+    float avg = ta.sma(src, len)
+    not na(avg) ? avg * len : na
 
 float atr = ta.atr(atrLen)
 float candleRange = math.max(high - low, syminfo.mintick)
@@ -62,9 +65,9 @@ float p02 = not na(vwapDistAtr) ? f_norm(vwapDistAtr, 1.5) : 0.0
 // Uses rolling VWAP-like volume-weighted mean as compact profile centre and
 // rolling high/low for normalized auction location.
 //------------------------------------------------------------------------------
-float pv = ta.sum(hlc3 * volume, profileLen)
-float vv = ta.sum(volume, profileLen)
-float profileCenter = vv > 0 ? pv / vv : na
+float pv = f_rollsum(hlc3 * volume, profileLen)
+float vv = f_rollsum(volume, profileLen)
+float profileCenter = not na(vv) and vv > 0 ? pv / vv : na
 float rangeHigh = ta.highest(high, profileLen)
 float rangeLow = ta.lowest(low, profileLen)
 float profileHalf = math.max((rangeHigh - rangeLow) * 0.5, syminfo.mintick)
