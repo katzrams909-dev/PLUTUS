@@ -51,7 +51,13 @@ groupSessions = "Session Zones"
 showSessionZonesInput = input.bool(true, "Show Session Zones", group=groupSessions)
 showAsiaZone = input.bool(true, "Asia Zone", group=groupSessions)
 showLondonZone = input.bool(true, "London Zone", group=groupSessions)
-showNewYorkZone = input.bool(false, "New York Zone", group=groupSessions)
+showNewYorkZone = input.bool(true, "New York Zone", group=groupSessions)
+newYorkBoxMode = input.string("AM + PM", "New York Box Mode", options=["AM + PM", "Full Session"], group=groupSessions)
+nyBoxTimezoneInput = input.string("America/New_York", "New York Box Timezone", options=["America/New_York", "Exchange", "UTC-2", "UTC-1", "UTC+0", "UTC+1", "UTC+2"], group=groupSessions)
+string nyBoxTz = nyBoxTimezoneInput == "Exchange" ? syminfo.timezone : nyBoxTimezoneInput
+nyFullSessionInput = input.session("0930-1600", "NY Full Session", group=groupSessions)
+nyAmSessionInput = input.session("0930-1200", "NY AM Session", group=groupSessions)
+nyPmSessionInput = input.session("1300-1600", "NY PM Session", group=groupSessions)
 sessionHistory = input.int(2, "Completed Sessions To Keep Per Market", minval=0, maxval=10, group=groupSessions)
 showSessionHighLowLabels = input.bool(true, "Show Session High / Low Labels", group=groupSessions)
 showSessionName = input.bool(false, "Show Session Name In Box", group=groupSessions)
@@ -218,6 +224,22 @@ bool newNewYork=inNewYork and not inNewYork[1]
 bool endAsia=not inAsia and inAsia[1]
 bool endLondon=not inLondon and inLondon[1]
 bool endNewYork=not inNewYork and inNewYork[1]
+
+// Visual New York box sessions are independent from the P02 Active Session VWAP.
+bool inNyFullBox=not na(time(timeframe.period,nyFullSessionInput,nyBoxTz))
+bool inNyAmBox=not na(time(timeframe.period,nyAmSessionInput,nyBoxTz))
+bool inNyPmBox=not na(time(timeframe.period,nyPmSessionInput,nyBoxTz))
+bool newNyFullBox=inNyFullBox and not inNyFullBox[1]
+bool newNyAmBox=inNyAmBox and not inNyAmBox[1]
+bool newNyPmBox=inNyPmBox and not inNyPmBox[1]
+bool endNyFullBox=not inNyFullBox and inNyFullBox[1]
+bool endNyAmBox=not inNyAmBox and inNyAmBox[1]
+bool endNyPmBox=not inNyPmBox and inNyPmBox[1]
+bool inNyVisual=newYorkBoxMode=="Full Session"?inNyFullBox:(inNyAmBox or inNyPmBox)
+bool newNyVisual=newYorkBoxMode=="Full Session"?newNyFullBox:(newNyAmBox or newNyPmBox)
+bool endNyVisual=newYorkBoxMode=="Full Session"?endNyFullBox:(endNyAmBox or endNyPmBox)
+string nyVisualName=newYorkBoxMode=="Full Session"?"NEW YORK":inNyAmBox?"NY AM":inNyPmBox?"NY PM":"NEW YORK"
+
 int localDay=dayofmonth(time,sessionTz)
 int localWeek=weekofyear(time,sessionTz)
 int localMonth=month(time,sessionTz)
@@ -252,6 +274,7 @@ var float newYorkLow=na
 var int asiaStart=na
 var int londonStart=na
 var int newYorkStart=na
+var string activeNyBoxName="NEW YORK"
 var array<box> asiaBoxes=array.new_box()
 var array<box> londonBoxes=array.new_box()
 var array<box> newYorkBoxes=array.new_box()
@@ -370,22 +393,23 @@ if endLondon and sessionHistory==0
     londonHighLabel:=na
     londonLowLabel:=na
 
-if newNewYork and showSessionZones and showNewYorkZone
+if newNyVisual and showSessionZones and showNewYorkZone
     newYorkHigh:=high
     newYorkLow:=low
     newYorkStart:=bar_index
-    string nyText=showSessionName?"NEW YORK":""
+    activeNyBoxName:=nyVisualName
+    string nyText=showSessionName?activeNyBoxName:""
     newYorkBox:=box.new(bar_index,newYorkHigh,bar_index,newYorkLow,xloc=xloc.bar_index,extend=extend.none,border_color=color.new(cNewYork,sessionBorderOpacity),bgcolor=color.new(cNewYork,sessionZoneOpacity),text=nyText,text_color=color.new(color.white,15),text_size=size.tiny)
     array.push(newYorkBoxes,newYorkBox)
     if showSessionMidline
         newYorkMid:=line.new(bar_index,(newYorkHigh+newYorkLow)*0.5,bar_index,(newYorkHigh+newYorkLow)*0.5,xloc=xloc.bar_index,extend=extend.none,color=color.new(cNewYork,55),style=line.style_dotted)
         array.push(newYorkMids,newYorkMid)
     if showSessionHighLowLabels
-        newYorkHighLabel:=label.new(bar_index,newYorkHigh,"NEW YORK HIGH",xloc=xloc.bar_index,style=label.style_none,textcolor=color.new(color.white,5),size=size.tiny)
-        newYorkLowLabel:=label.new(bar_index,newYorkLow,"NEW YORK LOW",xloc=xloc.bar_index,style=label.style_none,textcolor=color.new(color.white,5),size=size.tiny)
+        newYorkHighLabel:=label.new(bar_index,newYorkHigh,activeNyBoxName+" HIGH",xloc=xloc.bar_index,style=label.style_none,textcolor=color.new(color.white,5),size=size.tiny)
+        newYorkLowLabel:=label.new(bar_index,newYorkLow,activeNyBoxName+" LOW",xloc=xloc.bar_index,style=label.style_none,textcolor=color.new(color.white,5),size=size.tiny)
         array.push(newYorkLabels,newYorkHighLabel)
         array.push(newYorkLabels,newYorkLowLabel)
-    int maxNewYorkBoxes=sessionHistory+1
+    int maxNewYorkBoxes=newYorkBoxMode=="AM + PM"?(sessionHistory+1)*2:sessionHistory+1
     while array.size(newYorkBoxes)>maxNewYorkBoxes
         box.delete(array.shift(newYorkBoxes))
     while array.size(newYorkMids)>maxNewYorkBoxes
@@ -393,7 +417,7 @@ if newNewYork and showSessionZones and showNewYorkZone
     while array.size(newYorkLabels)>maxNewYorkBoxes*2
         label.delete(array.shift(newYorkLabels))
 
-if inNewYork and showSessionZones and showNewYorkZone and not na(newYorkBox)
+if inNyVisual and showSessionZones and showNewYorkZone and not na(newYorkBox)
     newYorkHigh:=math.max(nz(newYorkHigh,high),high)
     newYorkLow:=math.min(nz(newYorkLow,low),low)
     int midX=int(math.round((newYorkStart+bar_index)*0.5))
@@ -410,7 +434,7 @@ if inNewYork and showSessionZones and showNewYorkZone and not na(newYorkBox)
         if not na(newYorkLowLabel)
             label.set_xy(newYorkLowLabel,midX,newYorkLow)
 
-if endNewYork and sessionHistory==0
+if endNyVisual and sessionHistory==0
     if not na(newYorkBox)
         box.delete(newYorkBox)
     if not na(newYorkMid)
@@ -1038,7 +1062,7 @@ if barstate.islast
             table.cell(status,0,9,"Engines",text_color=color.silver)
             table.cell(status,1,9,str.tostring(activeCount)+"A / "+str.tostring(reliableCount)+"R",text_color=color.white)
             table.cell(status,0,10,"Sessions",text_color=color.silver)
-            table.cell(status,1,10,(inAsia?"ASIA ":"")+(inLondon?"LONDON ":"")+(inNewYork?"NY":""),text_color=color.white)
+            table.cell(status,1,10,(inAsia?"ASIA ":"")+(inLondon?"LONDON ":"")+(inNyVisual?nyVisualName:""),text_color=color.white)
         else
             table.cell(status,0,7,"VAH / VAL",text_color=color.silver)
             table.cell(status,1,7,str.tostring(vahPrice,format.mintick)+" / "+str.tostring(valPrice,format.mintick),text_color=cVa)
@@ -1049,7 +1073,7 @@ if barstate.islast
             table.cell(status,0,10,"Zones / Engines",text_color=color.silver)
             table.cell(status,1,10,str.tostring(array.size(zDir))+" Z · "+str.tostring(activeCount)+"A/"+str.tostring(reliableCount)+"R",text_color=color.white)
             table.cell(status,0,11,"Active Session",text_color=color.silver)
-            table.cell(status,1,11,inNewYork?"NEW YORK":inLondon?"LONDON":inAsia?"ASIA":"NONE",text_color=color.white)
+            table.cell(status,1,11,inNyVisual?nyVisualName:inLondon?"LONDON":inAsia?"ASIA":"NONE",text_color=color.white)
 
 //------------------------------------------------------------------------------
 // Diagnostics
