@@ -1,0 +1,346 @@
+//@version=6
+indicator("PLUTUS P09.0 — Signal Architecture", shorttitle="PLUTUS P09.0", overlay=true, max_boxes_count=120, max_labels_count=160, max_lines_count=80)
+
+// P09.0 validates the signal state machine.
+// Trigger model: qualified FVG touch -> ARMED -> confirmed-bar validation -> CONFIRMED.
+// This is still a prototype. Final P10 integration will consume the exact upstream PLUTUS engines.
+
+//------------------------------------------------------------------------------
+// Groups / inputs
+//------------------------------------------------------------------------------
+groupFvg = "FVG Trigger"
+atrLen = input.int(14, "ATR Length", minval=1, group=groupFvg)
+volumeLen = input.int(20, "Volume Baseline", minval=2, group=groupFvg)
+minFvgAtr = input.float(0.10, "Minimum FVG Width / ATR", minval=0.0, step=0.01, group=groupFvg)
+minFvgTicks = input.int(3, "Minimum FVG Width (Ticks)", minval=1, group=groupFvg)
+minDispAtr = input.float(0.50, "Minimum Displacement Body / ATR", minval=0.05, step=0.05, group=groupFvg)
+minEfficiency = input.float(0.55, "Minimum Displacement Body / Range", minval=0.10, maxval=1.0, step=0.05, group=groupFvg)
+minRvol = input.float(1.00, "Minimum Trigger RVOL", minval=0.0, step=0.10, group=groupFvg)
+minZoneScore = input.float(55.0, "Minimum FVG Quality", minval=0, maxval=100, step=5, group=groupFvg)
+maxZoneAge = input.int(150, "Maximum FVG Age", minval=5, maxval=1000, group=groupFvg)
+
+// P09.0 uses compact local evidence solely to validate signal mechanics.
+groupContext = "Context / Confluence Gate"
+minConfluence = input.float(20.0, "Minimum Directional Confluence", minval=0, maxval=100, step=5, group=groupContext)
+minConfidence = input.float(40.0, "Minimum Confidence", minval=0, maxval=100, step=5, group=groupContext)
+requireVwapSide = input.bool(false, "Require Close On Correct Side Of Daily VWAP", group=groupContext)
+participationWeight = input.float(40.0, "Participation Weight", minval=0, maxval=100, group=groupContext)
+vwapWeight = input.float(30.0, "VWAP Weight", minval=0, maxval=100, group=groupContext)
+valueWeight = input.float(30.0, "Value / Auction Weight", minval=0, maxval=100, group=groupContext)
+
+// Signal state controls.
+groupSignal = "Signal State Machine"
+confirmationMode = input.string("Directional Close", "Close Confirmation", options=["Directional Close", "Close Back Through Midpoint", "Any Valid Close"], group=groupSignal)
+minCloseLocation = input.float(0.55, "Minimum Directional Close Location", minval=0.0, maxval=1.0, step=0.05, group=groupSignal)
+armedExpiryBars = input.int(3, "Armed Setup Expiry", minval=1, maxval=20, group=groupSignal)
+cooldownBars = input.int(10, "Signal Cooldown Bars", minval=0, maxval=100, group=groupSignal)
+allowSameBarConfirmation = input.bool(true, "Allow Touch-Bar Close Confirmation", group=groupSignal)
+
+// Risk / reward preview is intentionally finite and diagnostic.
+groupRisk = "Risk / Reward Preview"
+showRiskReward = input.bool(true, "Show Confirmed Trade Preview", group=groupRisk)
+stopBufferAtr = input.float(0.10, "Stop Buffer / ATR", minval=0.0, step=0.05, group=groupRisk)
+targetR = input.float(2.0, "Target R Multiple", minval=0.5, step=0.25, group=groupRisk)
+riskRewardBars = input.int(25, "Preview Width (Bars)", minval=3, maxval=100, group=groupRisk)
+maxTradePreviews = input.int(8, "Maximum Trade Previews", minval=1, maxval=30, group=groupRisk)
+
+// Visuals / diagnostics.
+groupVisual = "Visuals"
+showFvgZones = input.bool(true, "Show Active Trigger FVGs", group=groupVisual)
+showStateLabel = input.bool(true, "Show Current State", group=groupVisual)
+showDiagnostics = input.bool(false, "Diagnostics Table", group=groupVisual)
+
+//------------------------------------------------------------------------------
+// Helpers
+//------------------------------------------------------------------------------
+f_clamp(float x, float lo, float hi) => math.max(lo, math.min(hi, x))
+
+f_closeLocation() =>
+    float rng = math.max(high - low, syminfo.mintick)
+    (close - low) / rng
+
+f_contextScore(float participation, float vwapScore, float valueScore) =>
+    float total = math.max(participationWeight + vwapWeight + valueWeight, 0.0001)
+    f_clamp((participation * participationWeight + vwapScore * vwapWeight + valueScore * valueWeight) / total, -100.0, 100.0)
+
+//------------------------------------------------------------------------------
+// Compact P01/P02/P04-style context for architecture validation
+//------------------------------------------------------------------------------
+float atr = ta.atr(atrLen)
+float rng = math.max(high - low, syminfo.mintick)
+float body = math.abs(close - open)
+float efficiency = body / rng
+float bodyAtr = not na(atr) and atr > 0 ? body / atr : 0.0
+float volBase = ta.sma(volume, volumeLen)
+float rvol = not na(volBase) and volBase > 0 ? volume / volBase : na
+int candleDir = close > open ? 1 : close < open ? -1 : 0
+float participation = candleDir * f_clamp((nz(rvol, 0.0) / 2.0) * 55.0 + efficiency * 45.0, 0.0, 100.0)
+
+bool newDay = ta.change(dayofmonth(time, syminfo.timezone)) != 0
+float dailyVwap = ta.vwap(hlc3, barstate.isfirst or newDay)
+float vwapScore = not na(dailyVwap) and not na(atr) and atr > 0 ? f_clamp((close - dailyVwap) / atr * 60.0, -100.0, 100.0) : 0.0
+
+float rollingValue = ta.sma(hlc3, 20)
+float valueScore = not na(rollingValue) and not na(atr) and atr > 0 ? f_clamp((close - rollingValue) / atr * 50.0 + candleDir * efficiency * 25.0, -100.0, 100.0) : 0.0
+float confluence = f_contextScore(participation, vwapScore, valueScore)
+
+int availableEvidence = (not na(rvol) ? 1 : 0) + (not na(dailyVwap) ? 1 : 0) + (not na(rollingValue) ? 1 : 0)
+float confidence = availableEvidence / 3.0 * 55.0 + f_clamp(math.abs(confluence), 0.0, 100.0) * 0.45
+
+//------------------------------------------------------------------------------
+// Qualified FVG candidates
+//------------------------------------------------------------------------------
+bool displacementOk = bodyAtr >= minDispAtr and efficiency >= minEfficiency and nz(rvol, 0.0) >= minRvol
+bool bullFvgRaw = low > high[2]
+bool bearFvgRaw = high < low[2]
+float bullWidth = bullFvgRaw ? low - high[2] : 0.0
+float bearWidth = bearFvgRaw ? low[2] - high : 0.0
+bool bullWidthOk = bullFvgRaw and bullWidth >= minFvgTicks * syminfo.mintick and (na(atr) or bullWidth >= minFvgAtr * atr)
+bool bearWidthOk = bearFvgRaw and bearWidth >= minFvgTicks * syminfo.mintick and (na(atr) or bearWidth >= minFvgAtr * atr)
+
+float mechanics = f_clamp(bodyAtr / math.max(minDispAtr * 2.0, 0.01) * 55.0 + efficiency * 45.0, 0.0, 100.0)
+float bullQuality = f_clamp(mechanics * 0.50 + math.max(participation, 0.0) * 0.30 + math.max(confluence, 0.0) * 0.20, 0.0, 100.0)
+float bearQuality = f_clamp(mechanics * 0.50 + math.max(-participation, 0.0) * 0.30 + math.max(-confluence, 0.0) * 0.20, 0.0, 100.0)
+bool newBullFvg = bullWidthOk and displacementOk and bullQuality >= minZoneScore
+bool newBearFvg = bearWidthOk and displacementOk and bearQuality >= minZoneScore
+
+// Track latest qualified FVG in each direction. The final integrated build will bind to P05 zone IDs.
+var float bullTop = na
+var float bullBottom = na
+var float bullScore = na
+var int bullBorn = na
+var bool bullValid = false
+var box bullBox = na
+
+var float bearTop = na
+var float bearBottom = na
+var float bearScore = na
+var int bearBorn = na
+var bool bearValid = false
+var box bearBox = na
+
+if newBullFvg
+    bullTop := low
+    bullBottom := high[2]
+    bullScore := bullQuality
+    bullBorn := bar_index
+    bullValid := true
+    if not na(bullBox)
+        box.delete(bullBox)
+    bullBox := showFvgZones ? box.new(bar_index, bullTop, bar_index, bullBottom, xloc=xloc.bar_index, extend=extend.none, border_color=color.new(color.lime, 20), bgcolor=color.new(color.lime, 88), text="BULL FVG", text_color=color.lime, text_size=size.tiny) : na
+
+if newBearFvg
+    bearTop := low[2]
+    bearBottom := high
+    bearScore := bearQuality
+    bearBorn := bar_index
+    bearValid := true
+    if not na(bearBox)
+        box.delete(bearBox)
+    bearBox := showFvgZones ? box.new(bar_index, bearTop, bar_index, bearBottom, xloc=xloc.bar_index, extend=extend.none, border_color=color.new(color.red, 20), bgcolor=color.new(color.red, 88), text="BEAR FVG", text_color=color.red, text_size=size.tiny) : na
+
+if bullValid
+    bool expired = bar_index - bullBorn > maxZoneAge
+    bool invalid = close < bullBottom
+    if expired or invalid
+        bullValid := false
+        if not na(bullBox)
+            box.set_right(bullBox, bar_index)
+            box.delete(bullBox)
+            bullBox := na
+    else if showFvgZones
+        if na(bullBox)
+            bullBox := box.new(bullBorn, bullTop, bar_index, bullBottom, xloc=xloc.bar_index, extend=extend.none, border_color=color.new(color.lime, 20), bgcolor=color.new(color.lime, 88), text="BULL FVG", text_color=color.lime, text_size=size.tiny)
+        else
+            box.set_right(bullBox, bar_index)
+else if not na(bullBox)
+    box.delete(bullBox)
+    bullBox := na
+
+if bearValid
+    bool expired = bar_index - bearBorn > maxZoneAge
+    bool invalid = close > bearTop
+    if expired or invalid
+        bearValid := false
+        if not na(bearBox)
+            box.set_right(bearBox, bar_index)
+            box.delete(bearBox)
+            bearBox := na
+    else if showFvgZones
+        if na(bearBox)
+            bearBox := box.new(bearBorn, bearTop, bar_index, bearBottom, xloc=xloc.bar_index, extend=extend.none, border_color=color.new(color.red, 20), bgcolor=color.new(color.red, 88), text="BEAR FVG", text_color=color.red, text_size=size.tiny)
+        else
+            box.set_right(bearBox, bar_index)
+else if not na(bearBox)
+    box.delete(bearBox)
+    bearBox := na
+
+//------------------------------------------------------------------------------
+// Signal state machine
+//------------------------------------------------------------------------------
+var string signalState = "IDLE"
+var int setupDir = 0
+var string triggerType = "NONE"
+var float setupTop = na
+var float setupBottom = na
+var float setupZoneScore = na
+var int setupBornBar = na
+var int armedBar = na
+var int lastConfirmedBar = na
+var float signalEntry = na
+var float signalStop = na
+var float signalTarget = na
+
+bool cooldownActive = not na(lastConfirmedBar) and bar_index - lastConfirmedBar <= cooldownBars
+bool bullContext = confluence >= minConfluence and confidence >= minConfidence and (not requireVwapSide or close >= dailyVwap)
+bool bearContext = confluence <= -minConfluence and confidence >= minConfidence and (not requireVwapSide or close <= dailyVwap)
+
+// Create a setup only when idle and context permits it.
+if signalState == "IDLE" and not cooldownActive
+    if bullValid and bullContext
+        signalState := "SETUP"
+        setupDir := 1
+        triggerType := "FVG"
+        setupTop := bullTop
+        setupBottom := bullBottom
+        setupZoneScore := bullScore
+        setupBornBar := bullBorn
+    else if bearValid and bearContext
+        signalState := "SETUP"
+        setupDir := -1
+        triggerType := "FVG"
+        setupTop := bearTop
+        setupBottom := bearBottom
+        setupZoneScore := bearScore
+        setupBornBar := bearBorn
+
+// Keep setup bound to a still-valid directional FVG.
+bool boundZoneValid = setupDir == 1 ? bullValid and bullBorn == setupBornBar : setupDir == -1 ? bearValid and bearBorn == setupBornBar : false
+if (signalState == "SETUP" or signalState == "ARMED") and not boundZoneValid
+    signalState := "INVALIDATED"
+
+bool touched = setupDir == 1 ? low <= setupTop and high >= setupBottom : setupDir == -1 ? high >= setupBottom and low <= setupTop : false
+
+if signalState == "SETUP" and touched and bar_index > setupBornBar
+    signalState := "ARMED"
+    armedBar := bar_index
+
+// Confirmation is evaluated on candle close. In realtime, touch can arm intrabar and close confirms.
+float closeLoc = f_closeLocation()
+float zoneMid = (setupTop + setupBottom) * 0.5
+bool directionalClose = setupDir == 1 ? close > open and closeLoc >= minCloseLocation : setupDir == -1 ? close < open and closeLoc <= 1.0 - minCloseLocation : false
+bool midpointClose = setupDir == 1 ? close >= zoneMid : setupDir == -1 ? close <= zoneMid : false
+bool anyValidClose = setupDir == 1 ? close >= setupBottom : setupDir == -1 ? close <= setupTop : false
+bool closeConfirmed = confirmationMode == "Directional Close" ? directionalClose : confirmationMode == "Close Back Through Midpoint" ? midpointClose : anyValidClose
+bool contextStillValid = setupDir == 1 ? bullContext : setupDir == -1 ? bearContext : false
+bool sameBarAllowed = allowSameBarConfirmation or na(armedBar) or bar_index > armedBar
+bool confirmNow = signalState == "ARMED" and sameBarAllowed and barstate.isconfirmed and closeConfirmed and contextStillValid and boundZoneValid
+
+// Explicit invalidation while armed.
+bool setupBroken = setupDir == 1 ? close < setupBottom : setupDir == -1 ? close > setupTop : false
+if signalState == "ARMED" and setupBroken
+    signalState := "INVALIDATED"
+
+if signalState == "ARMED" and not na(armedBar) and bar_index - armedBar > armedExpiryBars
+    signalState := "EXPIRED"
+
+bool longConfirmed = false
+bool shortConfirmed = false
+if confirmNow
+    signalState := "CONFIRMED"
+    signalEntry := close
+    float buffer = nz(atr, 0.0) * stopBufferAtr
+    signalStop := setupDir == 1 ? setupBottom - buffer : setupTop + buffer
+    float risk = math.abs(signalEntry - signalStop)
+    signalTarget := setupDir == 1 ? signalEntry + risk * targetR : signalEntry - risk * targetR
+    lastConfirmedBar := bar_index
+    longConfirmed := setupDir == 1
+    shortConfirmed := setupDir == -1
+
+//------------------------------------------------------------------------------
+// Confirmed trade preview objects
+//------------------------------------------------------------------------------
+var array<box> riskBoxes = array.new_box()
+var array<box> rewardBoxes = array.new_box()
+var array<label> signalLabels = array.new_label()
+
+if longConfirmed or shortConfirmed
+    color sigColor = longConfirmed ? color.lime : color.red
+    label lb = label.new(bar_index, close, longConfirmed ? "PLUTUS LONG" : "PLUTUS SHORT", xloc=xloc.bar_index, style=longConfirmed ? label.style_label_up : label.style_label_down, textcolor=color.white, color=color.new(sigColor, 15), size=size.small)
+    array.push(signalLabels, lb)
+    while array.size(signalLabels) > maxTradePreviews
+        label.delete(array.shift(signalLabels))
+    if showRiskReward and signalEntry != signalStop
+        int rightBar = bar_index + riskRewardBars
+        float riskTop = math.max(signalEntry, signalStop)
+        float riskBottom = math.min(signalEntry, signalStop)
+        float rewardTop = math.max(signalEntry, signalTarget)
+        float rewardBottom = math.min(signalEntry, signalTarget)
+        box rb = box.new(bar_index, riskTop, rightBar, riskBottom, xloc=xloc.bar_index, extend=extend.none, border_color=color.new(color.gray, 45), bgcolor=color.new(color.gray, 83))
+        box pb = box.new(bar_index, rewardTop, rightBar, rewardBottom, xloc=xloc.bar_index, extend=extend.none, border_color=color.new(color.green, 45), bgcolor=color.new(color.green, 82))
+        array.push(riskBoxes, rb)
+        array.push(rewardBoxes, pb)
+        while array.size(riskBoxes) > maxTradePreviews
+            box.delete(array.shift(riskBoxes))
+        while array.size(rewardBoxes) > maxTradePreviews
+            box.delete(array.shift(rewardBoxes))
+
+// CONFIRMED / INVALIDATED / EXPIRED are event states. Advance to cooldown/idle on next confirmed bar.
+if barstate.isconfirmed and signalState == "CONFIRMED" and not (longConfirmed or shortConfirmed)
+    signalState := cooldownActive ? "COOLDOWN" : "IDLE"
+if barstate.isconfirmed and (signalState == "INVALIDATED" or signalState == "EXPIRED")
+    signalState := "IDLE"
+    setupDir := 0
+    triggerType := "NONE"
+    setupTop := na
+    setupBottom := na
+    setupZoneScore := na
+    setupBornBar := na
+    armedBar := na
+if signalState == "COOLDOWN" and not cooldownActive
+    signalState := "IDLE"
+    setupDir := 0
+    triggerType := "NONE"
+    setupTop := na
+    setupBottom := na
+    setupZoneScore := na
+    setupBornBar := na
+    armedBar := na
+
+//------------------------------------------------------------------------------
+// State / diagnostic visuals
+//------------------------------------------------------------------------------
+var label stateLabel = na
+if barstate.islast and showStateLabel
+    if not na(stateLabel)
+        label.delete(stateLabel)
+    string stateText = signalState + (setupDir == 1 ? " · LONG" : setupDir == -1 ? " · SHORT" : "")
+    stateLabel := label.new(bar_index, high + nz(atr) * 0.35, stateText, xloc=xloc.bar_index, style=label.style_label_down, textcolor=color.white, color=color.new(signalState == "ARMED" ? color.orange : signalState == "CONFIRMED" ? color.lime : color.gray, 35), size=size.tiny)
+
+var table diag = table.new(position.bottom_right, 2, 10, border_width=1, frame_width=1, bgcolor=color.new(color.black, 15))
+if barstate.islast
+    table.clear(diag, 0, 0, 1, 9)
+    if showDiagnostics
+        table.cell(diag, 0, 0, "P09.0", text_color=color.white)
+        table.cell(diag, 1, 0, signalState, text_color=color.white)
+        table.cell(diag, 0, 1, "Direction", text_color=color.silver)
+        table.cell(diag, 1, 1, setupDir == 1 ? "LONG" : setupDir == -1 ? "SHORT" : "NONE", text_color=setupDir == 1 ? color.lime : setupDir == -1 ? color.red : color.gray)
+        table.cell(diag, 0, 2, "Trigger", text_color=color.silver)
+        table.cell(diag, 1, 2, triggerType, text_color=color.white)
+        table.cell(diag, 0, 3, "Confluence", text_color=color.silver)
+        table.cell(diag, 1, 3, str.tostring(confluence, "#.1"), text_color=confluence > 0 ? color.lime : confluence < 0 ? color.red : color.white)
+        table.cell(diag, 0, 4, "Confidence", text_color=color.silver)
+        table.cell(diag, 1, 4, str.tostring(confidence, "#.0") + "%", text_color=color.white)
+        table.cell(diag, 0, 5, "Zone score", text_color=color.silver)
+        table.cell(diag, 1, 5, str.tostring(setupZoneScore, "#.0"), text_color=color.white)
+        table.cell(diag, 0, 6, "Entry", text_color=color.silver)
+        table.cell(diag, 1, 6, str.tostring(signalEntry, format.mintick), text_color=color.white)
+        table.cell(diag, 0, 7, "Stop", text_color=color.silver)
+        table.cell(diag, 1, 7, str.tostring(signalStop, format.mintick), text_color=color.white)
+        table.cell(diag, 0, 8, "Target", text_color=color.silver)
+        table.cell(diag, 1, 8, str.tostring(signalTarget, format.mintick), text_color=color.white)
+        table.cell(diag, 0, 9, "Touch / Close", text_color=color.silver)
+        table.cell(diag, 1, 9, (touched ? "TOUCH " : "") + (closeConfirmed ? "VALID" : "WAIT"), text_color=color.white)
+
+alertcondition(longConfirmed, "PLUTUS P09.0 Long Confirmed", "PLUTUS P09.0 confirmed a bullish FVG-touch setup on candle close.")
+alertcondition(shortConfirmed, "PLUTUS P09.0 Short Confirmed", "PLUTUS P09.0 confirmed a bearish FVG-touch setup on candle close.")
