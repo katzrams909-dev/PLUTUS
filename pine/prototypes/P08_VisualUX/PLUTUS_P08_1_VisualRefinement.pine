@@ -1,0 +1,544 @@
+//@version=6
+indicator("PLUTUS P08.1 — Visual Refinement", shorttitle="PLUTUS P08.1", overlay=true, max_boxes_count=180, max_lines_count=180, max_labels_count=180)
+
+//==============================================================================
+// PLUTUS P08.1 — Visual Refinement / Production UX
+// Refines the validated P08.0 presentation layer without intentional scoring
+// changes. No entry signals.
+//==============================================================================
+
+//------------------------------------------------------------------------------
+// Display architecture
+//------------------------------------------------------------------------------
+groupDisplay = "Display Architecture"
+displayPreset = input.string("Balanced", "Display Preset", options=["Minimal", "Balanced", "Full", "Diagnostic"], group=groupDisplay)
+showStatusPanelInput = input.bool(true, "Status Panel", group=groupDisplay)
+showVwapInput = input.bool(true, "VWAP", group=groupDisplay)
+showProfileInput = input.bool(true, "Profile Centre / Value", group=groupDisplay)
+showHistogramInput = input.bool(false, "Volume Profile Histogram", group=groupDisplay)
+showZonesInput = input.bool(true, "Institutional Zones", group=groupDisplay)
+showDivergenceInput = input.bool(true, "Divergence", group=groupDisplay)
+showTransitionsInput = input.bool(true, "Material Transitions", group=groupDisplay)
+showBiasBackgroundInput = input.bool(false, "Bias Background", group=groupDisplay)
+showDiagnosticsInput = input.bool(false, "Detailed Diagnostics", group=groupDisplay)
+
+bool presetMinimal = displayPreset == "Minimal"
+bool presetBalanced = displayPreset == "Balanced"
+bool presetFull = displayPreset == "Full"
+bool presetDiagnostic = displayPreset == "Diagnostic"
+bool showStatusPanel = showStatusPanelInput
+bool showVwap = showVwapInput and not presetMinimal
+bool showProfile = showProfileInput and (presetBalanced or presetFull or presetDiagnostic)
+bool showHistogram = showHistogramInput and (presetFull or presetDiagnostic)
+bool showZones = showZonesInput and not presetMinimal
+bool showDivergence = showDivergenceInput and (presetFull or presetDiagnostic)
+bool showTransitions = showTransitionsInput and not presetMinimal
+bool showBiasBackground = showBiasBackgroundInput and (presetFull or presetDiagnostic)
+bool showDiagnostics = showDiagnosticsInput or presetDiagnostic
+
+groupVisual = "Visual Refinement"
+maxTransitionLabels = input.int(14, "Maximum Transition Labels", minval=3, maxval=60, group=groupVisual)
+maxDivergenceObjects = input.int(24, "Maximum Divergence Events", minval=4, maxval=60, group=groupVisual)
+transitionCooldown = input.int(5, "Transition Label Cooldown Bars", minval=0, maxval=50, group=groupVisual)
+histogramRows = input.int(40, "Histogram Rows", minval=16, maxval=80, step=8, group=groupVisual)
+histogramWidth = input.int(18, "Histogram Maximum Width", minval=5, maxval=60, group=groupVisual)
+histogramOffset = input.int(3, "Histogram Right Offset", minval=1, maxval=30, group=groupVisual)
+zoneOpacityFresh = input.int(84, "Fresh Zone Opacity", minval=50, maxval=98, group=groupVisual)
+zoneOpacityStale = input.int(93, "Stale Zone Opacity", minval=70, maxval=99, group=groupVisual)
+staleZoneFraction = input.float(0.60, "Zone Stale Age Fraction", minval=0.25, maxval=0.95, step=0.05, group=groupVisual)
+
+//------------------------------------------------------------------------------
+// P07.2 scoring inputs — unchanged compact model
+//------------------------------------------------------------------------------
+groupWeights = "Base Engine Weights"
+wP01 = input.float(20.0, "P01 Participation Weight", minval=0, maxval=100, step=1, group=groupWeights)
+wP02 = input.float(15.0, "P02 Fair Value Weight", minval=0, maxval=100, step=1, group=groupWeights)
+wP03 = input.float(15.0, "P03 Profile Weight", minval=0, maxval=100, step=1, group=groupWeights)
+wP04 = input.float(20.0, "P04 Value Analysis Weight", minval=0, maxval=100, step=1, group=groupWeights)
+wP05 = input.float(20.0, "P05 Institutional Zones Weight", minval=0, maxval=100, step=1, group=groupWeights)
+wP06 = input.float(10.0, "P06 Divergence Weight", minval=0, maxval=100, step=1, group=groupWeights)
+
+groupCore = "Core Inputs"
+atrLen = input.int(14, "ATR Length", minval=1, group=groupCore)
+volumeLen = input.int(20, "Volume Baseline Length", minval=2, group=groupCore)
+profileLen = input.int(80, "Profile Approximation Lookback", minval=20, maxval=300, group=groupCore)
+zoneLookback = input.int(20, "Institutional Zone Context Lookback", minval=5, maxval=200, group=groupCore)
+divPivot = input.int(3, "Divergence Pivot Strength", minval=1, maxval=10, group=groupCore)
+regimeLen = input.int(50, "Regime Lookback", minval=20, maxval=300, group=groupCore)
+
+groupQuality = "Quality / Reliability"
+activeThreshold = input.float(15.0, "Engine Active Threshold", minval=0, maxval=100, step=5, group=groupQuality)
+reliableThreshold = input.float(35.0, "Reliable Evidence Threshold", minval=0, maxval=100, step=5, group=groupQuality)
+minActiveEngines = input.int(3, "Minimum Active Engines", minval=1, maxval=6, group=groupQuality)
+minReliableEngines = input.int(2, "Minimum Reliable Engines", minval=1, maxval=6, group=groupQuality)
+weakConsensusPenalty = input.float(25.0, "Weak Consensus Confidence Penalty", minval=0, maxval=100, step=5, group=groupQuality)
+strongThreshold = input.float(60.0, "Strong Confluence Threshold", minval=20, maxval=100, step=5, group=groupQuality)
+conflictMin = input.float(30.0, "Conflict Side Minimum", minval=0, maxval=100, step=5, group=groupQuality)
+conflictMaxDiff = input.float(15.0, "Conflict Maximum Side Difference", minval=0, maxval=100, step=5, group=groupQuality)
+conflictPenalty = input.float(35.0, "Conflict Confidence Penalty", minval=0, maxval=100, step=5, group=groupQuality)
+hysteresisEnter = input.float(20.0, "Directional Entry Threshold", minval=0, maxval=100, step=5, group=groupQuality)
+hysteresisExit = input.float(10.0, "Directional Exit Threshold", minval=0, maxval=100, step=5, group=groupQuality)
+strongPersistenceBars = input.int(2, "Strong State Confirmation Bars", minval=1, maxval=20, group=groupQuality)
+transitionMinDelta = input.float(20.0, "Material Transition Score Delta", minval=1, maxval=100, step=1, group=groupQuality)
+
+groupRegime = "Regime Handling"
+trendAdxLen = input.int(14, "ADX Length", minval=2, maxval=50, group=groupRegime)
+trendAdxThreshold = input.float(22.0, "Trend ADX Threshold", minval=5, maxval=60, step=1, group=groupRegime)
+expansionAtrRatio = input.float(1.15, "Expansion ATR Ratio", minval=0.8, maxval=3.0, step=0.05, group=groupRegime)
+compressionAtrRatio = input.float(0.85, "Compression ATR Ratio", minval=0.2, maxval=1.2, step=0.05, group=groupRegime)
+
+//------------------------------------------------------------------------------
+// Helpers / palette
+//------------------------------------------------------------------------------
+f_clamp(float x, float lo, float hi) => math.max(lo, math.min(hi, x))
+f_norm(float x, float full) => full > 0 ? f_clamp(x / full * 100.0, -100.0, 100.0) : 0.0
+f_rollsum(float src, int len) =>
+    float avg = ta.sma(src, len)
+    not na(avg) ? avg * len : na
+f_rel(float score) =>
+    float a = math.abs(score)
+    a < activeThreshold ? 0.0 : f_clamp((a - activeThreshold) / math.max(100.0 - activeThreshold, 1.0), 0.0, 1.0)
+f_effWeight(float base, float regimeFactor, float reliability, bool available) =>
+    available ? base * regimeFactor * (0.50 + reliability * 0.50) : 0.0
+f_stateColor(string s) =>
+    s == "CONFLUENCE_STRONGLY_BULLISH" ? color.lime :
+     s == "CONFLUENCE_BULLISH" ? color.green :
+     s == "CONFLUENCE_STRONGLY_BEARISH" ? color.red :
+     s == "CONFLUENCE_BEARISH" ? color.maroon :
+     s == "CONFLUENCE_CONFLICT" ? color.orange :
+     s == "CONFLUENCE_LOW_CONFIDENCE" ? color.yellow : color.gray
+f_ageOpacity(int bornBar, int maxAge) =>
+    int age = na(bornBar) ? maxAge : math.max(0, bar_index - bornBar)
+    float frac = maxAge > 0 ? math.min(1.0, age / maxAge) : 1.0
+    int(math.round(zoneOpacityFresh + (zoneOpacityStale - zoneOpacityFresh) * frac))
+
+color cBull = color.lime
+color cBear = color.red
+color cVwap = color.aqua
+color cProfile = color.blue
+color cNeutral = color.gray
+
+//------------------------------------------------------------------------------
+// Core series / regime
+//------------------------------------------------------------------------------
+float atr = ta.atr(atrLen)
+float atrMean = ta.sma(atr, regimeLen)
+float atrRatio = not na(atr) and not na(atrMean) and atrMean > 0 ? atr / atrMean : na
+float candleRange = math.max(high - low, syminfo.mintick)
+float bodyEff = math.abs(close - open) / candleRange
+float volBase = ta.sma(volume, volumeLen)
+float rvol = not na(volume) and not na(volBase) and volBase > 0 ? volume / volBase : na
+[plusDI, minusDI, adx] = ta.dmi(trendAdxLen, trendAdxLen)
+bool trendRegime = not na(adx) and adx >= trendAdxThreshold
+bool expansionRegime = not na(atrRatio) and atrRatio >= expansionAtrRatio
+bool compressionRegime = not na(atrRatio) and atrRatio <= compressionAtrRatio
+string regime = trendRegime ? (expansionRegime ? "TREND_EXPANSION" : "TREND") : compressionRegime ? "COMPRESSION" : expansionRegime ? "EXPANSION" : "BALANCED"
+float rfP01 = expansionRegime ? 1.20 : compressionRegime ? 0.80 : 1.00
+float rfP02 = trendRegime ? 1.15 : compressionRegime ? 1.10 : 1.00
+float rfP03 = compressionRegime ? 1.20 : trendRegime ? 0.90 : 1.05
+float rfP04 = trendRegime ? 1.15 : compressionRegime ? 1.10 : 1.00
+float rfP05 = expansionRegime or trendRegime ? 1.15 : 1.00
+float rfP06 = trendRegime ? 0.85 : compressionRegime ? 1.20 : 1.05
+
+// P01
+float p01Magnitude = not na(rvol) ? f_clamp((rvol - 0.75) / 1.25 * 100.0, 0.0, 100.0) : 0.0
+int barDir = close > open ? 1 : close < open ? -1 : 0
+float p01 = barDir * f_clamp(p01Magnitude * 0.65 + bodyEff * 35.0, 0.0, 100.0)
+bool a01 = not na(rvol)
+
+// P02 + reset-safe VWAP
+bool newDay = ta.change(dayofmonth(time, syminfo.timezone)) != 0
+float dailyVwap = ta.vwap(hlc3, barstate.isfirst or newDay)
+float vwapDistAtr = not na(dailyVwap) and not na(atr) and atr > 0 ? (close - dailyVwap) / atr : na
+float p02 = not na(vwapDistAtr) ? f_norm(vwapDistAtr, 1.5) : 0.0
+bool a02 = not na(dailyVwap) and not na(atr)
+plot(showVwap and not newDay ? dailyVwap : na, "Daily VWAP", color=color.new(cVwap, 0), linewidth=presetFull or presetDiagnostic ? 2 : 1, style=plot.style_linebr)
+
+// P03 / P04
+float pv = f_rollsum(hlc3 * volume, profileLen)
+float vv = f_rollsum(volume, profileLen)
+float profileCenter = not na(vv) and vv > 0 ? pv / vv : na
+float rangeHigh = ta.highest(high, profileLen)
+float rangeLow = ta.lowest(low, profileLen)
+float profileHalf = not na(rangeHigh) and not na(rangeLow) ? math.max((rangeHigh - rangeLow) * 0.5, syminfo.mintick) : na
+float p03 = not na(profileCenter) and not na(profileHalf) ? f_clamp((close - profileCenter) / profileHalf * 100.0, -100.0, 100.0) : 0.0
+bool a03 = not na(profileCenter) and not na(profileHalf)
+float valueDev = ta.stdev(hlc3, profileLen)
+float upperValue = not na(profileCenter) and not na(valueDev) ? profileCenter + valueDev : na
+float lowerValue = not na(profileCenter) and not na(valueDev) ? profileCenter - valueDev : na
+float outside = not na(upperValue) and close > upperValue ? 1.0 : not na(lowerValue) and close < lowerValue ? -1.0 : 0.0
+float centreShift = not na(profileCenter[5]) and not na(atr) and atr > 0 ? (profileCenter - profileCenter[5]) / atr : 0.0
+float p04 = f_clamp(outside * 55.0 + f_norm(centreShift, 1.0) * 0.45, -100.0, 100.0)
+bool a04 = not na(valueDev) and not na(profileCenter)
+plot(showProfile ? profileCenter : na, "Profile Centre", color=color.new(cProfile, presetBalanced ? 25 : 10), linewidth=presetFull or presetDiagnostic ? 2 : 1)
+plot(showProfile and (presetFull or presetDiagnostic) ? upperValue : na, "Upper Value", color=color.new(cNeutral, 55), linewidth=1)
+plot(showProfile and (presetFull or presetDiagnostic) ? lowerValue : na, "Lower Value", color=color.new(cNeutral, 55), linewidth=1)
+
+//------------------------------------------------------------------------------
+// P05 zones — active vs stale styling
+//------------------------------------------------------------------------------
+float bodyAtr = not na(atr) and atr > 0 ? math.abs(close - open) / atr : 0.0
+bool bullDisp = close > open and bodyAtr >= 0.50 and bodyEff >= 0.55
+bool bearDisp = close < open and bodyAtr >= 0.50 and bodyEff >= 0.55
+float recentOppLow = ta.lowest(low[1], zoneLookback)
+float recentOppHigh = ta.highest(high[1], zoneLookback)
+bool bullBreak = bullDisp and not na(recentOppHigh) and close > recentOppHigh
+bool bearBreak = bearDisp and not na(recentOppLow) and close < recentOppLow
+var float lastBullZoneScore = 0.0
+var float lastBearZoneScore = 0.0
+var int lastBullZoneBar = na
+var int lastBearZoneBar = na
+var box bullZoneBox = na
+var box bearZoneBox = na
+if bullBreak
+    lastBullZoneScore := f_clamp(bodyAtr * 45.0 + p01Magnitude * 0.35 + math.max(p02, 0.0) * 0.20, 0.0, 100.0)
+    lastBullZoneBar := bar_index
+    if not na(bullZoneBox)
+        box.delete(bullZoneBox)
+    if showZones
+        float zTop = math.max(open[1], close[1])
+        float zBottom = math.min(open[1], close[1])
+        string zText = presetDiagnostic ? "BULL ZONE · " + str.tostring(lastBullZoneScore, "#.0") : presetFull ? "BULL ZONE" : ""
+        bullZoneBox := box.new(bar_index - 1, zTop, bar_index, zBottom, xloc=xloc.bar_index, extend=extend.right, border_color=color.new(cBull, 35), bgcolor=color.new(cBull, zoneOpacityFresh), text=zText, text_color=color.new(cBull, 0), text_size=size.tiny)
+if bearBreak
+    lastBearZoneScore := f_clamp(bodyAtr * 45.0 + p01Magnitude * 0.35 + math.max(-p02, 0.0) * 0.20, 0.0, 100.0)
+    lastBearZoneBar := bar_index
+    if not na(bearZoneBox)
+        box.delete(bearZoneBox)
+    if showZones
+        float zTop = math.max(open[1], close[1])
+        float zBottom = math.min(open[1], close[1])
+        string zText = presetDiagnostic ? "BEAR ZONE · " + str.tostring(lastBearZoneScore, "#.0") : presetFull ? "BEAR ZONE" : ""
+        bearZoneBox := box.new(bar_index - 1, zTop, bar_index, zBottom, xloc=xloc.bar_index, extend=extend.right, border_color=color.new(cBear, 35), bgcolor=color.new(cBear, zoneOpacityFresh), text=zText, text_color=color.new(cBear, 0), text_size=size.tiny)
+float bullZoneLive = not na(lastBullZoneBar) and bar_index - lastBullZoneBar <= zoneLookback ? lastBullZoneScore * (1.0 - (bar_index - lastBullZoneBar) / math.max(zoneLookback, 1) * 0.5) : 0.0
+float bearZoneLive = not na(lastBearZoneBar) and bar_index - lastBearZoneBar <= zoneLookback ? lastBearZoneScore * (1.0 - (bar_index - lastBearZoneBar) / math.max(zoneLookback, 1) * 0.5) : 0.0
+float p05 = f_clamp(bullZoneLive - bearZoneLive, -100.0, 100.0)
+bool a05 = not na(lastBullZoneBar) or not na(lastBearZoneBar)
+if not showZones
+    if not na(bullZoneBox)
+        box.delete(bullZoneBox)
+        bullZoneBox := na
+    if not na(bearZoneBox)
+        box.delete(bearZoneBox)
+        bearZoneBox := na
+else
+    if not na(bullZoneBox)
+        if na(lastBullZoneBar) or bar_index - lastBullZoneBar > zoneLookback
+            box.delete(bullZoneBox)
+            bullZoneBox := na
+        else
+            int op = f_ageOpacity(lastBullZoneBar, zoneLookback)
+            box.set_bgcolor(bullZoneBox, color.new(cBull, op))
+            box.set_border_color(bullZoneBox, color.new(cBull, bar_index - lastBullZoneBar >= int(zoneLookback * staleZoneFraction) ? 70 : 35))
+    if not na(bearZoneBox)
+        if na(lastBearZoneBar) or bar_index - lastBearZoneBar > zoneLookback
+            box.delete(bearZoneBox)
+            bearZoneBox := na
+        else
+            int op = f_ageOpacity(lastBearZoneBar, zoneLookback)
+            box.set_bgcolor(bearZoneBox, color.new(cBear, op))
+            box.set_border_color(bearZoneBox, color.new(cBear, bar_index - lastBearZoneBar >= int(zoneLookback * staleZoneFraction) ? 70 : 35))
+
+//------------------------------------------------------------------------------
+// P06 divergence — bounded and preset-aware
+//------------------------------------------------------------------------------
+float rsi = ta.rsi(close, 14)
+float pl = ta.pivotlow(low, divPivot, divPivot)
+float ph = ta.pivothigh(high, divPivot, divPivot)
+var float prevPL = na
+var float prevPLOsc = na
+var int prevPLBar = na
+var float prevPH = na
+var float prevPHOsc = na
+var int prevPHBar = na
+var float divBull = 0.0
+var float divBear = 0.0
+var int divBullBar = na
+var int divBearBar = na
+var array<line> divLines = array.new_line()
+var array<label> divLabels = array.new_label()
+f_storeLine(line ln) =>
+    array.push(divLines, ln)
+    while array.size(divLines) > maxDivergenceObjects
+        line old = array.shift(divLines)
+        line.delete(old)
+f_storeLabel(label lb) =>
+    array.push(divLabels, lb)
+    while array.size(divLabels) > maxDivergenceObjects
+        label old = array.shift(divLabels)
+        label.delete(old)
+if not na(pl)
+    int pivotBar = bar_index - divPivot
+    float oscNow = rsi[divPivot]
+    if not na(prevPL) and not na(prevPLOsc) and not na(prevPLBar) and pl < prevPL and oscNow > prevPLOsc
+        divBull := f_clamp((prevPL - pl) / math.max(nz(atr[divPivot], syminfo.mintick), syminfo.mintick) * 35.0 + (oscNow - prevPLOsc) * 5.0, 0.0, 100.0)
+        divBullBar := pivotBar
+        if showDivergence
+            line ln = line.new(prevPLBar, prevPL, pivotBar, pl, xloc=xloc.bar_index, extend=extend.none, color=color.new(cBull, presetDiagnostic ? 0 : 20), width=presetDiagnostic ? 2 : 1)
+            f_storeLine(ln)
+            if presetDiagnostic
+                label lb = label.new(pivotBar, pl, "DIV ↑ " + str.tostring(divBull, "#.0"), xloc=xloc.bar_index, style=label.style_label_up, textcolor=color.white, color=color.new(cBull, 68), size=size.tiny)
+                f_storeLabel(lb)
+    prevPL := pl
+    prevPLOsc := oscNow
+    prevPLBar := pivotBar
+if not na(ph)
+    int pivotBar = bar_index - divPivot
+    float oscNow = rsi[divPivot]
+    if not na(prevPH) and not na(prevPHOsc) and not na(prevPHBar) and ph > prevPH and oscNow < prevPHOsc
+        divBear := f_clamp((ph - prevPH) / math.max(nz(atr[divPivot], syminfo.mintick), syminfo.mintick) * 35.0 + (prevPHOsc - oscNow) * 5.0, 0.0, 100.0)
+        divBearBar := pivotBar
+        if showDivergence
+            line ln = line.new(prevPHBar, prevPH, pivotBar, ph, xloc=xloc.bar_index, extend=extend.none, color=color.new(cBear, presetDiagnostic ? 0 : 20), width=presetDiagnostic ? 2 : 1)
+            f_storeLine(ln)
+            if presetDiagnostic
+                label lb = label.new(pivotBar, ph, "DIV ↓ " + str.tostring(divBear, "#.0"), xloc=xloc.bar_index, style=label.style_label_down, textcolor=color.white, color=color.new(cBear, 68), size=size.tiny)
+                f_storeLabel(lb)
+    prevPH := ph
+    prevPHOsc := oscNow
+    prevPHBar := pivotBar
+float divBullLive = not na(divBullBar) and bar_index - divBullBar <= 30 ? divBull * (1.0 - (bar_index - divBullBar) / 30.0) : 0.0
+float divBearLive = not na(divBearBar) and bar_index - divBearBar <= 30 ? divBear * (1.0 - (bar_index - divBearBar) / 30.0) : 0.0
+float p06 = f_clamp(divBullLive - divBearLive, -100.0, 100.0)
+bool a06 = not na(divBullBar) or not na(divBearBar)
+
+//------------------------------------------------------------------------------
+// P07.2 confluence interface
+//------------------------------------------------------------------------------
+float r01 = a01 ? f_rel(p01) : 0.0
+float r02 = a02 ? f_rel(p02) : 0.0
+float r03 = a03 ? f_rel(p03) : 0.0
+float r04 = a04 ? f_rel(p04) : 0.0
+float r05 = a05 ? f_rel(p05) : 0.0
+float r06 = a06 ? f_rel(p06) : 0.0
+float ew01 = f_effWeight(wP01, rfP01, r01, a01)
+float ew02 = f_effWeight(wP02, rfP02, r02, a02)
+float ew03 = f_effWeight(wP03, rfP03, r03, a03)
+float ew04 = f_effWeight(wP04, rfP04, r04, a04)
+float ew05 = f_effWeight(wP05, rfP05, r05, a05)
+float ew06 = f_effWeight(wP06, rfP06, r06, a06)
+float totalWeight = math.max(ew01 + ew02 + ew03 + ew04 + ew05 + ew06, 0.0001)
+float weightedSigned = (p01*ew01 + p02*ew02 + p03*ew03 + p04*ew04 + p05*ew05 + p06*ew06) / totalWeight
+float bullEvidence = (math.max(p01,0)*ew01 + math.max(p02,0)*ew02 + math.max(p03,0)*ew03 + math.max(p04,0)*ew04 + math.max(p05,0)*ew05 + math.max(p06,0)*ew06) / totalWeight
+float bearEvidence = (math.max(-p01,0)*ew01 + math.max(-p02,0)*ew02 + math.max(-p03,0)*ew03 + math.max(-p04,0)*ew04 + math.max(-p05,0)*ew05 + math.max(-p06,0)*ew06) / totalWeight
+int activeCount = 0
+activeCount += a01 and math.abs(p01) >= activeThreshold ? 1 : 0
+activeCount += a02 and math.abs(p02) >= activeThreshold ? 1 : 0
+activeCount += a03 and math.abs(p03) >= activeThreshold ? 1 : 0
+activeCount += a04 and math.abs(p04) >= activeThreshold ? 1 : 0
+activeCount += a05 and math.abs(p05) >= activeThreshold ? 1 : 0
+activeCount += a06 and math.abs(p06) >= activeThreshold ? 1 : 0
+int reliableCount = 0
+reliableCount += a01 and math.abs(p01) >= reliableThreshold ? 1 : 0
+reliableCount += a02 and math.abs(p02) >= reliableThreshold ? 1 : 0
+reliableCount += a03 and math.abs(p03) >= reliableThreshold ? 1 : 0
+reliableCount += a04 and math.abs(p04) >= reliableThreshold ? 1 : 0
+reliableCount += a05 and math.abs(p05) >= reliableThreshold ? 1 : 0
+reliableCount += a06 and math.abs(p06) >= reliableThreshold ? 1 : 0
+int bullCount = 0
+int bearCount = 0
+bullCount += p01 >= activeThreshold ? 1 : 0
+bullCount += p02 >= activeThreshold ? 1 : 0
+bullCount += p03 >= activeThreshold ? 1 : 0
+bullCount += p04 >= activeThreshold ? 1 : 0
+bullCount += p05 >= activeThreshold ? 1 : 0
+bullCount += p06 >= activeThreshold ? 1 : 0
+bearCount += p01 <= -activeThreshold ? 1 : 0
+bearCount += p02 <= -activeThreshold ? 1 : 0
+bearCount += p03 <= -activeThreshold ? 1 : 0
+bearCount += p04 <= -activeThreshold ? 1 : 0
+bearCount += p05 <= -activeThreshold ? 1 : 0
+bearCount += p06 <= -activeThreshold ? 1 : 0
+bool conflict = bullEvidence >= conflictMin and bearEvidence >= conflictMin and math.abs(bullEvidence - bearEvidence) <= conflictMaxDiff
+bool weakConsensus = activeCount < minActiveEngines or reliableCount < minReliableEngines
+float participationFactor = activeCount / 6.0
+float reliabilityFactor = reliableCount / 6.0
+float agreementFactor = activeCount > 0 ? math.max(bullCount, bearCount) / activeCount : 0.0
+float rawConfidence = f_clamp(participationFactor * 35.0 + reliabilityFactor * 35.0 + agreementFactor * 30.0, 0.0, 100.0)
+float confidence = f_clamp(rawConfidence - (conflict ? conflictPenalty : 0.0) - (weakConsensus ? weakConsensusPenalty : 0.0), 0.0, 100.0)
+float confluenceScore = f_clamp(weightedSigned, -100.0, 100.0)
+var int strongBullRun = 0
+var int strongBearRun = 0
+strongBullRun := confluenceScore >= strongThreshold and not conflict and not weakConsensus ? strongBullRun + 1 : 0
+strongBearRun := confluenceScore <= -strongThreshold and not conflict and not weakConsensus ? strongBearRun + 1 : 0
+var string stableState = "CONFLUENCE_NEUTRAL"
+string candidateState = "CONFLUENCE_NEUTRAL"
+if conflict
+    candidateState := "CONFLUENCE_CONFLICT"
+else if weakConsensus
+    candidateState := "CONFLUENCE_LOW_CONFIDENCE"
+else if strongBullRun >= strongPersistenceBars
+    candidateState := "CONFLUENCE_STRONGLY_BULLISH"
+else if strongBearRun >= strongPersistenceBars
+    candidateState := "CONFLUENCE_STRONGLY_BEARISH"
+else if confluenceScore >= hysteresisEnter
+    candidateState := "CONFLUENCE_BULLISH"
+else if confluenceScore <= -hysteresisEnter
+    candidateState := "CONFLUENCE_BEARISH"
+string priorState = stableState
+float priorScore = nz(confluenceScore[1])
+if barstate.isconfirmed
+    bool keepBull = (stableState == "CONFLUENCE_BULLISH" or stableState == "CONFLUENCE_STRONGLY_BULLISH") and confluenceScore > hysteresisExit and not conflict and not weakConsensus
+    bool keepBear = (stableState == "CONFLUENCE_BEARISH" or stableState == "CONFLUENCE_STRONGLY_BEARISH") and confluenceScore < -hysteresisExit and not conflict and not weakConsensus
+    stableState := keepBull and candidateState == "CONFLUENCE_NEUTRAL" ? "CONFLUENCE_BULLISH" : keepBear and candidateState == "CONFLUENCE_NEUTRAL" ? "CONFLUENCE_BEARISH" : candidateState
+string state = barstate.isconfirmed ? stableState : "FORMING"
+int finalDirection = state == "CONFLUENCE_STRONGLY_BULLISH" or state == "CONFLUENCE_BULLISH" ? 1 : state == "CONFLUENCE_STRONGLY_BEARISH" or state == "CONFLUENCE_BEARISH" ? -1 : 0
+int priorDirection = priorState == "CONFLUENCE_STRONGLY_BULLISH" or priorState == "CONFLUENCE_BULLISH" ? 1 : priorState == "CONFLUENCE_STRONGLY_BEARISH" or priorState == "CONFLUENCE_BEARISH" ? -1 : 0
+bool stateChanged = barstate.isconfirmed and stableState != priorState
+bool scoreTransition = barstate.isconfirmed and math.abs(confluenceScore - priorScore) >= transitionMinDelta
+bool directionChanged = barstate.isconfirmed and finalDirection != 0 and finalDirection != priorDirection
+bool materialTransition = stateChanged and (directionChanged or scoreTransition or stableState == "CONFLUENCE_CONFLICT" or stableState == "CONFLUENCE_LOW_CONFIDENCE")
+
+// Strongest supporting/opposing engine
+string strongestSupportEngine = "NONE"
+string strongestOpposingEngine = "NONE"
+float strongestSupportContribution = 0.0
+float strongestOpposingContribution = 0.0
+int rawDirection = confluenceScore > hysteresisExit ? 1 : confluenceScore < -hysteresisExit ? -1 : 0
+array<float> scores = array.from(p01,p02,p03,p04,p05,p06)
+array<float> weights = array.from(ew01,ew02,ew03,ew04,ew05,ew06)
+array<string> names = array.from("P01 Participation","P02 Fair Value","P03 Profile","P04 Value","P05 Zones","P06 Divergence")
+for i = 0 to 5
+    float cc = array.get(scores,i) * array.get(weights,i)
+    if rawDirection == 0
+        if math.abs(cc) > strongestSupportContribution
+            strongestSupportContribution := math.abs(cc)
+            strongestSupportEngine := array.get(names,i)
+    else
+        if cc * rawDirection > 0 and math.abs(cc) > strongestSupportContribution
+            strongestSupportContribution := math.abs(cc)
+            strongestSupportEngine := array.get(names,i)
+        if cc * rawDirection < 0 and math.abs(cc) > strongestOpposingContribution
+            strongestOpposingContribution := math.abs(cc)
+            strongestOpposingEngine := array.get(names,i)
+
+//------------------------------------------------------------------------------
+// Transition discipline
+//------------------------------------------------------------------------------
+var array<label> transitionLabels = array.new_label()
+var int lastTransitionLabelBar = na
+bool transitionCooldownOk = na(lastTransitionLabelBar) or bar_index - lastTransitionLabelBar >= transitionCooldown
+if materialTransition and showTransitions and transitionCooldownOk
+    color tc = f_stateColor(stableState)
+    string tx = finalDirection == 1 ? "BIAS ↑" : finalDirection == -1 ? "BIAS ↓" : stableState == "CONFLUENCE_CONFLICT" ? "CONFLICT" : "LOW CONF"
+    float ty = finalDirection == 1 ? low - nz(atr) * 0.15 : finalDirection == -1 ? high + nz(atr) * 0.15 : high + nz(atr) * 0.10
+    label lb = label.new(bar_index, ty, tx, style=finalDirection == 1 ? label.style_label_up : label.style_label_down, textcolor=color.white, color=color.new(tc, 58), size=size.tiny)
+    array.push(transitionLabels, lb)
+    lastTransitionLabelBar := bar_index
+    while array.size(transitionLabels) > maxTransitionLabels
+        label old = array.shift(transitionLabels)
+        label.delete(old)
+
+color bgBias = state == "CONFLUENCE_STRONGLY_BULLISH" ? color.new(cBull,94) : state == "CONFLUENCE_BULLISH" ? color.new(color.green,96) : state == "CONFLUENCE_STRONGLY_BEARISH" ? color.new(cBear,94) : state == "CONFLUENCE_BEARISH" ? color.new(cBear,96) : state == "CONFLUENCE_CONFLICT" ? color.new(color.orange,95) : na
+bgcolor(showBiasBackground ? bgBias : na)
+
+//------------------------------------------------------------------------------
+// Optional histogram — bounded reusable pool
+//------------------------------------------------------------------------------
+var array<box> histBoxes = array.new_box()
+if barstate.isfirst
+    for i = 0 to histogramRows - 1
+        array.push(histBoxes, box.new(bar_index, close, bar_index, close, xloc=xloc.bar_index, border_width=0, bgcolor=color.new(cNeutral,100)))
+if barstate.islast
+    if showHistogram and not na(rangeHigh) and not na(rangeLow) and rangeHigh > rangeLow
+        float rowSize = (rangeHigh - rangeLow) / histogramRows
+        array<float> rowVols = array.new_float(histogramRows,0.0)
+        float maxRowVol = 0.0
+        for j = 0 to profileLen - 1
+            float px = hlc3[j]
+            float vol = volume[j]
+            if not na(px) and not na(vol)
+                int idx = int(math.floor((px - rangeLow) / rowSize))
+                idx := math.max(0,math.min(histogramRows - 1,idx))
+                float nv = array.get(rowVols,idx) + vol
+                array.set(rowVols,idx,nv)
+                maxRowVol := math.max(maxRowVol,nv)
+        for i = 0 to histogramRows - 1
+            box hb = array.get(histBoxes,i)
+            float rv = array.get(rowVols,i)
+            int width = maxRowVol > 0 ? int(math.round(rv / maxRowVol * histogramWidth)) : 0
+            float bottom = rangeLow + i * rowSize
+            float top = bottom + rowSize
+            int rightX = bar_index + histogramOffset
+            int leftX = rightX - width
+            bool inValue = not na(lowerValue) and not na(upperValue) and top >= lowerValue and bottom <= upperValue
+            box.set_lefttop(hb,leftX,top)
+            box.set_rightbottom(hb,rightX,bottom)
+            box.set_bgcolor(hb,width > 0 ? color.new(inValue ? cProfile : cNeutral,inValue ? 82 : 90) : color.new(cNeutral,100))
+            box.set_border_color(hb,color.new(cNeutral,100))
+    else
+        for i = 0 to array.size(histBoxes) - 1
+            box hb = array.get(histBoxes,i)
+            box.set_lefttop(hb,bar_index,close)
+            box.set_rightbottom(hb,bar_index,close)
+            box.set_bgcolor(hb,color.new(cNeutral,100))
+            box.set_border_color(hb,color.new(cNeutral,100))
+
+//------------------------------------------------------------------------------
+// Compact production panel / diagnostics
+//------------------------------------------------------------------------------
+var table status = table.new(position.top_right,2,8,border_width=1,frame_width=1,bgcolor=color.new(color.black,18))
+if barstate.islast
+    if showStatusPanel
+        table.clear(status,0,0,1,7)
+        color sc = f_stateColor(state)
+        table.cell(status,0,0,"PLUTUS",text_color=color.white,bgcolor=color.new(sc,62),text_halign=text.align_left)
+        table.cell(status,1,0,displayPreset,text_color=color.white,bgcolor=color.new(sc,62),text_halign=text.align_right)
+        table.cell(status,0,1,"Bias",text_color=color.silver)
+        table.cell(status,1,1,finalDirection==1?"BULLISH":finalDirection==-1?"BEARISH":state=="CONFLUENCE_CONFLICT"?"CONFLICT":"NEUTRAL",text_color=sc)
+        table.cell(status,0,2,"Score",text_color=color.silver)
+        table.cell(status,1,2,str.tostring(confluenceScore,"#.1"),text_color=confluenceScore>0?cBull:confluenceScore<0?cBear:color.white)
+        table.cell(status,0,3,"Confidence",text_color=color.silver)
+        table.cell(status,1,3,str.tostring(confidence,"#.0")+"%",text_color=confidence>=65?cBull:confidence>=40?color.yellow:color.orange)
+        table.cell(status,0,4,"Regime",text_color=color.silver)
+        table.cell(status,1,4,regime,text_color=color.white)
+        table.cell(status,0,5,"Engines",text_color=color.silver)
+        table.cell(status,1,5,str.tostring(activeCount)+"A / "+str.tostring(reliableCount)+"R",text_color=color.white)
+        table.cell(status,0,6,"Support",text_color=color.silver)
+        table.cell(status,1,6,strongestSupportEngine,text_color=color.white)
+        table.cell(status,0,7,"Opposing",text_color=color.silver)
+        table.cell(status,1,7,strongestOpposingEngine,text_color=strongestOpposingEngine=="NONE"?color.gray:color.orange)
+    else
+        table.clear(status,0,0,1,7)
+
+var table diag = table.new(position.bottom_right,4,12,border_width=1,frame_width=1,bgcolor=color.new(color.black,15))
+f_diagRow(int row,string name,float score,float weight,float rel) =>
+    table.cell(diag,0,row,name,text_color=color.silver,text_halign=text.align_left)
+    table.cell(diag,1,row,str.tostring(score,"#.1"),text_color=score>0?cBull:score<0?cBear:color.white)
+    table.cell(diag,2,row,str.tostring(weight,"#.1"),text_color=color.white)
+    table.cell(diag,3,row,str.tostring(rel*100.0,"#.0"),text_color=color.white)
+if barstate.islast
+    if showDiagnostics
+        table.clear(diag,0,0,3,11)
+        table.cell(diag,0,0,"P08.1 DIAGNOSTICS",text_color=color.white)
+        table.cell(diag,1,0,"Score",text_color=color.silver)
+        table.cell(diag,2,0,"EffWt",text_color=color.silver)
+        table.cell(diag,3,0,"Rel%",text_color=color.silver)
+        f_diagRow(1,"P01 Participation",p01,ew01,r01)
+        f_diagRow(2,"P02 Fair Value",p02,ew02,r02)
+        f_diagRow(3,"P03 Profile",p03,ew03,r03)
+        f_diagRow(4,"P04 Value",p04,ew04,r04)
+        f_diagRow(5,"P05 Zones",p05,ew05,r05)
+        f_diagRow(6,"P06 Divergence",p06,ew06,r06)
+        table.cell(diag,0,7,"Bull / Bear",text_color=color.silver)
+        table.cell(diag,1,7,str.tostring(bullEvidence,"#.1"),text_color=cBull)
+        table.cell(diag,2,7,str.tostring(bearEvidence,"#.1"),text_color=cBear)
+        table.cell(diag,3,7,conflict?"CONFLICT":"OK",text_color=conflict?color.orange:color.white)
+        table.cell(diag,0,8,"State",text_color=color.silver)
+        table.cell(diag,1,8,state,text_color=f_stateColor(state))
+        table.cell(diag,2,8,"Transition",text_color=color.silver)
+        table.cell(diag,3,8,materialTransition?"YES":"NO",text_color=materialTransition?color.orange:color.white)
+        table.cell(diag,0,9,"ATR / ADX",text_color=color.silver)
+        table.cell(diag,1,9,str.tostring(atrRatio,"#.2"),text_color=color.white)
+        table.cell(diag,2,9,str.tostring(adx,"#.1"),text_color=color.white)
+        table.cell(diag,3,9,regime,text_color=color.white)
+        table.cell(diag,0,10,"Objects",text_color=color.silver)
+        table.cell(diag,1,10,str.tostring(array.size(transitionLabels))+" T",text_color=color.white)
+        table.cell(diag,2,10,str.tostring(array.size(divLines))+" D",text_color=color.white)
+        table.cell(diag,3,10,showHistogram?"VP":"-",text_color=color.white)
+        table.cell(diag,0,11,"Signals",text_color=color.silver)
+        table.cell(diag,1,11,"DISABLED",text_color=color.orange)
+        table.cell(diag,2,11,"Phase",text_color=color.silver)
+        table.cell(diag,3,11,"P08.1",text_color=color.white)
+    else
+        table.clear(diag,0,0,3,11)
