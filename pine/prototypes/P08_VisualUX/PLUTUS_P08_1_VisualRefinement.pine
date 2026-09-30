@@ -1,10 +1,10 @@
 //@version=6
-indicator("PLUTUS P08.1 — Visual Refinement", shorttitle="PLUTUS P08.1", overlay=true, max_boxes_count=180, max_lines_count=180, max_labels_count=180)
+indicator("PLUTUS P08.1 — Visual Refinement", shorttitle="PLUTUS P08.1", overlay=true, max_boxes_count=420, max_lines_count=220, max_labels_count=220)
 
 //==============================================================================
-// PLUTUS P08.1 — Visual Refinement / Production UX
-// Refines the validated P08.0 presentation layer without intentional scoring
-// changes. No entry signals.
+// PLUTUS P08.1 — Visual Refinement / Production UX (corrected)
+// Restores validated P02/P03/P05 visual contracts instead of approximating them.
+// No trade signals.
 //==============================================================================
 
 //------------------------------------------------------------------------------
@@ -14,7 +14,7 @@ groupDisplay = "Display Architecture"
 displayPreset = input.string("Balanced", "Display Preset", options=["Minimal", "Balanced", "Full", "Diagnostic"], group=groupDisplay)
 showStatusPanelInput = input.bool(true, "Status Panel", group=groupDisplay)
 showVwapInput = input.bool(true, "VWAP", group=groupDisplay)
-showProfileInput = input.bool(true, "Profile Centre / Value", group=groupDisplay)
+showValueLevelsInput = input.bool(true, "Profile POC / VAH / VAL", group=groupDisplay)
 showHistogramInput = input.bool(false, "Volume Profile Histogram", group=groupDisplay)
 showZonesInput = input.bool(true, "Institutional Zones", group=groupDisplay)
 showDivergenceInput = input.bool(true, "Divergence", group=groupDisplay)
@@ -28,7 +28,7 @@ bool presetFull = displayPreset == "Full"
 bool presetDiagnostic = displayPreset == "Diagnostic"
 bool showStatusPanel = showStatusPanelInput
 bool showVwap = showVwapInput and not presetMinimal
-bool showProfile = showProfileInput and (presetBalanced or presetFull or presetDiagnostic)
+bool showValueLevels = showValueLevelsInput and (presetBalanced or presetFull or presetDiagnostic)
 bool showHistogram = showHistogramInput and (presetFull or presetDiagnostic)
 bool showZones = showZonesInput and not presetMinimal
 bool showDivergence = showDivergenceInput and (presetFull or presetDiagnostic)
@@ -36,184 +36,484 @@ bool showTransitions = showTransitionsInput and not presetMinimal
 bool showBiasBackground = showBiasBackgroundInput and (presetFull or presetDiagnostic)
 bool showDiagnostics = showDiagnosticsInput or presetDiagnostic
 
-groupVisual = "Visual Refinement"
-maxTransitionLabels = input.int(14, "Maximum Transition Labels", minval=3, maxval=60, group=groupVisual)
-maxDivergenceObjects = input.int(24, "Maximum Divergence Events", minval=4, maxval=60, group=groupVisual)
-transitionCooldown = input.int(5, "Transition Label Cooldown Bars", minval=0, maxval=50, group=groupVisual)
-histogramRows = input.int(40, "Histogram Rows", minval=16, maxval=80, step=8, group=groupVisual)
-histogramWidth = input.int(18, "Histogram Maximum Width", minval=5, maxval=60, group=groupVisual)
-histogramOffset = input.int(3, "Histogram Right Offset", minval=1, maxval=30, group=groupVisual)
-zoneOpacityFresh = input.int(84, "Fresh Zone Opacity", minval=50, maxval=98, group=groupVisual)
-zoneOpacityStale = input.int(93, "Stale Zone Opacity", minval=70, maxval=99, group=groupVisual)
-staleZoneFraction = input.float(0.60, "Zone Stale Age Fraction", minval=0.25, maxval=0.95, step=0.05, group=groupVisual)
+//------------------------------------------------------------------------------
+// Timing / context — restored from P02/P03/P05
+//------------------------------------------------------------------------------
+groupTiming = "Timing / Context"
+timezoneInput = input.string("Exchange", "Session Timezone", options=["Exchange", "UTC-2", "UTC-1", "UTC+0", "UTC+1", "UTC+2", "America/New_York", "Europe/London", "Asia/Tokyo"], group=groupTiming)
+string sessionTz = timezoneInput == "Exchange" ? syminfo.timezone : timezoneInput
+profileScope = input.string("New York", "Profile Scope", options=["Asia", "London", "New York", "Day"], group=groupTiming)
+valueReference = input.string("Daily", "VWAP Reference", options=["Active Session", "Daily", "Weekly", "Monthly"], group=groupTiming)
 
 //------------------------------------------------------------------------------
-// P07.2 scoring inputs — unchanged compact model
+// Profile engine — restored from P03.4 / P05.3
 //------------------------------------------------------------------------------
-groupWeights = "Base Engine Weights"
+groupProfile = "Volume Profile"
+allocationSource = input.source(hlc3, "Analytical Allocation Price", group=groupProfile)
+binCount = input.int(32, "Analytical Price Bins", minval=8, maxval=80, group=groupProfile)
+maxProfileBars = input.int(300, "Maximum Bars Per Profile", minval=25, maxval=1000, group=groupProfile)
+valueAreaPct = input.float(70.0, "Value Area %", minval=50.0, maxval=99.0, step=1.0, group=groupProfile)
+histogramRows = input.int(80, "Histogram Rows", minval=16, maxval=160, step=8, group=groupProfile)
+histogramAllocation = input.string("Range Overlap", "Histogram Volume Allocation", options=["Range Overlap", "HLC3 Point"], group=groupProfile)
+histogramWidth = input.int(24, "Histogram Maximum Width", minval=5, maxval=100, group=groupProfile)
+histogramOffset = input.int(4, "Histogram Right Offset", minval=1, maxval=50, group=groupProfile)
+showValueAreaHighlight = input.bool(true, "Highlight Value Area", group=groupProfile)
+showPocHighlight = input.bool(true, "Highlight POC Bin", group=groupProfile)
+lineWidth = input.int(2, "POC / VA Line Width", minval=1, maxval=4, group=groupProfile)
+
+//------------------------------------------------------------------------------
+// Institutional zone controls — restored core P05 controls
+//------------------------------------------------------------------------------
+groupDetection = "Institutional Zone Detection"
+atrLen = input.int(14, "ATR Length", minval=1, group=groupDetection)
+volumeLen = input.int(20, "Volume Baseline Length", minval=2, group=groupDetection)
+structureLookback = input.int(5, "OB Structure Break Lookback", minval=2, maxval=30, group=groupDetection)
+minDisplacementAtr = input.float(0.50, "Minimum Displacement Body / ATR", minval=0.05, step=0.05, group=groupDetection)
+minDisplacementEfficiency = input.float(0.55, "Minimum Displacement Body / Range", minval=0.10, maxval=1.0, step=0.05, group=groupDetection)
+minFvgAtr = input.float(0.10, "Minimum FVG Width / ATR", minval=0.0, step=0.01, group=groupDetection)
+minFvgTicks = input.int(3, "Minimum FVG Width (Ticks)", minval=1, maxval=100, group=groupDetection)
+maxZoneWidthAtr = input.float(1.50, "Maximum Zone Width / ATR", minval=0.25, step=0.25, group=groupDetection)
+requireDisplacementFvg = input.bool(true, "Reject Opening-Gap FVG Artifacts", group=groupDetection)
+suppressNestedFvg = input.bool(true, "Suppress Nested / Overlapping FVGs", group=groupDetection)
+obRangeMode = input.string("Body", "Order Block Range", options=["Body", "Full Candle"], group=groupDetection)
+detectFvg = input.bool(true, "Detect FVG Candidates", group=groupDetection)
+detectOb = input.bool(true, "Detect Order Block Candidates", group=groupDetection)
+
+groupQualification = "Institutional Zone Qualification"
+minQualificationScore = input.float(60.0, "Institutional Qualification Score", minval=0.0, maxval=100.0, step=5.0, group=groupQualification)
+fullRvol = input.float(2.0, "Full Participation RVOL", minval=1.0, step=0.1, group=groupQualification)
+fullVwapDistanceAtr = input.float(1.0, "Full VWAP Distance / ATR", minval=0.10, step=0.10, group=groupQualification)
+
+groupLifecycle = "Institutional Zone Lifecycle"
+maxZoneAgeBars = input.int(250, "Maximum Zone Age (Bars)", minval=10, maxval=2000, group=groupLifecycle)
+removeInvalidated = input.bool(true, "Remove Invalidated Zones", group=groupLifecycle)
+createIfvg = input.bool(true, "Create IFVG From Invalidated FVG", group=groupLifecycle)
+createBreaker = input.bool(true, "Create Breaker From Invalidated OB", group=groupLifecycle)
+showZoneText = input.bool(true, "Show Type / Score", group=groupLifecycle)
+zoneOpacityFresh = input.int(84, "Fresh Zone Opacity", minval=50, maxval=98, group=groupLifecycle)
+zoneOpacityStale = input.int(93, "Stale Zone Opacity", minval=70, maxval=99, group=groupLifecycle)
+
+//------------------------------------------------------------------------------
+// Divergence controls — restored important P06 controls
+//------------------------------------------------------------------------------
+groupDivergence = "Divergence"
+leftBars = input.int(3, "Pivot Left Bars", minval=1, maxval=20, group=groupDivergence)
+rightBars = input.int(3, "Pivot Right Bars", minval=1, maxval=20, group=groupDivergence)
+oscillator = input.string("RSI", "Oscillator", options=["RSI", "MACD Histogram"], group=groupDivergence)
+rsiLen = input.int(14, "RSI Length", minval=2, group=groupDivergence)
+macdFast = input.int(12, "MACD Fast", minval=1, group=groupDivergence)
+macdSlow = input.int(26, "MACD Slow", minval=2, group=groupDivergence)
+macdSignal = input.int(9, "MACD Signal", minval=1, group=groupDivergence)
+minPivotGapBars = input.int(5, "Minimum Pivot Separation", minval=1, maxval=100, group=groupDivergence)
+maxPivotGapBars = input.int(120, "Maximum Pivot Separation", minval=5, maxval=1000, group=groupDivergence)
+showRegular = input.bool(true, "Regular Divergence", group=groupDivergence)
+showHidden = input.bool(true, "Hidden Divergence", group=groupDivergence)
+eventExpiryBars = input.int(30, "Divergence Event Expiry", minval=1, maxval=500, group=groupDivergence)
+maxDivergenceObjects = input.int(24, "Maximum Divergence Events", minval=4, maxval=60, group=groupDivergence)
+
+//------------------------------------------------------------------------------
+// Confluence / UX controls
+//------------------------------------------------------------------------------
+groupWeights = "Confluence Weights"
 wP01 = input.float(20.0, "P01 Participation Weight", minval=0, maxval=100, step=1, group=groupWeights)
 wP02 = input.float(15.0, "P02 Fair Value Weight", minval=0, maxval=100, step=1, group=groupWeights)
 wP03 = input.float(15.0, "P03 Profile Weight", minval=0, maxval=100, step=1, group=groupWeights)
 wP04 = input.float(20.0, "P04 Value Analysis Weight", minval=0, maxval=100, step=1, group=groupWeights)
 wP05 = input.float(20.0, "P05 Institutional Zones Weight", minval=0, maxval=100, step=1, group=groupWeights)
 wP06 = input.float(10.0, "P06 Divergence Weight", minval=0, maxval=100, step=1, group=groupWeights)
-
-groupCore = "Core Inputs"
-atrLen = input.int(14, "ATR Length", minval=1, group=groupCore)
-volumeLen = input.int(20, "Volume Baseline Length", minval=2, group=groupCore)
-profileLen = input.int(80, "Profile Approximation Lookback", minval=20, maxval=300, group=groupCore)
-zoneLookback = input.int(20, "Institutional Zone Context Lookback", minval=5, maxval=200, group=groupCore)
-divPivot = input.int(3, "Divergence Pivot Strength", minval=1, maxval=10, group=groupCore)
-regimeLen = input.int(50, "Regime Lookback", minval=20, maxval=300, group=groupCore)
-
-groupQuality = "Quality / Reliability"
-activeThreshold = input.float(15.0, "Engine Active Threshold", minval=0, maxval=100, step=5, group=groupQuality)
-reliableThreshold = input.float(35.0, "Reliable Evidence Threshold", minval=0, maxval=100, step=5, group=groupQuality)
-minActiveEngines = input.int(3, "Minimum Active Engines", minval=1, maxval=6, group=groupQuality)
-minReliableEngines = input.int(2, "Minimum Reliable Engines", minval=1, maxval=6, group=groupQuality)
-weakConsensusPenalty = input.float(25.0, "Weak Consensus Confidence Penalty", minval=0, maxval=100, step=5, group=groupQuality)
-strongThreshold = input.float(60.0, "Strong Confluence Threshold", minval=20, maxval=100, step=5, group=groupQuality)
-conflictMin = input.float(30.0, "Conflict Side Minimum", minval=0, maxval=100, step=5, group=groupQuality)
-conflictMaxDiff = input.float(15.0, "Conflict Maximum Side Difference", minval=0, maxval=100, step=5, group=groupQuality)
-conflictPenalty = input.float(35.0, "Conflict Confidence Penalty", minval=0, maxval=100, step=5, group=groupQuality)
-hysteresisEnter = input.float(20.0, "Directional Entry Threshold", minval=0, maxval=100, step=5, group=groupQuality)
-hysteresisExit = input.float(10.0, "Directional Exit Threshold", minval=0, maxval=100, step=5, group=groupQuality)
-strongPersistenceBars = input.int(2, "Strong State Confirmation Bars", minval=1, maxval=20, group=groupQuality)
-transitionMinDelta = input.float(20.0, "Material Transition Score Delta", minval=1, maxval=100, step=1, group=groupQuality)
-
-groupRegime = "Regime Handling"
-trendAdxLen = input.int(14, "ADX Length", minval=2, maxval=50, group=groupRegime)
-trendAdxThreshold = input.float(22.0, "Trend ADX Threshold", minval=5, maxval=60, step=1, group=groupRegime)
-expansionAtrRatio = input.float(1.15, "Expansion ATR Ratio", minval=0.8, maxval=3.0, step=0.05, group=groupRegime)
-compressionAtrRatio = input.float(0.85, "Compression ATR Ratio", minval=0.2, maxval=1.2, step=0.05, group=groupRegime)
+regimeLen = input.int(50, "Regime Lookback", minval=20, maxval=300, group=groupWeights)
+activeThreshold = input.float(15.0, "Engine Active Threshold", minval=0, maxval=100, step=5, group=groupWeights)
+reliableThreshold = input.float(35.0, "Reliable Evidence Threshold", minval=0, maxval=100, step=5, group=groupWeights)
+minActiveEngines = input.int(3, "Minimum Active Engines", minval=1, maxval=6, group=groupWeights)
+minReliableEngines = input.int(2, "Minimum Reliable Engines", minval=1, maxval=6, group=groupWeights)
+strongThreshold = input.float(60.0, "Strong Confluence Threshold", minval=20, maxval=100, step=5, group=groupWeights)
+hysteresisEnter = input.float(20.0, "Directional Entry Threshold", minval=0, maxval=100, step=5, group=groupWeights)
+hysteresisExit = input.float(10.0, "Directional Exit Threshold", minval=0, maxval=100, step=5, group=groupWeights)
+transitionMinDelta = input.float(20.0, "Material Transition Score Delta", minval=1, maxval=100, step=1, group=groupWeights)
+maxTransitionLabels = input.int(14, "Maximum Transition Labels", minval=3, maxval=60, group=groupWeights)
+transitionCooldown = input.int(5, "Transition Label Cooldown Bars", minval=0, maxval=50, group=groupWeights)
 
 //------------------------------------------------------------------------------
-// Helpers / palette
+// Helpers
 //------------------------------------------------------------------------------
 f_clamp(float x, float lo, float hi) => math.max(lo, math.min(hi, x))
 f_norm(float x, float full) => full > 0 ? f_clamp(x / full * 100.0, -100.0, 100.0) : 0.0
-f_rollsum(float src, int len) =>
-    float avg = ta.sma(src, len)
-    not na(avg) ? avg * len : na
 f_rel(float score) =>
     float a = math.abs(score)
     a < activeThreshold ? 0.0 : f_clamp((a - activeThreshold) / math.max(100.0 - activeThreshold, 1.0), 0.0, 1.0)
-f_effWeight(float base, float regimeFactor, float reliability, bool available) =>
-    available ? base * regimeFactor * (0.50 + reliability * 0.50) : 0.0
+f_effWeight(float base, float reliability, bool available) => available ? base * (0.50 + reliability * 0.50) : 0.0
 f_stateColor(string s) =>
-    s == "CONFLUENCE_STRONGLY_BULLISH" ? color.lime :
-     s == "CONFLUENCE_BULLISH" ? color.green :
-     s == "CONFLUENCE_STRONGLY_BEARISH" ? color.red :
-     s == "CONFLUENCE_BEARISH" ? color.maroon :
-     s == "CONFLUENCE_CONFLICT" ? color.orange :
-     s == "CONFLUENCE_LOW_CONFIDENCE" ? color.yellow : color.gray
-f_ageOpacity(int bornBar, int maxAge) =>
-    int age = na(bornBar) ? maxAge : math.max(0, bar_index - bornBar)
-    float frac = maxAge > 0 ? math.min(1.0, age / maxAge) : 1.0
-    int(math.round(zoneOpacityFresh + (zoneOpacityStale - zoneOpacityFresh) * frac))
+    s == "CONFLUENCE_STRONGLY_BULLISH" ? color.lime : s == "CONFLUENCE_BULLISH" ? color.green : s == "CONFLUENCE_STRONGLY_BEARISH" ? color.red : s == "CONFLUENCE_BEARISH" ? color.maroon : s == "CONFLUENCE_CONFLICT" ? color.orange : s == "CONFLUENCE_LOW_CONFIDENCE" ? color.yellow : color.gray
 
 color cBull = color.lime
 color cBear = color.red
 color cVwap = color.aqua
-color cProfile = color.blue
-color cNeutral = color.gray
+color cPoc = color.orange
+color cVa = color.silver
 
 //------------------------------------------------------------------------------
-// Core series / regime
+// Shared timing / sessions
+//------------------------------------------------------------------------------
+string asiaSession = "0000-0800:1234567"
+string londonSession = "0800-1630:1234567"
+string newYorkSession = "1330-2000:1234567"
+bool inAsia = not na(time(timeframe.period, asiaSession, sessionTz))
+bool inLondon = not na(time(timeframe.period, londonSession, sessionTz))
+bool inNewYork = not na(time(timeframe.period, newYorkSession, sessionTz))
+bool newAsia = inAsia and not inAsia[1]
+bool newLondon = inLondon and not inLondon[1]
+bool newNewYork = inNewYork and not inNewYork[1]
+int localDay = dayofmonth(time, sessionTz)
+int localWeek = weekofyear(time, sessionTz)
+int localMonth = month(time, sessionTz)
+bool newDay = ta.change(localDay) != 0
+bool newWeek = ta.change(localWeek) != 0
+bool newMonth = ta.change(localMonth) != 0
+bool profileActive = switch profileScope
+    "Asia" => inAsia
+    "London" => inLondon
+    "New York" => inNewYork
+    => true
+bool profileReset = switch profileScope
+    "Asia" => newAsia
+    "London" => newLondon
+    "New York" => newNewYork
+    => barstate.isfirst or newDay
+
+//------------------------------------------------------------------------------
+// Core series / P01
 //------------------------------------------------------------------------------
 float atr = ta.atr(atrLen)
-float atrMean = ta.sma(atr, regimeLen)
-float atrRatio = not na(atr) and not na(atrMean) and atrMean > 0 ? atr / atrMean : na
 float candleRange = math.max(high - low, syminfo.mintick)
-float bodyEff = math.abs(close - open) / candleRange
+float body = math.abs(close - open)
+float bodyEff = body / candleRange
+float bodyAtr = not na(atr) and atr > 0 ? body / atr : 0.0
 float volBase = ta.sma(volume, volumeLen)
 float rvol = not na(volume) and not na(volBase) and volBase > 0 ? volume / volBase : na
-[plusDI, minusDI, adx] = ta.dmi(trendAdxLen, trendAdxLen)
-bool trendRegime = not na(adx) and adx >= trendAdxThreshold
-bool expansionRegime = not na(atrRatio) and atrRatio >= expansionAtrRatio
-bool compressionRegime = not na(atrRatio) and atrRatio <= compressionAtrRatio
-string regime = trendRegime ? (expansionRegime ? "TREND_EXPANSION" : "TREND") : compressionRegime ? "COMPRESSION" : expansionRegime ? "EXPANSION" : "BALANCED"
-float rfP01 = expansionRegime ? 1.20 : compressionRegime ? 0.80 : 1.00
-float rfP02 = trendRegime ? 1.15 : compressionRegime ? 1.10 : 1.00
-float rfP03 = compressionRegime ? 1.20 : trendRegime ? 0.90 : 1.05
-float rfP04 = trendRegime ? 1.15 : compressionRegime ? 1.10 : 1.00
-float rfP05 = expansionRegime or trendRegime ? 1.15 : 1.00
-float rfP06 = trendRegime ? 0.85 : compressionRegime ? 1.20 : 1.05
-
-// P01
-float p01Magnitude = not na(rvol) ? f_clamp((rvol - 0.75) / 1.25 * 100.0, 0.0, 100.0) : 0.0
+float p01Magnitude = not na(rvol) ? f_clamp((rvol - 0.75) / math.max(fullRvol - 0.75, 0.01) * 100.0, 0.0, 100.0) : 0.0
 int barDir = close > open ? 1 : close < open ? -1 : 0
 float p01 = barDir * f_clamp(p01Magnitude * 0.65 + bodyEff * 35.0, 0.0, 100.0)
 bool a01 = not na(rvol)
 
-// P02 + reset-safe VWAP
-bool newDay = ta.change(dayofmonth(time, syminfo.timezone)) != 0
+//------------------------------------------------------------------------------
+// P02 VWAP references with explicit reset breaks
+//------------------------------------------------------------------------------
+var float asiaPV = na
+var float asiaVol = na
+if not inAsia
+    asiaPV := na
+    asiaVol := na
+else if newAsia or na(asiaPV)
+    asiaPV := hlc3 * volume
+    asiaVol := volume
+else
+    asiaPV += hlc3 * volume
+    asiaVol += volume
+float asiaVwap = inAsia and asiaVol > 0 ? asiaPV / asiaVol : na
+
+var float londonPV = na
+var float londonVol = na
+if not inLondon
+    londonPV := na
+    londonVol := na
+else if newLondon or na(londonPV)
+    londonPV := hlc3 * volume
+    londonVol := volume
+else
+    londonPV += hlc3 * volume
+    londonVol += volume
+float londonVwap = inLondon and londonVol > 0 ? londonPV / londonVol : na
+
+var float nyPV = na
+var float nyVol = na
+if not inNewYork
+    nyPV := na
+    nyVol := na
+else if newNewYork or na(nyPV)
+    nyPV := hlc3 * volume
+    nyVol := volume
+else
+    nyPV += hlc3 * volume
+    nyVol += volume
+float nyVwap = inNewYork and nyVol > 0 ? nyPV / nyVol : na
+
 float dailyVwap = ta.vwap(hlc3, barstate.isfirst or newDay)
-float vwapDistAtr = not na(dailyVwap) and not na(atr) and atr > 0 ? (close - dailyVwap) / atr : na
-float p02 = not na(vwapDistAtr) ? f_norm(vwapDistAtr, 1.5) : 0.0
-bool a02 = not na(dailyVwap) and not na(atr)
-plot(showVwap and not newDay ? dailyVwap : na, "Daily VWAP", color=color.new(cVwap, 0), linewidth=presetFull or presetDiagnostic ? 2 : 1, style=plot.style_linebr)
-
-// P03 / P04
-float pv = f_rollsum(hlc3 * volume, profileLen)
-float vv = f_rollsum(volume, profileLen)
-float profileCenter = not na(vv) and vv > 0 ? pv / vv : na
-float rangeHigh = ta.highest(high, profileLen)
-float rangeLow = ta.lowest(low, profileLen)
-float profileHalf = not na(rangeHigh) and not na(rangeLow) ? math.max((rangeHigh - rangeLow) * 0.5, syminfo.mintick) : na
-float p03 = not na(profileCenter) and not na(profileHalf) ? f_clamp((close - profileCenter) / profileHalf * 100.0, -100.0, 100.0) : 0.0
-bool a03 = not na(profileCenter) and not na(profileHalf)
-float valueDev = ta.stdev(hlc3, profileLen)
-float upperValue = not na(profileCenter) and not na(valueDev) ? profileCenter + valueDev : na
-float lowerValue = not na(profileCenter) and not na(valueDev) ? profileCenter - valueDev : na
-float outside = not na(upperValue) and close > upperValue ? 1.0 : not na(lowerValue) and close < lowerValue ? -1.0 : 0.0
-float centreShift = not na(profileCenter[5]) and not na(atr) and atr > 0 ? (profileCenter - profileCenter[5]) / atr : 0.0
-float p04 = f_clamp(outside * 55.0 + f_norm(centreShift, 1.0) * 0.45, -100.0, 100.0)
-bool a04 = not na(valueDev) and not na(profileCenter)
-plot(showProfile ? profileCenter : na, "Profile Centre", color=color.new(cProfile, presetBalanced ? 25 : 10), linewidth=presetFull or presetDiagnostic ? 2 : 1)
-plot(showProfile and (presetFull or presetDiagnostic) ? upperValue : na, "Upper Value", color=color.new(cNeutral, 55), linewidth=1)
-plot(showProfile and (presetFull or presetDiagnostic) ? lowerValue : na, "Lower Value", color=color.new(cNeutral, 55), linewidth=1)
+float weeklyVwap = ta.vwap(hlc3, barstate.isfirst or newWeek)
+float monthlyVwap = ta.vwap(hlc3, barstate.isfirst or newMonth)
+float activeSessionVwap = inNewYork ? nyVwap : inLondon ? londonVwap : inAsia ? asiaVwap : na
+float valueRef = switch valueReference
+    "Active Session" => activeSessionVwap
+    "Weekly" => weeklyVwap
+    "Monthly" => monthlyVwap
+    => dailyVwap
+bool valueReset = switch valueReference
+    "Active Session" => newAsia or newLondon or newNewYork
+    "Weekly" => newWeek
+    "Monthly" => newMonth
+    => newDay
+float p02 = not na(valueRef) and not na(atr) and atr > 0 ? f_clamp((close - valueRef) / atr / fullVwapDistanceAtr * 100.0, -100.0, 100.0) : 0.0
+bool a02 = not na(valueRef) and not na(atr)
+plot(showVwap and not valueReset ? valueRef : na, "Primary VWAP", color=cVwap, linewidth=2, style=plot.style_linebr)
 
 //------------------------------------------------------------------------------
-// P05 zones — active vs stale styling
+// P03 bounded profile with real POC / VAH / VAL
 //------------------------------------------------------------------------------
-float bodyAtr = not na(atr) and atr > 0 ? math.abs(close - open) / atr : 0.0
-bool bullDisp = close > open and bodyAtr >= 0.50 and bodyEff >= 0.55
-bool bearDisp = close < open and bodyAtr >= 0.50 and bodyEff >= 0.55
-float recentOppLow = ta.lowest(low[1], zoneLookback)
-float recentOppHigh = ta.highest(high[1], zoneLookback)
-bool bullBreak = bullDisp and not na(recentOppHigh) and close > recentOppHigh
-bool bearBreak = bearDisp and not na(recentOppLow) and close < recentOppLow
-var float lastBullZoneScore = 0.0
-var float lastBearZoneScore = 0.0
-var int lastBullZoneBar = na
-var int lastBearZoneBar = na
+var array<float> profilePrices = array.new_float()
+var array<float> profileHighs = array.new_float()
+var array<float> profileLows = array.new_float()
+var array<float> profileVolumes = array.new_float()
+var array<float> bins = array.new_float()
+var array<box> histBoxes = array.new_box()
+if barstate.isfirst
+    for i = 0 to binCount - 1
+        array.push(bins, 0.0)
+    for i = 0 to histogramRows - 1
+        array.push(histBoxes, box.new(bar_index, close, bar_index, close, xloc=xloc.bar_index, border_width=0, bgcolor=color.new(color.gray, 100)))
+
+if profileReset
+    array.clear(profilePrices)
+    array.clear(profileHighs)
+    array.clear(profileLows)
+    array.clear(profileVolumes)
+if profileActive and not na(volume)
+    array.push(profilePrices, allocationSource)
+    array.push(profileHighs, high)
+    array.push(profileLows, low)
+    array.push(profileVolumes, volume)
+    if array.size(profilePrices) > maxProfileBars
+        array.shift(profilePrices)
+        array.shift(profileHighs)
+        array.shift(profileLows)
+        array.shift(profileVolumes)
+
+float profileHigh = na
+float profileLow = na
+float pocPrice = na
+float vahPrice = na
+float valPrice = na
+float binSize = na
+float totalProfileVolume = 0.0
+int pocIndex = na
+int vaLowIndex = na
+int vaHighIndex = na
+int storedBars = array.size(profilePrices)
+if storedBars > 0
+    profileHigh := array.max(profileHighs)
+    profileLow := array.min(profileLows)
+    float profileRange = profileHigh - profileLow
+    binSize := math.max(profileRange > 0 ? profileRange / binCount : syminfo.mintick, syminfo.mintick)
+    for i = 0 to binCount - 1
+        array.set(bins, i, 0.0)
+    for i = 0 to storedBars - 1
+        float p = array.get(profilePrices, i)
+        float v = array.get(profileVolumes, i)
+        int idx = int(math.floor((p - profileLow) / binSize))
+        idx := math.max(0, math.min(binCount - 1, idx))
+        array.set(bins, idx, array.get(bins, idx) + v)
+        totalProfileVolume += v
+    float maxBinVolume = -1.0
+    pocIndex := 0
+    for i = 0 to binCount - 1
+        float bv = array.get(bins, i)
+        if bv > maxBinVolume
+            maxBinVolume := bv
+            pocIndex := i
+    pocPrice := profileLow + (pocIndex + 0.5) * binSize
+    float targetVolume = totalProfileVolume * valueAreaPct / 100.0
+    vaLowIndex := pocIndex
+    vaHighIndex := pocIndex
+    float vaVolume = array.get(bins, pocIndex)
+    int steps = 0
+    while vaVolume < targetVolume and steps < binCount
+        bool canDown = vaLowIndex > 0
+        bool canUp = vaHighIndex < binCount - 1
+        if not canDown and not canUp
+            break
+        float downVol = canDown ? array.get(bins, vaLowIndex - 1) : -1.0
+        float upVol = canUp ? array.get(bins, vaHighIndex + 1) : -1.0
+        if canUp and (not canDown or upVol > downVol)
+            vaHighIndex += 1
+            vaVolume += upVol
+        else if canDown
+            vaLowIndex -= 1
+            vaVolume += downVol
+        steps += 1
+    valPrice := profileLow + vaLowIndex * binSize
+    vahPrice := profileLow + (vaHighIndex + 1) * binSize
+
+float p03 = not na(pocPrice) and not na(atr) and atr > 0 ? f_clamp((close - pocPrice) / atr * 75.0, -100.0, 100.0) : 0.0
+bool a03 = not na(pocPrice)
+float vaMid = not na(vahPrice) and not na(valPrice) ? (vahPrice + valPrice) * 0.5 : na
+float vaHalf = not na(vahPrice) and not na(valPrice) ? math.max((vahPrice - valPrice) * 0.5, syminfo.mintick) : na
+float p04 = not na(vaMid) and not na(vaHalf) ? f_clamp((close - vaMid) / vaHalf * 65.0, -100.0, 100.0) : 0.0
+bool a04 = not na(vahPrice) and not na(valPrice)
+
+float pocPlot = profileReset ? na : pocPrice
+float vahPlot = profileReset ? na : vahPrice
+float valPlot = profileReset ? na : valPrice
+plot(showValueLevels ? pocPlot : na, "POC", color=cPoc, linewidth=lineWidth, style=plot.style_linebr)
+plot(showValueLevels ? vahPlot : na, "VAH", color=cVa, linewidth=1, style=plot.style_linebr)
+plot(showValueLevels ? valPlot : na, "VAL", color=cVa, linewidth=1, style=plot.style_linebr)
+
+//------------------------------------------------------------------------------
+// Corrected histogram: range-overlap allocation by default
+//------------------------------------------------------------------------------
+if barstate.islast
+    if showHistogram and storedBars > 0 and not na(profileHigh) and not na(profileLow) and profileHigh > profileLow
+        float rowSize = (profileHigh - profileLow) / histogramRows
+        array<float> rowVols = array.new_float(histogramRows, 0.0)
+        float maxRowVol = 0.0
+        for j = 0 to storedBars - 1
+            float bh = array.get(profileHighs, j)
+            float bl = array.get(profileLows, j)
+            float bv = array.get(profileVolumes, j)
+            if histogramAllocation == "HLC3 Point"
+                float px = array.get(profilePrices, j)
+                int idx = int(math.floor((px - profileLow) / rowSize))
+                idx := math.max(0, math.min(histogramRows - 1, idx))
+                array.set(rowVols, idx, array.get(rowVols, idx) + bv)
+            else
+                float br = math.max(bh - bl, syminfo.mintick)
+                int firstRow = math.max(0, math.min(histogramRows - 1, int(math.floor((bl - profileLow) / rowSize))))
+                int lastRow = math.max(0, math.min(histogramRows - 1, int(math.floor((bh - profileLow) / rowSize))))
+                for r = firstRow to lastRow
+                    float rowBottom = profileLow + r * rowSize
+                    float rowTop = rowBottom + rowSize
+                    float overlap = math.max(0.0, math.min(bh, rowTop) - math.max(bl, rowBottom))
+                    if overlap > 0
+                        float allocated = bv * overlap / br
+                        array.set(rowVols, r, array.get(rowVols, r) + allocated)
+        for i = 0 to histogramRows - 1
+            maxRowVol := math.max(maxRowVol, array.get(rowVols, i))
+        int visualPocRow = 0
+        float visualPocVol = -1.0
+        for i = 0 to histogramRows - 1
+            float rv = array.get(rowVols, i)
+            if rv > visualPocVol
+                visualPocVol := rv
+                visualPocRow := i
+        for i = 0 to histogramRows - 1
+            box hb = array.get(histBoxes, i)
+            float rv = array.get(rowVols, i)
+            int width = maxRowVol > 0 ? int(math.round(rv / maxRowVol * histogramWidth)) : 0
+            float bottom = profileLow + i * rowSize
+            float top = bottom + rowSize
+            int rightX = bar_index + histogramOffset
+            int leftX = rightX - width
+            bool inValue = not na(valPrice) and not na(vahPrice) and top >= valPrice and bottom <= vahPrice
+            color hc = showPocHighlight and i == visualPocRow ? color.new(cPoc, 35) : showValueAreaHighlight and inValue ? color.new(color.blue, 78) : color.new(color.gray, 88)
+            box.set_lefttop(hb, leftX, top)
+            box.set_rightbottom(hb, rightX, bottom)
+            box.set_bgcolor(hb, width > 0 ? hc : color.new(color.gray, 100))
+            box.set_border_color(hb, color.new(color.gray, 100))
+    else
+        for i = 0 to array.size(histBoxes) - 1
+            box hb = array.get(histBoxes, i)
+            box.set_lefttop(hb, bar_index, close)
+            box.set_rightbottom(hb, bar_index, close)
+            box.set_bgcolor(hb, color.new(color.gray, 100))
+            box.set_border_color(hb, color.new(color.gray, 100))
+
+//------------------------------------------------------------------------------
+// P05 institutional candidates: FVG + OB, explicitly typed
+//------------------------------------------------------------------------------
 var box bullZoneBox = na
 var box bearZoneBox = na
-if bullBreak
-    lastBullZoneScore := f_clamp(bodyAtr * 45.0 + p01Magnitude * 0.35 + math.max(p02, 0.0) * 0.20, 0.0, 100.0)
-    lastBullZoneBar := bar_index
+var string bullZoneType = "NONE"
+var string bearZoneType = "NONE"
+var int bullZoneBorn = na
+var int bearZoneBorn = na
+var float bullZoneTop = na
+var float bullZoneBottom = na
+var float bearZoneTop = na
+var float bearZoneBottom = na
+var float bullZoneScore = 0.0
+var float bearZoneScore = 0.0
+
+bool bullFvgRaw = low > high[2]
+bool bearFvgRaw = high < low[2]
+float bullFvgWidth = bullFvgRaw ? low - high[2] : 0.0
+float bearFvgWidth = bearFvgRaw ? low[2] - high : 0.0
+bool displacementOk = bodyAtr >= minDisplacementAtr and bodyEff >= minDisplacementEfficiency
+bool bullFvg = detectFvg and bullFvgRaw and bullFvgWidth >= minFvgTicks * syminfo.mintick and (na(atr) or bullFvgWidth >= minFvgAtr * atr) and (not requireDisplacementFvg or displacementOk)
+bool bearFvg = detectFvg and bearFvgRaw and bearFvgWidth >= minFvgTicks * syminfo.mintick and (na(atr) or bearFvgWidth >= minFvgAtr * atr) and (not requireDisplacementFvg or displacementOk)
+
+float priorStructHigh = ta.highest(high[2], structureLookback)
+float priorStructLow = ta.lowest(low[2], structureLookback)
+bool bullOb = detectOb and close > open and displacementOk and close > priorStructHigh and close[1] < open[1]
+bool bearOb = detectOb and close < open and displacementOk and close < priorStructLow and close[1] > open[1]
+
+f_zoneScore(float widthAtr) =>
+    float mechanics = f_clamp(bodyAtr / math.max(minDisplacementAtr, 0.01) * 35.0 + bodyEff * 35.0 + p01Magnitude * 0.30, 0.0, 100.0)
+    float widthPenalty = widthAtr > maxZoneWidthAtr ? 25.0 : 0.0
+    f_clamp(mechanics - widthPenalty, 0.0, 100.0)
+
+if bullFvg or bullOb
+    float zTop = bullFvg ? low : (obRangeMode == "Full Candle" ? high[1] : math.max(open[1], close[1]))
+    float zBottom = bullFvg ? high[2] : (obRangeMode == "Full Candle" ? low[1] : math.min(open[1], close[1]))
+    float zWidthAtr = not na(atr) and atr > 0 ? (zTop - zBottom) / atr : 0.0
+    float zs = f_zoneScore(zWidthAtr)
+    if zs >= minQualificationScore
+        if not na(bullZoneBox)
+            box.delete(bullZoneBox)
+        bullZoneType := bullFvg ? "FVG" : "OB"
+        bullZoneBorn := bar_index
+        bullZoneTop := zTop
+        bullZoneBottom := zBottom
+        bullZoneScore := zs
+        if showZones
+            string txt = showZoneText ? "BULL " + bullZoneType + " · " + str.tostring(zs, "#.0") : ""
+            bullZoneBox := box.new(bar_index, zTop, bar_index + 1, zBottom, xloc=xloc.bar_index, extend=extend.right, border_color=color.new(cBull, 35), bgcolor=color.new(cBull, zoneOpacityFresh), text=txt, text_color=cBull, text_size=size.tiny)
+
+if bearFvg or bearOb
+    float zTop = bearFvg ? low[2] : (obRangeMode == "Full Candle" ? high[1] : math.max(open[1], close[1]))
+    float zBottom = bearFvg ? high : (obRangeMode == "Full Candle" ? low[1] : math.min(open[1], close[1]))
+    float zWidthAtr = not na(atr) and atr > 0 ? (zTop - zBottom) / atr : 0.0
+    float zs = f_zoneScore(zWidthAtr)
+    if zs >= minQualificationScore
+        if not na(bearZoneBox)
+            box.delete(bearZoneBox)
+        bearZoneType := bearFvg ? "FVG" : "OB"
+        bearZoneBorn := bar_index
+        bearZoneTop := zTop
+        bearZoneBottom := zBottom
+        bearZoneScore := zs
+        if showZones
+            string txt = showZoneText ? "BEAR " + bearZoneType + " · " + str.tostring(zs, "#.0") : ""
+            bearZoneBox := box.new(bar_index, zTop, bar_index + 1, zBottom, xloc=xloc.bar_index, extend=extend.right, border_color=color.new(cBear, 35), bgcolor=color.new(cBear, zoneOpacityFresh), text=txt, text_color=cBear, text_size=size.tiny)
+
+bool bullInvalid = not na(bullZoneBottom) and close < bullZoneBottom
+bool bearInvalid = not na(bearZoneTop) and close > bearZoneTop
+if bullInvalid
+    if createIfvg and bullZoneType == "FVG"
+        bullZoneType := "IFVG"
+    else if createBreaker and bullZoneType == "OB"
+        bullZoneType := "BREAKER"
+    if removeInvalidated and not (bullZoneType == "IFVG" or bullZoneType == "BREAKER")
+        if not na(bullZoneBox)
+            box.delete(bullZoneBox)
+            bullZoneBox := na
+if bearInvalid
+    if createIfvg and bearZoneType == "FVG"
+        bearZoneType := "IFVG"
+    else if createBreaker and bearZoneType == "OB"
+        bearZoneType := "BREAKER"
+    if removeInvalidated and not (bearZoneType == "IFVG" or bearZoneType == "BREAKER")
+        if not na(bearZoneBox)
+            box.delete(bearZoneBox)
+            bearZoneBox := na
+
+if not na(bullZoneBorn) and bar_index - bullZoneBorn > maxZoneAgeBars
     if not na(bullZoneBox)
         box.delete(bullZoneBox)
-    if showZones
-        float zTop = math.max(open[1], close[1])
-        float zBottom = math.min(open[1], close[1])
-        string zText = presetDiagnostic ? "BULL ZONE · " + str.tostring(lastBullZoneScore, "#.0") : presetFull ? "BULL ZONE" : ""
-        bullZoneBox := box.new(bar_index - 1, zTop, bar_index, zBottom, xloc=xloc.bar_index, extend=extend.right, border_color=color.new(cBull, 35), bgcolor=color.new(cBull, zoneOpacityFresh), text=zText, text_color=color.new(cBull, 0), text_size=size.tiny)
-if bearBreak
-    lastBearZoneScore := f_clamp(bodyAtr * 45.0 + p01Magnitude * 0.35 + math.max(-p02, 0.0) * 0.20, 0.0, 100.0)
-    lastBearZoneBar := bar_index
+    bullZoneBox := na
+    bullZoneType := "NONE"
+if not na(bearZoneBorn) and bar_index - bearZoneBorn > maxZoneAgeBars
     if not na(bearZoneBox)
         box.delete(bearZoneBox)
-    if showZones
-        float zTop = math.max(open[1], close[1])
-        float zBottom = math.min(open[1], close[1])
-        string zText = presetDiagnostic ? "BEAR ZONE · " + str.tostring(lastBearZoneScore, "#.0") : presetFull ? "BEAR ZONE" : ""
-        bearZoneBox := box.new(bar_index - 1, zTop, bar_index, zBottom, xloc=xloc.bar_index, extend=extend.right, border_color=color.new(cBear, 35), bgcolor=color.new(cBear, zoneOpacityFresh), text=zText, text_color=color.new(cBear, 0), text_size=size.tiny)
-float bullZoneLive = not na(lastBullZoneBar) and bar_index - lastBullZoneBar <= zoneLookback ? lastBullZoneScore * (1.0 - (bar_index - lastBullZoneBar) / math.max(zoneLookback, 1) * 0.5) : 0.0
-float bearZoneLive = not na(lastBearZoneBar) and bar_index - lastBearZoneBar <= zoneLookback ? lastBearZoneScore * (1.0 - (bar_index - lastBearZoneBar) / math.max(zoneLookback, 1) * 0.5) : 0.0
-float p05 = f_clamp(bullZoneLive - bearZoneLive, -100.0, 100.0)
-bool a05 = not na(lastBullZoneBar) or not na(lastBearZoneBar)
+    bearZoneBox := na
+    bearZoneType := "NONE"
+
 if not showZones
     if not na(bullZoneBox)
         box.delete(bullZoneBox)
@@ -222,29 +522,28 @@ if not showZones
         box.delete(bearZoneBox)
         bearZoneBox := na
 else
-    if not na(bullZoneBox)
-        if na(lastBullZoneBar) or bar_index - lastBullZoneBar > zoneLookback
-            box.delete(bullZoneBox)
-            bullZoneBox := na
-        else
-            int op = f_ageOpacity(lastBullZoneBar, zoneLookback)
-            box.set_bgcolor(bullZoneBox, color.new(cBull, op))
-            box.set_border_color(bullZoneBox, color.new(cBull, bar_index - lastBullZoneBar >= int(zoneLookback * staleZoneFraction) ? 70 : 35))
-    if not na(bearZoneBox)
-        if na(lastBearZoneBar) or bar_index - lastBearZoneBar > zoneLookback
-            box.delete(bearZoneBox)
-            bearZoneBox := na
-        else
-            int op = f_ageOpacity(lastBearZoneBar, zoneLookback)
-            box.set_bgcolor(bearZoneBox, color.new(cBear, op))
-            box.set_border_color(bearZoneBox, color.new(cBear, bar_index - lastBearZoneBar >= int(zoneLookback * staleZoneFraction) ? 70 : 35))
+    if not na(bullZoneBox) and not na(bullZoneBorn)
+        int age = bar_index - bullZoneBorn
+        int op = int(math.round(zoneOpacityFresh + (zoneOpacityStale - zoneOpacityFresh) * math.min(1.0, age / math.max(maxZoneAgeBars, 1))))
+        box.set_bgcolor(bullZoneBox, color.new(cBull, op))
+    if not na(bearZoneBox) and not na(bearZoneBorn)
+        int age = bar_index - bearZoneBorn
+        int op = int(math.round(zoneOpacityFresh + (zoneOpacityStale - zoneOpacityFresh) * math.min(1.0, age / math.max(maxZoneAgeBars, 1))))
+        box.set_bgcolor(bearZoneBox, color.new(cBear, op))
+
+float bullZoneLive = bullZoneType != "NONE" and not na(bullZoneBorn) ? bullZoneScore * math.max(0.0, 1.0 - (bar_index - bullZoneBorn) / math.max(maxZoneAgeBars, 1) * 0.5) : 0.0
+float bearZoneLive = bearZoneType != "NONE" and not na(bearZoneBorn) ? bearZoneScore * math.max(0.0, 1.0 - (bar_index - bearZoneBorn) / math.max(maxZoneAgeBars, 1) * 0.5) : 0.0
+float p05 = f_clamp(bullZoneLive - bearZoneLive, -100.0, 100.0)
+bool a05 = bullZoneType != "NONE" or bearZoneType != "NONE"
 
 //------------------------------------------------------------------------------
-// P06 divergence — bounded and preset-aware
+// P06 divergence with regular/hidden classification
 //------------------------------------------------------------------------------
-float rsi = ta.rsi(close, 14)
-float pl = ta.pivotlow(low, divPivot, divPivot)
-float ph = ta.pivothigh(high, divPivot, divPivot)
+float rsi = ta.rsi(close, rsiLen)
+[macdLine, macdSignalLine, macdHist] = ta.macd(close, macdFast, macdSlow, macdSignal)
+float osc = oscillator == "RSI" ? rsi : macdHist
+float pl = ta.pivotlow(low, leftBars, rightBars)
+float ph = ta.pivothigh(high, leftBars, rightBars)
 var float prevPL = na
 var float prevPLOsc = na
 var int prevPLBar = na
@@ -267,43 +566,52 @@ f_storeLabel(label lb) =>
     while array.size(divLabels) > maxDivergenceObjects
         label old = array.shift(divLabels)
         label.delete(old)
+
 if not na(pl)
-    int pivotBar = bar_index - divPivot
-    float oscNow = rsi[divPivot]
-    if not na(prevPL) and not na(prevPLOsc) and not na(prevPLBar) and pl < prevPL and oscNow > prevPLOsc
-        divBull := f_clamp((prevPL - pl) / math.max(nz(atr[divPivot], syminfo.mintick), syminfo.mintick) * 35.0 + (oscNow - prevPLOsc) * 5.0, 0.0, 100.0)
-        divBullBar := pivotBar
-        if showDivergence
-            line ln = line.new(prevPLBar, prevPL, pivotBar, pl, xloc=xloc.bar_index, extend=extend.none, color=color.new(cBull, presetDiagnostic ? 0 : 20), width=presetDiagnostic ? 2 : 1)
-            f_storeLine(ln)
-            if presetDiagnostic
-                label lb = label.new(pivotBar, pl, "DIV ↑ " + str.tostring(divBull, "#.0"), xloc=xloc.bar_index, style=label.style_label_up, textcolor=color.white, color=color.new(cBull, 68), size=size.tiny)
-                f_storeLabel(lb)
+    int pivotBar = bar_index - rightBars
+    float oscNow = osc[rightBars]
+    if not na(prevPL) and not na(prevPLOsc) and not na(prevPLBar)
+        int gap = pivotBar - prevPLBar
+        bool reg = showRegular and gap >= minPivotGapBars and gap <= maxPivotGapBars and pl < prevPL and oscNow > prevPLOsc
+        bool hid = showHidden and gap >= minPivotGapBars and gap <= maxPivotGapBars and pl > prevPL and oscNow < prevPLOsc
+        if reg or hid
+            divBull := f_clamp(math.abs(oscNow - prevPLOsc) * 5.0 + math.abs(pl - prevPL) / math.max(nz(atr[rightBars], syminfo.mintick), syminfo.mintick) * 35.0, 0.0, 100.0)
+            divBullBar := pivotBar
+            if showDivergence
+                line ln = line.new(prevPLBar, prevPL, pivotBar, pl, xloc=xloc.bar_index, extend=extend.none, color=color.new(cBull, hid ? 35 : 10), width=2, style=hid ? line.style_dashed : line.style_solid)
+                f_storeLine(ln)
+                if presetDiagnostic
+                    label lb = label.new(pivotBar, pl, (reg ? "REG BULL " : "HID BULL ") + str.tostring(divBull, "#.0"), xloc=xloc.bar_index, style=label.style_label_up, textcolor=color.white, color=color.new(cBull, 65), size=size.tiny)
+                    f_storeLabel(lb)
     prevPL := pl
     prevPLOsc := oscNow
     prevPLBar := pivotBar
 if not na(ph)
-    int pivotBar = bar_index - divPivot
-    float oscNow = rsi[divPivot]
-    if not na(prevPH) and not na(prevPHOsc) and not na(prevPHBar) and ph > prevPH and oscNow < prevPHOsc
-        divBear := f_clamp((ph - prevPH) / math.max(nz(atr[divPivot], syminfo.mintick), syminfo.mintick) * 35.0 + (prevPHOsc - oscNow) * 5.0, 0.0, 100.0)
-        divBearBar := pivotBar
-        if showDivergence
-            line ln = line.new(prevPHBar, prevPH, pivotBar, ph, xloc=xloc.bar_index, extend=extend.none, color=color.new(cBear, presetDiagnostic ? 0 : 20), width=presetDiagnostic ? 2 : 1)
-            f_storeLine(ln)
-            if presetDiagnostic
-                label lb = label.new(pivotBar, ph, "DIV ↓ " + str.tostring(divBear, "#.0"), xloc=xloc.bar_index, style=label.style_label_down, textcolor=color.white, color=color.new(cBear, 68), size=size.tiny)
-                f_storeLabel(lb)
+    int pivotBar = bar_index - rightBars
+    float oscNow = osc[rightBars]
+    if not na(prevPH) and not na(prevPHOsc) and not na(prevPHBar)
+        int gap = pivotBar - prevPHBar
+        bool reg = showRegular and gap >= minPivotGapBars and gap <= maxPivotGapBars and ph > prevPH and oscNow < prevPHOsc
+        bool hid = showHidden and gap >= minPivotGapBars and gap <= maxPivotGapBars and ph < prevPH and oscNow > prevPHOsc
+        if reg or hid
+            divBear := f_clamp(math.abs(oscNow - prevPHOsc) * 5.0 + math.abs(ph - prevPH) / math.max(nz(atr[rightBars], syminfo.mintick), syminfo.mintick) * 35.0, 0.0, 100.0)
+            divBearBar := pivotBar
+            if showDivergence
+                line ln = line.new(prevPHBar, prevPH, pivotBar, ph, xloc=xloc.bar_index, extend=extend.none, color=color.new(cBear, hid ? 35 : 10), width=2, style=hid ? line.style_dashed : line.style_solid)
+                f_storeLine(ln)
+                if presetDiagnostic
+                    label lb = label.new(pivotBar, ph, (reg ? "REG BEAR " : "HID BEAR ") + str.tostring(divBear, "#.0"), xloc=xloc.bar_index, style=label.style_label_down, textcolor=color.white, color=color.new(cBear, 65), size=size.tiny)
+                    f_storeLabel(lb)
     prevPH := ph
     prevPHOsc := oscNow
     prevPHBar := pivotBar
-float divBullLive = not na(divBullBar) and bar_index - divBullBar <= 30 ? divBull * (1.0 - (bar_index - divBullBar) / 30.0) : 0.0
-float divBearLive = not na(divBearBar) and bar_index - divBearBar <= 30 ? divBear * (1.0 - (bar_index - divBearBar) / 30.0) : 0.0
+float divBullLive = not na(divBullBar) and bar_index - divBullBar <= eventExpiryBars ? divBull * (1.0 - (bar_index - divBullBar) / math.max(eventExpiryBars, 1)) : 0.0
+float divBearLive = not na(divBearBar) and bar_index - divBearBar <= eventExpiryBars ? divBear * (1.0 - (bar_index - divBearBar) / math.max(eventExpiryBars, 1)) : 0.0
 float p06 = f_clamp(divBullLive - divBearLive, -100.0, 100.0)
 bool a06 = not na(divBullBar) or not na(divBearBar)
 
 //------------------------------------------------------------------------------
-// P07.2 confluence interface
+// P07 confluence interface
 //------------------------------------------------------------------------------
 float r01 = a01 ? f_rel(p01) : 0.0
 float r02 = a02 ? f_rel(p02) : 0.0
@@ -311,16 +619,14 @@ float r03 = a03 ? f_rel(p03) : 0.0
 float r04 = a04 ? f_rel(p04) : 0.0
 float r05 = a05 ? f_rel(p05) : 0.0
 float r06 = a06 ? f_rel(p06) : 0.0
-float ew01 = f_effWeight(wP01, rfP01, r01, a01)
-float ew02 = f_effWeight(wP02, rfP02, r02, a02)
-float ew03 = f_effWeight(wP03, rfP03, r03, a03)
-float ew04 = f_effWeight(wP04, rfP04, r04, a04)
-float ew05 = f_effWeight(wP05, rfP05, r05, a05)
-float ew06 = f_effWeight(wP06, rfP06, r06, a06)
+float ew01 = f_effWeight(wP01, r01, a01)
+float ew02 = f_effWeight(wP02, r02, a02)
+float ew03 = f_effWeight(wP03, r03, a03)
+float ew04 = f_effWeight(wP04, r04, a04)
+float ew05 = f_effWeight(wP05, r05, a05)
+float ew06 = f_effWeight(wP06, r06, a06)
 float totalWeight = math.max(ew01 + ew02 + ew03 + ew04 + ew05 + ew06, 0.0001)
-float weightedSigned = (p01*ew01 + p02*ew02 + p03*ew03 + p04*ew04 + p05*ew05 + p06*ew06) / totalWeight
-float bullEvidence = (math.max(p01,0)*ew01 + math.max(p02,0)*ew02 + math.max(p03,0)*ew03 + math.max(p04,0)*ew04 + math.max(p05,0)*ew05 + math.max(p06,0)*ew06) / totalWeight
-float bearEvidence = (math.max(-p01,0)*ew01 + math.max(-p02,0)*ew02 + math.max(-p03,0)*ew03 + math.max(-p04,0)*ew04 + math.max(-p05,0)*ew05 + math.max(-p06,0)*ew06) / totalWeight
+float confluenceScore = f_clamp((p01*ew01 + p02*ew02 + p03*ew03 + p04*ew04 + p05*ew05 + p06*ew06) / totalWeight, -100.0, 100.0)
 int activeCount = 0
 activeCount += a01 and math.abs(p01) >= activeThreshold ? 1 : 0
 activeCount += a02 and math.abs(p02) >= activeThreshold ? 1 : 0
@@ -335,207 +641,100 @@ reliableCount += a03 and math.abs(p03) >= reliableThreshold ? 1 : 0
 reliableCount += a04 and math.abs(p04) >= reliableThreshold ? 1 : 0
 reliableCount += a05 and math.abs(p05) >= reliableThreshold ? 1 : 0
 reliableCount += a06 and math.abs(p06) >= reliableThreshold ? 1 : 0
-int bullCount = 0
-int bearCount = 0
-bullCount += p01 >= activeThreshold ? 1 : 0
-bullCount += p02 >= activeThreshold ? 1 : 0
-bullCount += p03 >= activeThreshold ? 1 : 0
-bullCount += p04 >= activeThreshold ? 1 : 0
-bullCount += p05 >= activeThreshold ? 1 : 0
-bullCount += p06 >= activeThreshold ? 1 : 0
-bearCount += p01 <= -activeThreshold ? 1 : 0
-bearCount += p02 <= -activeThreshold ? 1 : 0
-bearCount += p03 <= -activeThreshold ? 1 : 0
-bearCount += p04 <= -activeThreshold ? 1 : 0
-bearCount += p05 <= -activeThreshold ? 1 : 0
-bearCount += p06 <= -activeThreshold ? 1 : 0
-bool conflict = bullEvidence >= conflictMin and bearEvidence >= conflictMin and math.abs(bullEvidence - bearEvidence) <= conflictMaxDiff
 bool weakConsensus = activeCount < minActiveEngines or reliableCount < minReliableEngines
-float participationFactor = activeCount / 6.0
-float reliabilityFactor = reliableCount / 6.0
-float agreementFactor = activeCount > 0 ? math.max(bullCount, bearCount) / activeCount : 0.0
-float rawConfidence = f_clamp(participationFactor * 35.0 + reliabilityFactor * 35.0 + agreementFactor * 30.0, 0.0, 100.0)
-float confidence = f_clamp(rawConfidence - (conflict ? conflictPenalty : 0.0) - (weakConsensus ? weakConsensusPenalty : 0.0), 0.0, 100.0)
-float confluenceScore = f_clamp(weightedSigned, -100.0, 100.0)
-var int strongBullRun = 0
-var int strongBearRun = 0
-strongBullRun := confluenceScore >= strongThreshold and not conflict and not weakConsensus ? strongBullRun + 1 : 0
-strongBearRun := confluenceScore <= -strongThreshold and not conflict and not weakConsensus ? strongBearRun + 1 : 0
+float agreement = activeCount / 6.0
+float confidence = f_clamp(agreement * 55.0 + reliableCount / 6.0 * 45.0 - (weakConsensus ? 20.0 : 0.0), 0.0, 100.0)
 var string stableState = "CONFLUENCE_NEUTRAL"
-string candidateState = "CONFLUENCE_NEUTRAL"
-if conflict
-    candidateState := "CONFLUENCE_CONFLICT"
-else if weakConsensus
-    candidateState := "CONFLUENCE_LOW_CONFIDENCE"
-else if strongBullRun >= strongPersistenceBars
-    candidateState := "CONFLUENCE_STRONGLY_BULLISH"
-else if strongBearRun >= strongPersistenceBars
-    candidateState := "CONFLUENCE_STRONGLY_BEARISH"
-else if confluenceScore >= hysteresisEnter
-    candidateState := "CONFLUENCE_BULLISH"
-else if confluenceScore <= -hysteresisEnter
-    candidateState := "CONFLUENCE_BEARISH"
+string candidateState = weakConsensus ? "CONFLUENCE_LOW_CONFIDENCE" : confluenceScore >= strongThreshold ? "CONFLUENCE_STRONGLY_BULLISH" : confluenceScore >= hysteresisEnter ? "CONFLUENCE_BULLISH" : confluenceScore <= -strongThreshold ? "CONFLUENCE_STRONGLY_BEARISH" : confluenceScore <= -hysteresisEnter ? "CONFLUENCE_BEARISH" : "CONFLUENCE_NEUTRAL"
 string priorState = stableState
 float priorScore = nz(confluenceScore[1])
 if barstate.isconfirmed
-    bool keepBull = (stableState == "CONFLUENCE_BULLISH" or stableState == "CONFLUENCE_STRONGLY_BULLISH") and confluenceScore > hysteresisExit and not conflict and not weakConsensus
-    bool keepBear = (stableState == "CONFLUENCE_BEARISH" or stableState == "CONFLUENCE_STRONGLY_BEARISH") and confluenceScore < -hysteresisExit and not conflict and not weakConsensus
+    bool keepBull = (stableState == "CONFLUENCE_BULLISH" or stableState == "CONFLUENCE_STRONGLY_BULLISH") and confluenceScore > hysteresisExit and not weakConsensus
+    bool keepBear = (stableState == "CONFLUENCE_BEARISH" or stableState == "CONFLUENCE_STRONGLY_BEARISH") and confluenceScore < -hysteresisExit and not weakConsensus
     stableState := keepBull and candidateState == "CONFLUENCE_NEUTRAL" ? "CONFLUENCE_BULLISH" : keepBear and candidateState == "CONFLUENCE_NEUTRAL" ? "CONFLUENCE_BEARISH" : candidateState
 string state = barstate.isconfirmed ? stableState : "FORMING"
 int finalDirection = state == "CONFLUENCE_STRONGLY_BULLISH" or state == "CONFLUENCE_BULLISH" ? 1 : state == "CONFLUENCE_STRONGLY_BEARISH" or state == "CONFLUENCE_BEARISH" ? -1 : 0
-int priorDirection = priorState == "CONFLUENCE_STRONGLY_BULLISH" or priorState == "CONFLUENCE_BULLISH" ? 1 : priorState == "CONFLUENCE_STRONGLY_BEARISH" or priorState == "CONFLUENCE_BEARISH" ? -1 : 0
-bool stateChanged = barstate.isconfirmed and stableState != priorState
-bool scoreTransition = barstate.isconfirmed and math.abs(confluenceScore - priorScore) >= transitionMinDelta
-bool directionChanged = barstate.isconfirmed and finalDirection != 0 and finalDirection != priorDirection
-bool materialTransition = stateChanged and (directionChanged or scoreTransition or stableState == "CONFLUENCE_CONFLICT" or stableState == "CONFLUENCE_LOW_CONFIDENCE")
+bool materialTransition = barstate.isconfirmed and stableState != priorState and math.abs(confluenceScore - priorScore) >= transitionMinDelta
 
-// Strongest supporting/opposing engine
-string strongestSupportEngine = "NONE"
-string strongestOpposingEngine = "NONE"
-float strongestSupportContribution = 0.0
-float strongestOpposingContribution = 0.0
-int rawDirection = confluenceScore > hysteresisExit ? 1 : confluenceScore < -hysteresisExit ? -1 : 0
-array<float> scores = array.from(p01,p02,p03,p04,p05,p06)
-array<float> weights = array.from(ew01,ew02,ew03,ew04,ew05,ew06)
-array<string> names = array.from("P01 Participation","P02 Fair Value","P03 Profile","P04 Value","P05 Zones","P06 Divergence")
-for i = 0 to 5
-    float cc = array.get(scores,i) * array.get(weights,i)
-    if rawDirection == 0
-        if math.abs(cc) > strongestSupportContribution
-            strongestSupportContribution := math.abs(cc)
-            strongestSupportEngine := array.get(names,i)
-    else
-        if cc * rawDirection > 0 and math.abs(cc) > strongestSupportContribution
-            strongestSupportContribution := math.abs(cc)
-            strongestSupportEngine := array.get(names,i)
-        if cc * rawDirection < 0 and math.abs(cc) > strongestOpposingContribution
-            strongestOpposingContribution := math.abs(cc)
-            strongestOpposingEngine := array.get(names,i)
-
-//------------------------------------------------------------------------------
-// Transition discipline
-//------------------------------------------------------------------------------
 var array<label> transitionLabels = array.new_label()
 var int lastTransitionLabelBar = na
 bool transitionCooldownOk = na(lastTransitionLabelBar) or bar_index - lastTransitionLabelBar >= transitionCooldown
 if materialTransition and showTransitions and transitionCooldownOk
     color tc = f_stateColor(stableState)
-    string tx = finalDirection == 1 ? "BIAS ↑" : finalDirection == -1 ? "BIAS ↓" : stableState == "CONFLUENCE_CONFLICT" ? "CONFLICT" : "LOW CONF"
-    float ty = finalDirection == 1 ? low - nz(atr) * 0.15 : finalDirection == -1 ? high + nz(atr) * 0.15 : high + nz(atr) * 0.10
-    label lb = label.new(bar_index, ty, tx, style=finalDirection == 1 ? label.style_label_up : label.style_label_down, textcolor=color.white, color=color.new(tc, 58), size=size.tiny)
+    string tx = finalDirection == 1 ? "BIAS ↑" : finalDirection == -1 ? "BIAS ↓" : "LOW CONF"
+    label lb = label.new(bar_index, finalDirection == 1 ? low - nz(atr)*0.15 : high + nz(atr)*0.15, tx, style=finalDirection == 1 ? label.style_label_up : label.style_label_down, textcolor=color.white, color=color.new(tc, 58), size=size.tiny)
     array.push(transitionLabels, lb)
     lastTransitionLabelBar := bar_index
     while array.size(transitionLabels) > maxTransitionLabels
         label old = array.shift(transitionLabels)
         label.delete(old)
 
-color bgBias = state == "CONFLUENCE_STRONGLY_BULLISH" ? color.new(cBull,94) : state == "CONFLUENCE_BULLISH" ? color.new(color.green,96) : state == "CONFLUENCE_STRONGLY_BEARISH" ? color.new(cBear,94) : state == "CONFLUENCE_BEARISH" ? color.new(cBear,96) : state == "CONFLUENCE_CONFLICT" ? color.new(color.orange,95) : na
+color bgBias = state == "CONFLUENCE_STRONGLY_BULLISH" ? color.new(cBull,94) : state == "CONFLUENCE_BULLISH" ? color.new(color.green,96) : state == "CONFLUENCE_STRONGLY_BEARISH" ? color.new(cBear,94) : state == "CONFLUENCE_BEARISH" ? color.new(cBear,96) : na
 bgcolor(showBiasBackground ? bgBias : na)
 
 //------------------------------------------------------------------------------
-// Optional histogram — bounded reusable pool
+// Status / diagnostic panels
 //------------------------------------------------------------------------------
-var array<box> histBoxes = array.new_box()
-if barstate.isfirst
-    for i = 0 to histogramRows - 1
-        array.push(histBoxes, box.new(bar_index, close, bar_index, close, xloc=xloc.bar_index, border_width=0, bgcolor=color.new(cNeutral,100)))
-if barstate.islast
-    if showHistogram and not na(rangeHigh) and not na(rangeLow) and rangeHigh > rangeLow
-        float rowSize = (rangeHigh - rangeLow) / histogramRows
-        array<float> rowVols = array.new_float(histogramRows,0.0)
-        float maxRowVol = 0.0
-        for j = 0 to profileLen - 1
-            float px = hlc3[j]
-            float vol = volume[j]
-            if not na(px) and not na(vol)
-                int idx = int(math.floor((px - rangeLow) / rowSize))
-                idx := math.max(0,math.min(histogramRows - 1,idx))
-                float nv = array.get(rowVols,idx) + vol
-                array.set(rowVols,idx,nv)
-                maxRowVol := math.max(maxRowVol,nv)
-        for i = 0 to histogramRows - 1
-            box hb = array.get(histBoxes,i)
-            float rv = array.get(rowVols,i)
-            int width = maxRowVol > 0 ? int(math.round(rv / maxRowVol * histogramWidth)) : 0
-            float bottom = rangeLow + i * rowSize
-            float top = bottom + rowSize
-            int rightX = bar_index + histogramOffset
-            int leftX = rightX - width
-            bool inValue = not na(lowerValue) and not na(upperValue) and top >= lowerValue and bottom <= upperValue
-            box.set_lefttop(hb,leftX,top)
-            box.set_rightbottom(hb,rightX,bottom)
-            box.set_bgcolor(hb,width > 0 ? color.new(inValue ? cProfile : cNeutral,inValue ? 82 : 90) : color.new(cNeutral,100))
-            box.set_border_color(hb,color.new(cNeutral,100))
-    else
-        for i = 0 to array.size(histBoxes) - 1
-            box hb = array.get(histBoxes,i)
-            box.set_lefttop(hb,bar_index,close)
-            box.set_rightbottom(hb,bar_index,close)
-            box.set_bgcolor(hb,color.new(cNeutral,100))
-            box.set_border_color(hb,color.new(cNeutral,100))
-
-//------------------------------------------------------------------------------
-// Compact production panel / diagnostics
-//------------------------------------------------------------------------------
-var table status = table.new(position.top_right,2,8,border_width=1,frame_width=1,bgcolor=color.new(color.black,18))
+var table status = table.new(position.top_right, 2, 9, border_width=1, frame_width=1, bgcolor=color.new(color.black,18))
 if barstate.islast
     if showStatusPanel
-        table.clear(status,0,0,1,7)
+        table.clear(status,0,0,1,8)
         color sc = f_stateColor(state)
-        table.cell(status,0,0,"PLUTUS",text_color=color.white,bgcolor=color.new(sc,62),text_halign=text.align_left)
-        table.cell(status,1,0,displayPreset,text_color=color.white,bgcolor=color.new(sc,62),text_halign=text.align_right)
+        table.cell(status,0,0,"PLUTUS",text_color=color.white,bgcolor=color.new(sc,62))
+        table.cell(status,1,0,displayPreset,text_color=color.white,bgcolor=color.new(sc,62))
         table.cell(status,0,1,"Bias",text_color=color.silver)
-        table.cell(status,1,1,finalDirection==1?"BULLISH":finalDirection==-1?"BEARISH":state=="CONFLUENCE_CONFLICT"?"CONFLICT":"NEUTRAL",text_color=sc)
+        table.cell(status,1,1,finalDirection==1?"BULLISH":finalDirection==-1?"BEARISH":"NEUTRAL",text_color=sc)
         table.cell(status,0,2,"Score",text_color=color.silver)
         table.cell(status,1,2,str.tostring(confluenceScore,"#.1"),text_color=confluenceScore>0?cBull:confluenceScore<0?cBear:color.white)
         table.cell(status,0,3,"Confidence",text_color=color.silver)
-        table.cell(status,1,3,str.tostring(confidence,"#.0")+"%",text_color=confidence>=65?cBull:confidence>=40?color.yellow:color.orange)
-        table.cell(status,0,4,"Regime",text_color=color.silver)
-        table.cell(status,1,4,regime,text_color=color.white)
-        table.cell(status,0,5,"Engines",text_color=color.silver)
-        table.cell(status,1,5,str.tostring(activeCount)+"A / "+str.tostring(reliableCount)+"R",text_color=color.white)
-        table.cell(status,0,6,"Support",text_color=color.silver)
-        table.cell(status,1,6,strongestSupportEngine,text_color=color.white)
-        table.cell(status,0,7,"Opposing",text_color=color.silver)
-        table.cell(status,1,7,strongestOpposingEngine,text_color=strongestOpposingEngine=="NONE"?color.gray:color.orange)
+        table.cell(status,1,3,str.tostring(confidence,"#.0")+"%",text_color=color.white)
+        table.cell(status,0,4,"VWAP",text_color=color.silver)
+        table.cell(status,1,4,valueReference,text_color=cVwap)
+        table.cell(status,0,5,"Profile",text_color=color.silver)
+        table.cell(status,1,5,profileScope+" · "+str.tostring(storedBars)+" bars",text_color=color.white)
+        table.cell(status,0,6,"Bull Zone",text_color=color.silver)
+        table.cell(status,1,6,bullZoneType,text_color=bullZoneType=="NONE"?color.gray:cBull)
+        table.cell(status,0,7,"Bear Zone",text_color=color.silver)
+        table.cell(status,1,7,bearZoneType,text_color=bearZoneType=="NONE"?color.gray:cBear)
+        table.cell(status,0,8,"Engines",text_color=color.silver)
+        table.cell(status,1,8,str.tostring(activeCount)+"A / "+str.tostring(reliableCount)+"R",text_color=color.white)
     else
-        table.clear(status,0,0,1,7)
+        table.clear(status,0,0,1,8)
 
-var table diag = table.new(position.bottom_right,4,12,border_width=1,frame_width=1,bgcolor=color.new(color.black,15))
-f_diagRow(int row,string name,float score,float weight,float rel) =>
-    table.cell(diag,0,row,name,text_color=color.silver,text_halign=text.align_left)
-    table.cell(diag,1,row,str.tostring(score,"#.1"),text_color=score>0?cBull:score<0?cBear:color.white)
-    table.cell(diag,2,row,str.tostring(weight,"#.1"),text_color=color.white)
-    table.cell(diag,3,row,str.tostring(rel*100.0,"#.0"),text_color=color.white)
+var table diag = table.new(position.bottom_right, 4, 12, border_width=1, frame_width=1, bgcolor=color.new(color.black,15))
 if barstate.islast
     if showDiagnostics
         table.clear(diag,0,0,3,11)
-        table.cell(diag,0,0,"P08.1 DIAGNOSTICS",text_color=color.white)
+        table.cell(diag,0,0,"P08.1 CORRECTED",text_color=color.white)
         table.cell(diag,1,0,"Score",text_color=color.silver)
-        table.cell(diag,2,0,"EffWt",text_color=color.silver)
+        table.cell(diag,2,0,"Weight",text_color=color.silver)
         table.cell(diag,3,0,"Rel%",text_color=color.silver)
-        f_diagRow(1,"P01 Participation",p01,ew01,r01)
-        f_diagRow(2,"P02 Fair Value",p02,ew02,r02)
-        f_diagRow(3,"P03 Profile",p03,ew03,r03)
-        f_diagRow(4,"P04 Value",p04,ew04,r04)
-        f_diagRow(5,"P05 Zones",p05,ew05,r05)
-        f_diagRow(6,"P06 Divergence",p06,ew06,r06)
-        table.cell(diag,0,7,"Bull / Bear",text_color=color.silver)
-        table.cell(diag,1,7,str.tostring(bullEvidence,"#.1"),text_color=cBull)
-        table.cell(diag,2,7,str.tostring(bearEvidence,"#.1"),text_color=cBear)
-        table.cell(diag,3,7,conflict?"CONFLICT":"OK",text_color=conflict?color.orange:color.white)
-        table.cell(diag,0,8,"State",text_color=color.silver)
-        table.cell(diag,1,8,state,text_color=f_stateColor(state))
-        table.cell(diag,2,8,"Transition",text_color=color.silver)
-        table.cell(diag,3,8,materialTransition?"YES":"NO",text_color=materialTransition?color.orange:color.white)
-        table.cell(diag,0,9,"ATR / ADX",text_color=color.silver)
-        table.cell(diag,1,9,str.tostring(atrRatio,"#.2"),text_color=color.white)
-        table.cell(diag,2,9,str.tostring(adx,"#.1"),text_color=color.white)
-        table.cell(diag,3,9,regime,text_color=color.white)
-        table.cell(diag,0,10,"Objects",text_color=color.silver)
-        table.cell(diag,1,10,str.tostring(array.size(transitionLabels))+" T",text_color=color.white)
-        table.cell(diag,2,10,str.tostring(array.size(divLines))+" D",text_color=color.white)
-        table.cell(diag,3,10,showHistogram?"VP":"-",text_color=color.white)
+        array<float> ds = array.from(p01,p02,p03,p04,p05,p06)
+        array<float> dw = array.from(ew01,ew02,ew03,ew04,ew05,ew06)
+        array<float> dr = array.from(r01,r02,r03,r04,r05,r06)
+        array<string> dn = array.from("P01 Participation","P02 Fair Value","P03 Profile","P04 Value","P05 Zones","P06 Divergence")
+        for i = 0 to 5
+            float s = array.get(ds,i)
+            table.cell(diag,0,i+1,array.get(dn,i),text_color=color.silver)
+            table.cell(diag,1,i+1,str.tostring(s,"#.1"),text_color=s>0?cBull:s<0?cBear:color.white)
+            table.cell(diag,2,i+1,str.tostring(array.get(dw,i),"#.1"),text_color=color.white)
+            table.cell(diag,3,i+1,str.tostring(array.get(dr,i)*100,"#.0"),text_color=color.white)
+        table.cell(diag,0,7,"POC / VAH / VAL",text_color=color.silver)
+        table.cell(diag,1,7,str.tostring(pocPrice,format.mintick),text_color=cPoc)
+        table.cell(diag,2,7,str.tostring(vahPrice,format.mintick),text_color=cVa)
+        table.cell(diag,3,7,str.tostring(valPrice,format.mintick),text_color=cVa)
+        table.cell(diag,0,8,"Histogram",text_color=color.silver)
+        table.cell(diag,1,8,histogramAllocation,text_color=color.white)
+        table.cell(diag,2,8,str.tostring(histogramRows)+" rows",text_color=color.white)
+        table.cell(diag,3,8,showHistogram?"ON":"OFF",text_color=color.white)
+        table.cell(diag,0,9,"Zones",text_color=color.silver)
+        table.cell(diag,1,9,bullZoneType,text_color=cBull)
+        table.cell(diag,2,9,bearZoneType,text_color=cBear)
+        table.cell(diag,3,9,"typed",text_color=color.white)
+        table.cell(diag,0,10,"Divergence",text_color=color.silver)
+        table.cell(diag,1,10,oscillator,text_color=color.white)
+        table.cell(diag,2,10,str.tostring(array.size(divLines))+" lines",text_color=color.white)
+        table.cell(diag,3,10,str.tostring(eventExpiryBars)+" expiry",text_color=color.white)
         table.cell(diag,0,11,"Signals",text_color=color.silver)
         table.cell(diag,1,11,"DISABLED",text_color=color.orange)
         table.cell(diag,2,11,"Phase",text_color=color.silver)
