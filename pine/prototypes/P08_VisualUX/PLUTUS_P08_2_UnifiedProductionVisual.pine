@@ -733,7 +733,7 @@ bgcolor(showBiasBackground?bgBias:na)
 //------------------------------------------------------------------------------
 // Production status / diagnostics
 //------------------------------------------------------------------------------
-position statusPos=panelPosition=="Top Left"?position.top_left:panelPosition=="Bottom Right"?position.bottom_right:panelPosition=="Bottom Left"?position.bottom_left:position.top_right
+string statusPos=panelPosition=="Top Left"?position.top_left:panelPosition=="Bottom Right"?position.bottom_right:panelPosition=="Bottom Left"?position.bottom_left:position.top_right
 int statusRows=compactPanel?7:10
 var table status=table.new(statusPos,2,10,border_width=1,frame_width=1,bgcolor=color.new(color.black,18))
 if barstate.islast
