@@ -478,12 +478,14 @@ if barstate.islast
             box.set_bgcolor(hb,width>0?hc:color.new(color.gray,100))
             box.set_border_color(hb,color.new(color.gray,100))
     else
-        for i = 0 to array.size(histBoxes)-1
-            box hb = array.get(histBoxes,i)
-            box.set_lefttop(hb,bar_index,close)
-            box.set_rightbottom(hb,bar_index,close)
-            box.set_bgcolor(hb,color.new(color.gray,100))
-            box.set_border_color(hb,color.new(color.gray,100))
+        int histCount = array.size(histBoxes)
+        if histCount > 0
+            for i = 0 to histCount - 1
+                box hb = array.get(histBoxes,i)
+                box.set_lefttop(hb,bar_index,close)
+                box.set_rightbottom(hb,bar_index,close)
+                box.set_bgcolor(hb,color.new(color.gray,100))
+                box.set_border_color(hb,color.new(color.gray,100))
 
 //------------------------------------------------------------------------------
 // Institutional-zone inventory: FVG / OB / IFVG / BREAKER
@@ -540,13 +542,15 @@ for pass = 0 to 3
         float support4 = dir==1?p04Bull:p04Bear
         float score = f_clamp(mechanic*0.25 + support1*0.25 + support2*0.20 + support3*0.15 + support4*0.15,0.0,100.0)
         bool duplicate = false
-        for i = 0 to array.size(zDir)-1
-            if array.get(zDir,i)==dir
-                float ov = f_overlapPct(top,bottom,array.get(zTop,i),array.get(zBottom,i))
-                float sep = math.abs((top+bottom)*0.5 - (array.get(zTop,i)+array.get(zBottom,i))*0.5)
-                bool sameFamily = array.get(zType,i)==typ or (typ=="FVG" and str.contains(array.get(zType,i),"FVG"))
-                if ov >= (typ=="FVG" and suppressNestedFvg ? fvgFamilyOverlapPct : duplicateOverlapPct) or (sameFamily and not na(atr) and sep <= minZoneSeparationAtr*atr)
-                    duplicate := true
+        int existingZones = array.size(zDir)
+        if existingZones > 0
+            for i = 0 to existingZones - 1
+                if array.get(zDir,i)==dir
+                    float ov = f_overlapPct(top,bottom,array.get(zTop,i),array.get(zBottom,i))
+                    float sep = math.abs((top+bottom)*0.5 - (array.get(zTop,i)+array.get(zBottom,i))*0.5)
+                    bool sameFamily = array.get(zType,i)==typ or (typ=="FVG" and str.contains(array.get(zType,i),"FVG"))
+                    if ov >= (typ=="FVG" and suppressNestedFvg ? fvgFamilyOverlapPct : duplicateOverlapPct) or (sameFamily and not na(atr) and sep <= minZoneSeparationAtr*atr)
+                        duplicate := true
         bool qualified = score >= minQualificationScore
         if not duplicate and (qualified or not showOnlyQualified)
             if array.size(zDir) >= maxTrackedZones
