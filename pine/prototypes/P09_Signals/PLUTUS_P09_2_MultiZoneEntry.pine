@@ -53,7 +53,9 @@ minConfirmParticipation = input.float(5.0, "Minimum Confirmation Participation",
 requireVwapSide = input.bool(false, "Require Close On Correct Side Of Daily VWAP", group=groupQuality)
 rejectStrongConflict = input.bool(true, "Reject Strong Opposing Evidence", group=groupQuality)
 conflictThreshold = input.float(35.0, "Opposing Evidence Threshold", minval=5, maxval=100, step=5, group=groupQuality)
-allowRepeatSameZone = input.bool(false, "Allow Repeat Signal From Same Zone", group=groupQuality)
+allowRepeatSameZone = input.bool(true, "Allow Repeat Signal From Same Zone", group=groupQuality)
+sameZoneReentryBars = input.int(3, "Minimum Bars Before Same-Zone Re-entry", minval=0, maxval=50, group=groupQuality)
+separateDirectionalCooldown = input.bool(true, "Separate Long / Short Cooldowns", group=groupQuality)
 participationWeight = input.float(40.0, "Context Participation Weight", minval=0, maxval=100, group=groupQuality)
 vwapWeight = input.float(30.0, "Context VWAP Weight", minval=0, maxval=100, group=groupQuality)
 valueWeight = input.float(30.0, "Context Value Weight", minval=0, maxval=100, group=groupQuality)
@@ -82,7 +84,9 @@ groupSignal = "Signal State Machine"
 confirmationMode = input.string("Directional Close", "Close Confirmation", options=["Directional Close", "Close Back Through Midpoint", "Any Valid Close"], group=groupSignal)
 minCloseLocation = input.float(0.55, "Minimum Directional Close Location", minval=0.0, maxval=1.0, step=0.05, group=groupSignal)
 armedExpiryBars = input.int(3, "Armed Setup Expiry", minval=1, maxval=20, group=groupSignal)
-cooldownBars = input.int(10, "Signal Cooldown Bars", minval=0, maxval=100, group=groupSignal)
+cooldownBars = input.int(5, "Signal Cooldown Bars", minval=0, maxval=100, group=groupSignal)
+allowStrongerRearm = input.bool(true, "Allow Stronger Interaction To Replace Armed Setup", group=groupSignal)
+rearmQualityDelta = input.float(7.5, "Minimum Quality Advantage To Re-arm", minval=0, maxval=50, step=0.5, group=groupSignal)
 allowSameBarConfirmation = input.bool(true, "Allow Touch-Bar Close Confirmation", group=groupSignal)
 customMinInteractionQuality = input.float(50.0, "Custom Minimum Interaction Quality", minval=0, maxval=100, step=5, group=groupSignal)
 clusterOverlapPct = input.float(50.0, "Institutional Cluster Overlap %", minval=10, maxval=100, step=5, group=groupSignal)
@@ -357,6 +361,9 @@ while zi >= 0
 //------------------------------------------------------------------------------
 var int lastConfirmedZoneId = na
 var int lastConfirmedDir = 0
+var int lastConfirmedZoneBar = na
+var int lastLongConfirmedBar = na
+var int lastShortConfirmedBar = na
 
 int interactionIdx = na
 int interactionDir = 0
@@ -380,11 +387,13 @@ if zoneCount > 0
         int invArmed = array.get(zArmed, i)
         int pending = array.get(zPendingDir, i)
         bool typeOk = f_typeEnabled(typ)
-        bool repeatOk = allowRepeatSameZone or na(lastConfirmedZoneId) or id != lastConfirmedZoneId
         bool normalTouch = st == "FRESH" and bar_index > born and low <= top and high >= bottom
         bool freshReclaimBreak = st == "ARMED_INVERSION" and not na(invArmed) and bar_index == invArmed and pending != 0
+        int intendedDir = freshReclaimBreak ? pending : dir
+        bool sameAsLastZone = not na(lastConfirmedZoneId) and id == lastConfirmedZoneId and intendedDir == lastConfirmedDir
+        bool sameZoneDelayOk = not sameAsLastZone or na(lastConfirmedZoneBar) or bar_index - lastConfirmedZoneBar >= sameZoneReentryBars
+        bool repeatOk = (allowRepeatSameZone and sameZoneDelayOk) or not sameAsLastZone
         if typeOk and repeatOk and (normalTouch or freshReclaimBreak)
-            int intendedDir = freshReclaimBreak ? pending : dir
             float width = math.max(top - bottom, syminfo.mintick)
             float touchDepth = intendedDir == 1 ? f_clamp((top - low) / width, 0.0, 2.0) : f_clamp((high - bottom) / width, 0.0, 2.0)
             bool sweptBoundary = normalTouch and (intendedDir == 1 ? low < bottom : high > top)
@@ -440,11 +449,32 @@ var float signalEntry = na
 var float signalStop = na
 var float signalTarget = na
 
-bool cooldownActive = not na(lastConfirmedBar) and bar_index - lastConfirmedBar <= cooldownBars
+bool longCooldownActive = not na(lastLongConfirmedBar) and bar_index - lastLongConfirmedBar <= cooldownBars
+bool shortCooldownActive = not na(lastShortConfirmedBar) and bar_index - lastShortConfirmedBar <= cooldownBars
+bool cooldownActive = separateDirectionalCooldown ? (interactionDir == 1 ? longCooldownActive : interactionDir == -1 ? shortCooldownActive : false) : (not na(lastConfirmedBar) and bar_index - lastConfirmedBar <= cooldownBars)
 
 // Interaction arms first. Context is deliberately NOT required here.
 if signalState == "IDLE" and not cooldownActive and not na(interactionIdx)
     signalState := "ARMED"
+    setupDir := interactionDir
+    setupZoneId := array.get(zId, interactionIdx)
+    setupZoneOriginalDir := array.get(zDir, interactionIdx)
+    triggerType := array.get(zType, interactionIdx)
+    setupInteraction := interactionType
+    setupTop := array.get(zTop, interactionIdx)
+    setupBottom := array.get(zBottom, interactionIdx)
+    setupZoneScore := array.get(zScore, interactionIdx)
+    setupClusterQuality := interactionClusterQ
+    setupClusterCount := interactionClusterCount
+    setupTouchDepth := interactionTouchDepth
+    setupBornBar := array.get(zBorn, interactionIdx)
+    armedBar := bar_index
+
+// If a materially stronger interaction appears while waiting, allow it to take priority.
+// This prevents a mediocre setup from monopolizing the only signal slot.
+bool strongerFreshInteraction = signalState == "ARMED" and allowStrongerRearm and not na(interactionIdx) and array.get(zId, interactionIdx) != setupZoneId and bestInteractionQ >= nz(setupClusterQuality, setupZoneScore) + rearmQualityDelta
+bool rearmCooldownOk = not (interactionDir == 1 ? longCooldownActive : interactionDir == -1 ? shortCooldownActive : false)
+if strongerFreshInteraction and rearmCooldownOk
     setupDir := interactionDir
     setupZoneId := array.get(zId, interactionIdx)
     setupZoneOriginalDir := array.get(zDir, interactionIdx)
@@ -530,10 +560,16 @@ if confirmNow
     lastConfirmedBar := bar_index
     lastConfirmedZoneId := setupZoneId
     lastConfirmedDir := setupDir
+    lastConfirmedZoneBar := bar_index
+    if setupDir == 1
+        lastLongConfirmedBar := bar_index
+    else
+        lastShortConfirmedBar := bar_index
     longConfirmed := setupDir == 1
     shortConfirmed := setupDir == -1
 
-string blockReason = cooldownActive ? "COOLDOWN" : signalState == "ARMED" and not sessionOk ? "WAIT SESSION" : signalState == "ARMED" and not contextStillValid ? "WAIT CONTEXT" : signalState == "ARMED" and not participationOk ? "WAIT PARTICIPATION" : signalState == "ARMED" and not interactionCloseConfirmed ? "WAIT CLOSE" : signalState == "ARMED" ? "VALIDATING" : na(interactionIdx) ? "NO INTERACTION" : "INTERACTION READY"
+bool armedCooldown = signalState == "ARMED" and (setupDir == 1 ? longCooldownActive : setupDir == -1 ? shortCooldownActive : false)
+string blockReason = signalState == "IDLE" and cooldownActive ? "COOLDOWN" : signalState == "ARMED" and not sessionOk ? "WAIT SESSION" : signalState == "ARMED" and not contextStillValid ? "WAIT CONTEXT" : signalState == "ARMED" and not participationOk ? "WAIT PARTICIPATION" : signalState == "ARMED" and not interactionCloseConfirmed ? "WAIT CLOSE" : signalState == "ARMED" ? "VALIDATING" : na(interactionIdx) ? "NO INTERACTION" : "INTERACTION READY"
 
 //------------------------------------------------------------------------------
 // Confirmed trade previews
@@ -606,9 +642,9 @@ if barstate.islast and showStateLabel
     string stateText = signalState + (setupDir == 1 ? " · LONG" : setupDir == -1 ? " · SHORT" : "") + (setupInteraction != "NONE" ? " · " + setupInteraction : "") + (triggerType != "NONE" ? " · " + triggerType : "") + (not na(setupQuality) ? " · Q " + str.tostring(setupQuality, "#.0") : "")
     stateLabel := label.new(bar_index, high + nz(atr) * 0.35, stateText, xloc=xloc.bar_index, style=label.style_label_down, textcolor=color.white, color=color.new(signalState == "ARMED" ? color.orange : signalState == "CONFIRMED" ? color.lime : color.gray, 35), size=size.tiny)
 
-var table diag = table.new(position.bottom_right, 2, 18, border_width=1, frame_width=1, bgcolor=color.new(color.black, 15))
+var table diag = table.new(position.bottom_right, 2, 20, border_width=1, frame_width=1, bgcolor=color.new(color.black, 15))
 if barstate.islast
-    table.clear(diag, 0, 0, 1, 17)
+    table.clear(diag, 0, 0, 1, 19)
     if showDiagnostics
         table.cell(diag, 0, 0, "P09.2 " + signalProfile, text_color=color.white)
         table.cell(diag, 1, 0, signalState, text_color=color.white)
@@ -640,12 +676,16 @@ if barstate.islast
         table.cell(diag, 1, 13, sessionOk ? "ALLOWED" : "BLOCKED", text_color=sessionOk ? color.lime : color.orange)
         table.cell(diag, 0, 14, "Close", text_color=color.silver)
         table.cell(diag, 1, 14, interactionCloseConfirmed ? "VALID" : "WAIT", text_color=interactionCloseConfirmed ? color.lime : color.orange)
-        table.cell(diag, 0, 15, "Entry", text_color=color.silver)
-        table.cell(diag, 1, 15, str.tostring(signalEntry, format.mintick), text_color=color.white)
-        table.cell(diag, 0, 16, "Stop", text_color=color.silver)
-        table.cell(diag, 1, 16, str.tostring(signalStop, format.mintick), text_color=color.white)
-        table.cell(diag, 0, 17, "Target", text_color=color.silver)
-        table.cell(diag, 1, 17, str.tostring(signalTarget, format.mintick), text_color=color.white)
+        table.cell(diag, 0, 15, "Cooldown", text_color=color.silver)
+        table.cell(diag, 1, 15, "L " + (longCooldownActive ? "ON" : "OFF") + " / S " + (shortCooldownActive ? "ON" : "OFF"), text_color=color.white)
+        table.cell(diag, 0, 16, "Same-zone re-entry", text_color=color.silver)
+        table.cell(diag, 1, 16, allowRepeatSameZone ? str.tostring(sameZoneReentryBars) + " bars" : "OFF", text_color=color.white)
+        table.cell(diag, 0, 17, "Entry", text_color=color.silver)
+        table.cell(diag, 1, 17, str.tostring(signalEntry, format.mintick), text_color=color.white)
+        table.cell(diag, 0, 18, "Stop", text_color=color.silver)
+        table.cell(diag, 1, 18, str.tostring(signalStop, format.mintick), text_color=color.white)
+        table.cell(diag, 0, 19, "Target", text_color=color.silver)
+        table.cell(diag, 1, 19, str.tostring(signalTarget, format.mintick), text_color=color.white)
 
 alertcondition(longConfirmed, "PLUTUS P09.2 Long Confirmed", "PLUTUS P09.2 confirmed an interaction-first bullish institutional-zone setup on candle close.")
 alertcondition(shortConfirmed, "PLUTUS P09.2 Short Confirmed", "PLUTUS P09.2 confirmed an interaction-first bearish institutional-zone setup on candle close.")
