@@ -1,9 +1,10 @@
 //@version=6
-indicator("PLUTUS P09.2 — Multi-Zone Entry", shorttitle="PLUTUS P09.2", overlay=true, max_boxes_count=300, max_labels_count=220, max_lines_count=120)
+indicator("PLUTUS P09.2 — Interaction-First Multi-Zone Entry", shorttitle="PLUTUS P09.2", overlay=true, max_boxes_count=300, max_labels_count=240, max_lines_count=120)
 
-// P09.2 extends the validated P09.1 signal state machine to the institutional-zone family:
-// FVG, IFVG, Order Block and Breaker Block.
-// Zone interaction ARMS a setup; candle close CONFIRMS it.
+// P09.2 revision: interaction-first institutional-zone signal architecture.
+// A qualified FVG / IFVG / OB / Breaker can ARM on price interaction before context turns.
+// Confirmation-time participation, value/confluence, regime and session gates decide whether the event is tradable.
+// Supported interaction classes: REJECTION, SWEEP_RECLAIM, BREAK_RECLAIM and FLIP_RETEST.
 // Final P10 integration will consume exact upstream P01-P07/P05 outputs.
 
 //------------------------------------------------------------------------------
@@ -83,6 +84,10 @@ minCloseLocation = input.float(0.55, "Minimum Directional Close Location", minva
 armedExpiryBars = input.int(3, "Armed Setup Expiry", minval=1, maxval=20, group=groupSignal)
 cooldownBars = input.int(10, "Signal Cooldown Bars", minval=0, maxval=100, group=groupSignal)
 allowSameBarConfirmation = input.bool(true, "Allow Touch-Bar Close Confirmation", group=groupSignal)
+customMinInteractionQuality = input.float(50.0, "Custom Minimum Interaction Quality", minval=0, maxval=100, step=5, group=groupSignal)
+clusterOverlapPct = input.float(50.0, "Institutional Cluster Overlap %", minval=10, maxval=100, step=5, group=groupSignal)
+clusterBoostPerZone = input.float(7.5, "Cluster Boost Per Additional Zone", minval=0, maxval=20, step=0.5, group=groupSignal)
+maxSweepBeyondAtr = input.float(0.35, "Maximum Sweep Beyond Zone / ATR", minval=0.0, maxval=2.0, step=0.05, group=groupSignal)
 
 groupRisk = "Risk / Reward Preview"
 showRiskReward = input.bool(true, "Show Confirmed Trade Preview", group=groupRisk)
@@ -157,6 +162,7 @@ bool sessionOk = sessionFilter == "All" ? true : sessionFilter == "London" ? inL
 float minConfluence = f_profileThreshold(10.0, 20.0, 35.0, customMinConfluence)
 float minConfidence = f_profileThreshold(30.0, 40.0, 55.0, customMinConfidence)
 float minSetupQuality = f_profileThreshold(45.0, 55.0, 70.0, customMinSetupQuality)
+float minInteractionQuality = f_profileThreshold(38.0, 50.0, 62.0, customMinInteractionQuality)
 float minZoneScore = f_profileThreshold(45.0, baseMinZoneScore, 70.0, baseMinZoneScore)
 
 f_regimeOk(int dir) =>
@@ -165,12 +171,12 @@ f_regimeOk(int dir) =>
 f_conflict(int dir) =>
     dir == 1 ? (participation <= -conflictThreshold or valueScore <= -conflictThreshold) : (participation >= conflictThreshold or valueScore >= conflictThreshold)
 
-f_setupQuality(int dir, float zoneScore, int bornBar) =>
+f_confirmationQuality(int dir, float clusterQuality, int bornBar) =>
     float age = math.max(bar_index - bornBar, 0)
     float freshness = f_clamp(100.0 * (1.0 - age / math.max(maxZoneAge, 1.0)), 0.0, 100.0)
     float directionalConfluence = dir == 1 ? math.max(confluence, 0.0) : math.max(-confluence, 0.0)
     float directionalParticipation = dir == 1 ? math.max(participation, 0.0) : math.max(-participation, 0.0)
-    f_clamp(zoneScore * 0.35 + directionalConfluence * 0.25 + confidence * 0.15 + directionalParticipation * 0.15 + freshness * 0.10, 0.0, 100.0)
+    f_clamp(clusterQuality * 0.40 + directionalConfluence * 0.25 + confidence * 0.15 + directionalParticipation * 0.15 + freshness * 0.05, 0.0, 100.0)
 
 //------------------------------------------------------------------------------
 // P05-style bounded zone inventory
@@ -347,51 +353,85 @@ while zi >= 0
     zi -= 1
 
 //------------------------------------------------------------------------------
-// Select best eligible zone for each direction
+// Interaction-first candidate scan / institutional clustering
 //------------------------------------------------------------------------------
 var int lastConfirmedZoneId = na
 var int lastConfirmedDir = 0
-int bestBullIdx = na
-int bestBearIdx = na
-float bestBullQ = 0.0
-float bestBearQ = 0.0
+
+int interactionIdx = na
+int interactionDir = 0
+string interactionType = "NONE"
+float interactionClusterQ = 0.0
+int interactionClusterCount = 0
+float interactionTouchDepth = 0.0
+float bestInteractionQ = 0.0
 
 int zoneCount = array.size(zId)
 if zoneCount > 0
     for i = 0 to zoneCount - 1
         int dir = array.get(zDir, i)
         string typ = array.get(zType, i)
-        int id = array.get(zId, i)
-        int born = array.get(zBorn, i)
+        string st = array.get(zState, i)
+        float top = array.get(zTop, i)
+        float bottom = array.get(zBottom, i)
         float score = array.get(zScore, i)
+        int born = array.get(zBorn, i)
+        int id = array.get(zId, i)
+        int invArmed = array.get(zArmed, i)
+        int pending = array.get(zPendingDir, i)
         bool typeOk = f_typeEnabled(typ)
-        bool repeatOk = allowRepeatSameZone or na(lastConfirmedZoneId) or id != lastConfirmedZoneId or dir != lastConfirmedDir
-        if typeOk and repeatOk and array.get(zState, i) == "FRESH"
-            float q = f_setupQuality(dir, score, born)
-            if dir == 1 and q > bestBullQ
-                bestBullQ := q
-                bestBullIdx := i
-            if dir == -1 and q > bestBearQ
-                bestBearQ := q
-                bestBearIdx := i
+        bool repeatOk = allowRepeatSameZone or na(lastConfirmedZoneId) or id != lastConfirmedZoneId
+        bool normalTouch = st == "FRESH" and bar_index > born and low <= top and high >= bottom
+        bool freshReclaimBreak = st == "ARMED_INVERSION" and not na(invArmed) and bar_index == invArmed and pending != 0
+        if typeOk and repeatOk and (normalTouch or freshReclaimBreak)
+            int intendedDir = freshReclaimBreak ? pending : dir
+            float width = math.max(top - bottom, syminfo.mintick)
+            float touchDepth = intendedDir == 1 ? f_clamp((top - low) / width, 0.0, 2.0) : f_clamp((high - bottom) / width, 0.0, 2.0)
+            bool sweptBoundary = normalTouch and (intendedDir == 1 ? low < bottom : high > top)
+            float sweepBeyond = sweptBoundary ? (intendedDir == 1 ? bottom - low : high - top) : 0.0
+            bool sweepWithinTolerance = not sweptBoundary or na(atr) or sweepBeyond <= maxSweepBeyondAtr * atr
+            string klass = freshReclaimBreak ? "BREAK_RECLAIM" : (typ == "IFVG" or typ == "BREAKER") ? "FLIP_RETEST" : sweptBoundary and sweepWithinTolerance ? "SWEEP_RECLAIM" : "REJECTION"
+
+            int clusterCount = 1
+            if zoneCount > 1
+                for j = 0 to zoneCount - 1
+                    if j != i and array.get(zState, j) == "FRESH" and array.get(zDir, j) == intendedDir
+                        float ov = f_overlapPct(top, bottom, array.get(zTop, j), array.get(zBottom, j))
+                        if ov >= clusterOverlapPct
+                            clusterCount += 1
+            float clusterQ = f_clamp(score + math.max(clusterCount - 1, 0) * clusterBoostPerZone, 0.0, 100.0)
+            float age = math.max(bar_index - born, 0)
+            float freshness = f_clamp(100.0 * (1.0 - age / math.max(maxZoneAge, 1.0)), 0.0, 100.0)
+            float interactionQ = f_clamp(clusterQ * 0.75 + freshness * 0.15 + f_clamp(touchDepth * 50.0, 0.0, 100.0) * 0.10, 0.0, 100.0)
+            if interactionQ >= minInteractionQuality and interactionQ > bestInteractionQ
+                bestInteractionQ := interactionQ
+                interactionIdx := i
+                interactionDir := intendedDir
+                interactionType := klass
+                interactionClusterQ := clusterQ
+                interactionClusterCount := clusterCount
+                interactionTouchDepth := touchDepth
 
 bool bullConflict = rejectStrongConflict and f_conflict(1)
 bool bearConflict = rejectStrongConflict and f_conflict(-1)
 bool bullContextBase = sessionOk and f_regimeOk(1) and not bullConflict and confluence >= minConfluence and confidence >= minConfidence and (not requireVwapSide or close >= dailyVwap)
 bool bearContextBase = sessionOk and f_regimeOk(-1) and not bearConflict and confluence <= -minConfluence and confidence >= minConfidence and (not requireVwapSide or close <= dailyVwap)
-bool bullReady = not na(bestBullIdx) and bestBullQ >= minSetupQuality and bullContextBase
-bool bearReady = not na(bestBearIdx) and bestBearQ >= minSetupQuality and bearContextBase
 
 //------------------------------------------------------------------------------
-// Unified state machine bound to stable zone ID
+// Unified interaction-first state machine bound to stable zone ID
 //------------------------------------------------------------------------------
 var string signalState = "IDLE"
 var int setupDir = 0
 var int setupZoneId = na
+var int setupZoneOriginalDir = 0
 var string triggerType = "NONE"
+var string setupInteraction = "NONE"
 var float setupTop = na
 var float setupBottom = na
 var float setupZoneScore = na
+var float setupClusterQuality = na
+var int setupClusterCount = 0
+var float setupTouchDepth = na
 var float setupQuality = na
 var int setupBornBar = na
 var int armedBar = na
@@ -401,33 +441,25 @@ var float signalStop = na
 var float signalTarget = na
 
 bool cooldownActive = not na(lastConfirmedBar) and bar_index - lastConfirmedBar <= cooldownBars
-string blockReason = cooldownActive ? "COOLDOWN" : not sessionOk ? "SESSION" : zoneCount == 0 ? "NO ZONE" : "QUALITY / CONTEXT"
 
-if signalState == "IDLE" and not cooldownActive
-    if bullReady
-        signalState := "SETUP"
-        setupDir := 1
-        setupZoneId := array.get(zId, bestBullIdx)
-        triggerType := array.get(zType, bestBullIdx)
-        setupTop := array.get(zTop, bestBullIdx)
-        setupBottom := array.get(zBottom, bestBullIdx)
-        setupZoneScore := array.get(zScore, bestBullIdx)
-        setupQuality := bestBullQ
-        setupBornBar := array.get(zBorn, bestBullIdx)
-        blockReason := "READY LONG " + triggerType
-    else if bearReady
-        signalState := "SETUP"
-        setupDir := -1
-        setupZoneId := array.get(zId, bestBearIdx)
-        triggerType := array.get(zType, bestBearIdx)
-        setupTop := array.get(zTop, bestBearIdx)
-        setupBottom := array.get(zBottom, bestBearIdx)
-        setupZoneScore := array.get(zScore, bestBearIdx)
-        setupQuality := bestBearQ
-        setupBornBar := array.get(zBorn, bestBearIdx)
-        blockReason := "READY SHORT " + triggerType
+// Interaction arms first. Context is deliberately NOT required here.
+if signalState == "IDLE" and not cooldownActive and not na(interactionIdx)
+    signalState := "ARMED"
+    setupDir := interactionDir
+    setupZoneId := array.get(zId, interactionIdx)
+    setupZoneOriginalDir := array.get(zDir, interactionIdx)
+    triggerType := array.get(zType, interactionIdx)
+    setupInteraction := interactionType
+    setupTop := array.get(zTop, interactionIdx)
+    setupBottom := array.get(zBottom, interactionIdx)
+    setupZoneScore := array.get(zScore, interactionIdx)
+    setupClusterQuality := interactionClusterQ
+    setupClusterCount := interactionClusterCount
+    setupTouchDepth := interactionTouchDepth
+    setupBornBar := array.get(zBorn, interactionIdx)
+    armedBar := bar_index
 
-// Resolve current array index from stable setupZoneId.
+// Resolve the exact source zone on every bar.
 int boundIdx = na
 int liveCount = array.size(zId)
 if not na(setupZoneId) and liveCount > 0
@@ -435,34 +467,51 @@ if not na(setupZoneId) and liveCount > 0
         if array.get(zId, i) == setupZoneId
             boundIdx := i
 
-bool boundZoneValid = not na(boundIdx) and array.get(zDir, boundIdx) == setupDir and array.get(zType, boundIdx) == triggerType and array.get(zState, boundIdx) == "FRESH"
-if (signalState == "SETUP" or signalState == "ARMED") and not boundZoneValid
+bool boundZoneValid = false
+if not na(boundIdx)
+    int liveDir = array.get(zDir, boundIdx)
+    string liveType = array.get(zType, boundIdx)
+    string liveState = array.get(zState, boundIdx)
+    int livePending = array.get(zPendingDir, boundIdx)
+    if setupInteraction == "BREAK_RECLAIM"
+        bool stillConverting = liveState == "ARMED_INVERSION" and livePending == setupDir
+        bool converted = liveState == "FRESH" and liveDir == setupDir and (liveType == "IFVG" or liveType == "BREAKER")
+        boundZoneValid := stillConverting or converted
+    else
+        boundZoneValid := liveState == "FRESH" and liveDir == setupDir
+
+if signalState == "ARMED" and not boundZoneValid
     signalState := "INVALIDATED"
 
 if boundZoneValid
     setupTop := array.get(zTop, boundIdx)
     setupBottom := array.get(zBottom, boundIdx)
     setupZoneScore := array.get(zScore, boundIdx)
-    setupBornBar := array.get(zBorn, boundIdx)
 
-bool touched = setupDir == 1 ? low <= setupTop and high >= setupBottom : setupDir == -1 ? high >= setupBottom and low <= setupTop : false
-if signalState == "SETUP" and touched and bar_index > setupBornBar
-    signalState := "ARMED"
-    armedBar := bar_index
-
+// Candle-close reaction classification.
 float closeLoc = f_closeLocation()
 float zoneMid = (setupTop + setupBottom) * 0.5
 bool directionalClose = setupDir == 1 ? close > open and closeLoc >= minCloseLocation : setupDir == -1 ? close < open and closeLoc <= 1.0 - minCloseLocation : false
 bool midpointClose = setupDir == 1 ? close >= zoneMid : setupDir == -1 ? close <= zoneMid : false
 bool anyValidClose = setupDir == 1 ? close >= setupBottom : setupDir == -1 ? close <= setupTop : false
-bool closeConfirmed = confirmationMode == "Directional Close" ? directionalClose : confirmationMode == "Close Back Through Midpoint" ? midpointClose : anyValidClose
-float liveSetupQuality = boundZoneValid ? f_setupQuality(setupDir, setupZoneScore, setupBornBar) : 0.0
+bool standardCloseConfirmed = confirmationMode == "Directional Close" ? directionalClose : confirmationMode == "Close Back Through Midpoint" ? midpointClose : anyValidClose
+bool reclaimCloseConfirmed = setupDir == 1 ? close > setupTop : setupDir == -1 ? close < setupBottom : false
+bool sweepCloseConfirmed = setupDir == 1 ? close >= setupBottom : setupDir == -1 ? close <= setupTop : false
+bool interactionCloseConfirmed = setupInteraction == "BREAK_RECLAIM" ? reclaimCloseConfirmed : setupInteraction == "SWEEP_RECLAIM" ? (sweepCloseConfirmed and standardCloseConfirmed) : standardCloseConfirmed
+
+float liveSetupQuality = boundZoneValid ? f_confirmationQuality(setupDir, nz(setupClusterQuality, setupZoneScore), setupBornBar) : 0.0
 bool participationOk = setupDir == 1 ? participation >= minConfirmParticipation : setupDir == -1 ? participation <= -minConfirmParticipation : false
 bool contextStillValid = setupDir == 1 ? bullContextBase : setupDir == -1 ? bearContextBase : false
 bool sameBarAllowed = allowSameBarConfirmation or na(armedBar) or bar_index > armedBar
-bool confirmNow = signalState == "ARMED" and sameBarAllowed and barstate.isconfirmed and closeConfirmed and participationOk and contextStillValid and liveSetupQuality >= minSetupQuality and boundZoneValid
+bool confirmNow = signalState == "ARMED" and sameBarAllowed and barstate.isconfirmed and interactionCloseConfirmed and participationOk and contextStillValid and liveSetupQuality >= minSetupQuality and boundZoneValid
 
-bool setupBroken = setupDir == 1 ? close < setupBottom : setupDir == -1 ? close > setupTop : false
+// Interaction-specific invalidation.
+bool setupBroken = false
+if setupInteraction == "BREAK_RECLAIM"
+    setupBroken := setupDir == 1 ? close < setupBottom : setupDir == -1 ? close > setupTop : false
+else
+    setupBroken := setupDir == 1 ? close < setupBottom : setupDir == -1 ? close > setupTop : false
+
 if signalState == "ARMED" and setupBroken
     signalState := "INVALIDATED"
 if signalState == "ARMED" and not na(armedBar) and bar_index - armedBar > armedExpiryBars
@@ -484,6 +533,8 @@ if confirmNow
     longConfirmed := setupDir == 1
     shortConfirmed := setupDir == -1
 
+string blockReason = cooldownActive ? "COOLDOWN" : signalState == "ARMED" and not sessionOk ? "WAIT SESSION" : signalState == "ARMED" and not contextStillValid ? "WAIT CONTEXT" : signalState == "ARMED" and not participationOk ? "WAIT PARTICIPATION" : signalState == "ARMED" and not interactionCloseConfirmed ? "WAIT CLOSE" : signalState == "ARMED" ? "VALIDATING" : na(interactionIdx) ? "NO INTERACTION" : "INTERACTION READY"
+
 //------------------------------------------------------------------------------
 // Confirmed trade previews
 //------------------------------------------------------------------------------
@@ -493,7 +544,7 @@ var array<label> signalLabels = array.new_label()
 
 if longConfirmed or shortConfirmed
     color sigColor = longConfirmed ? color.lime : color.red
-    string sigText = (longConfirmed ? "PLUTUS LONG · " : "PLUTUS SHORT · ") + triggerType + " · Q " + str.tostring(setupQuality, "#.0")
+    string sigText = (longConfirmed ? "PLUTUS LONG · " : "PLUTUS SHORT · ") + setupInteraction + " · " + triggerType + " · Q " + str.tostring(setupQuality, "#.0")
     label lb = label.new(bar_index, close, sigText, xloc=xloc.bar_index, style=longConfirmed ? label.style_label_up : label.style_label_down, textcolor=color.white, color=color.new(sigColor, 15), size=size.small)
     array.push(signalLabels, lb)
     while array.size(signalLabels) > maxTradePreviews
@@ -516,10 +567,15 @@ if barstate.isconfirmed and (signalState == "INVALIDATED" or signalState == "EXP
     signalState := "IDLE"
     setupDir := 0
     setupZoneId := na
+    setupZoneOriginalDir := 0
     triggerType := "NONE"
+    setupInteraction := "NONE"
     setupTop := na
     setupBottom := na
     setupZoneScore := na
+    setupClusterQuality := na
+    setupClusterCount := 0
+    setupTouchDepth := na
     setupQuality := na
     setupBornBar := na
     armedBar := na
@@ -527,10 +583,15 @@ if signalState == "COOLDOWN" and not cooldownActive
     signalState := "IDLE"
     setupDir := 0
     setupZoneId := na
+    setupZoneOriginalDir := 0
     triggerType := "NONE"
+    setupInteraction := "NONE"
     setupTop := na
     setupBottom := na
     setupZoneScore := na
+    setupClusterQuality := na
+    setupClusterCount := 0
+    setupTouchDepth := na
     setupQuality := na
     setupBornBar := na
     armedBar := na
@@ -542,45 +603,49 @@ var label stateLabel = na
 if barstate.islast and showStateLabel
     if not na(stateLabel)
         label.delete(stateLabel)
-    string stateText = signalState + (setupDir == 1 ? " · LONG" : setupDir == -1 ? " · SHORT" : "") + (triggerType != "NONE" ? " · " + triggerType : "") + (not na(setupQuality) ? " · Q " + str.tostring(setupQuality, "#.0") : "")
+    string stateText = signalState + (setupDir == 1 ? " · LONG" : setupDir == -1 ? " · SHORT" : "") + (setupInteraction != "NONE" ? " · " + setupInteraction : "") + (triggerType != "NONE" ? " · " + triggerType : "") + (not na(setupQuality) ? " · Q " + str.tostring(setupQuality, "#.0") : "")
     stateLabel := label.new(bar_index, high + nz(atr) * 0.35, stateText, xloc=xloc.bar_index, style=label.style_label_down, textcolor=color.white, color=color.new(signalState == "ARMED" ? color.orange : signalState == "CONFIRMED" ? color.lime : color.gray, 35), size=size.tiny)
 
-var table diag = table.new(position.bottom_right, 2, 16, border_width=1, frame_width=1, bgcolor=color.new(color.black, 15))
+var table diag = table.new(position.bottom_right, 2, 18, border_width=1, frame_width=1, bgcolor=color.new(color.black, 15))
 if barstate.islast
-    table.clear(diag, 0, 0, 1, 15)
+    table.clear(diag, 0, 0, 1, 17)
     if showDiagnostics
         table.cell(diag, 0, 0, "P09.2 " + signalProfile, text_color=color.white)
         table.cell(diag, 1, 0, signalState, text_color=color.white)
         table.cell(diag, 0, 1, "Direction", text_color=color.silver)
         table.cell(diag, 1, 1, setupDir == 1 ? "LONG" : setupDir == -1 ? "SHORT" : "NONE", text_color=setupDir == 1 ? color.lime : setupDir == -1 ? color.red : color.gray)
-        table.cell(diag, 0, 2, "Trigger", text_color=color.silver)
-        table.cell(diag, 1, 2, triggerType, text_color=color.white)
-        table.cell(diag, 0, 3, "Zone ID", text_color=color.silver)
-        table.cell(diag, 1, 3, str.tostring(setupZoneId), text_color=color.white)
-        table.cell(diag, 0, 4, "Block / Ready", text_color=color.silver)
-        table.cell(diag, 1, 4, blockReason, text_color=color.white)
-        table.cell(diag, 0, 5, "Confluence", text_color=color.silver)
-        table.cell(diag, 1, 5, str.tostring(confluence, "#.1") + " / " + str.tostring(minConfluence, "#.0"), text_color=confluence > 0 ? color.lime : confluence < 0 ? color.red : color.white)
-        table.cell(diag, 0, 6, "Confidence", text_color=color.silver)
-        table.cell(diag, 1, 6, str.tostring(confidence, "#.0") + "% / " + str.tostring(minConfidence, "#.0"), text_color=color.white)
-        table.cell(diag, 0, 7, "Setup Quality", text_color=color.silver)
-        table.cell(diag, 1, 7, str.tostring(setupQuality, "#.0") + " / " + str.tostring(minSetupQuality, "#.0"), text_color=color.white)
-        table.cell(diag, 0, 8, "Participation", text_color=color.silver)
-        table.cell(diag, 1, 8, str.tostring(participation, "#.1"), text_color=participation > 0 ? color.lime : participation < 0 ? color.red : color.white)
-        table.cell(diag, 0, 9, "Regime", text_color=color.silver)
-        table.cell(diag, 1, 9, compression ? "COMPRESSION" : bullTrendRegime ? "BULL TREND" : bearTrendRegime ? "BEAR TREND" : "MIXED", text_color=color.white)
-        table.cell(diag, 0, 10, "Session", text_color=color.silver)
-        table.cell(diag, 1, 10, sessionOk ? "ALLOWED" : "BLOCKED", text_color=sessionOk ? color.lime : color.orange)
-        table.cell(diag, 0, 11, "Zones", text_color=color.silver)
-        table.cell(diag, 1, 11, str.tostring(zoneCount) + " active", text_color=color.white)
-        table.cell(diag, 0, 12, "Touch / Close", text_color=color.silver)
-        table.cell(diag, 1, 12, (touched ? "TOUCH " : "") + (closeConfirmed ? "VALID" : "WAIT"), text_color=color.white)
-        table.cell(diag, 0, 13, "Entry", text_color=color.silver)
-        table.cell(diag, 1, 13, str.tostring(signalEntry, format.mintick), text_color=color.white)
-        table.cell(diag, 0, 14, "Stop", text_color=color.silver)
-        table.cell(diag, 1, 14, str.tostring(signalStop, format.mintick), text_color=color.white)
-        table.cell(diag, 0, 15, "Target", text_color=color.silver)
-        table.cell(diag, 1, 15, str.tostring(signalTarget, format.mintick), text_color=color.white)
+        table.cell(diag, 0, 2, "Interaction", text_color=color.silver)
+        table.cell(diag, 1, 2, setupInteraction, text_color=color.white)
+        table.cell(diag, 0, 3, "Trigger", text_color=color.silver)
+        table.cell(diag, 1, 3, triggerType, text_color=color.white)
+        table.cell(diag, 0, 4, "Zone ID", text_color=color.silver)
+        table.cell(diag, 1, 4, str.tostring(setupZoneId), text_color=color.white)
+        table.cell(diag, 0, 5, "Block / Ready", text_color=color.silver)
+        table.cell(diag, 1, 5, blockReason, text_color=color.white)
+        table.cell(diag, 0, 6, "Confluence", text_color=color.silver)
+        table.cell(diag, 1, 6, str.tostring(confluence, "#.1") + " / " + str.tostring(minConfluence, "#.0"), text_color=confluence > 0 ? color.lime : confluence < 0 ? color.red : color.white)
+        table.cell(diag, 0, 7, "Confidence", text_color=color.silver)
+        table.cell(diag, 1, 7, str.tostring(confidence, "#.0") + "% / " + str.tostring(minConfidence, "#.0"), text_color=color.white)
+        table.cell(diag, 0, 8, "Confirm Quality", text_color=color.silver)
+        table.cell(diag, 1, 8, str.tostring(liveSetupQuality, "#.0") + " / " + str.tostring(minSetupQuality, "#.0"), text_color=color.white)
+        table.cell(diag, 0, 9, "Cluster", text_color=color.silver)
+        table.cell(diag, 1, 9, str.tostring(setupClusterCount) + " · Q " + str.tostring(setupClusterQuality, "#.0"), text_color=color.white)
+        table.cell(diag, 0, 10, "Touch depth", text_color=color.silver)
+        table.cell(diag, 1, 10, str.tostring(setupTouchDepth, "#.2"), text_color=color.white)
+        table.cell(diag, 0, 11, "Participation", text_color=color.silver)
+        table.cell(diag, 1, 11, str.tostring(participation, "#.1"), text_color=participation > 0 ? color.lime : participation < 0 ? color.red : color.white)
+        table.cell(diag, 0, 12, "Regime", text_color=color.silver)
+        table.cell(diag, 1, 12, compression ? "COMPRESSION" : bullTrendRegime ? "BULL TREND" : bearTrendRegime ? "BEAR TREND" : "MIXED", text_color=color.white)
+        table.cell(diag, 0, 13, "Session", text_color=color.silver)
+        table.cell(diag, 1, 13, sessionOk ? "ALLOWED" : "BLOCKED", text_color=sessionOk ? color.lime : color.orange)
+        table.cell(diag, 0, 14, "Close", text_color=color.silver)
+        table.cell(diag, 1, 14, interactionCloseConfirmed ? "VALID" : "WAIT", text_color=interactionCloseConfirmed ? color.lime : color.orange)
+        table.cell(diag, 0, 15, "Entry", text_color=color.silver)
+        table.cell(diag, 1, 15, str.tostring(signalEntry, format.mintick), text_color=color.white)
+        table.cell(diag, 0, 16, "Stop", text_color=color.silver)
+        table.cell(diag, 1, 16, str.tostring(signalStop, format.mintick), text_color=color.white)
+        table.cell(diag, 0, 17, "Target", text_color=color.silver)
+        table.cell(diag, 1, 17, str.tostring(signalTarget, format.mintick), text_color=color.white)
 
-alertcondition(longConfirmed, "PLUTUS P09.2 Long Confirmed", "PLUTUS P09.2 confirmed a bullish institutional-zone setup on candle close.")
-alertcondition(shortConfirmed, "PLUTUS P09.2 Short Confirmed", "PLUTUS P09.2 confirmed a bearish institutional-zone setup on candle close.")
+alertcondition(longConfirmed, "PLUTUS P09.2 Long Confirmed", "PLUTUS P09.2 confirmed an interaction-first bullish institutional-zone setup on candle close.")
+alertcondition(shortConfirmed, "PLUTUS P09.2 Short Confirmed", "PLUTUS P09.2 confirmed an interaction-first bearish institutional-zone setup on candle close.")
