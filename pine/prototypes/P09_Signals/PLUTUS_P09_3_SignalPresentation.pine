@@ -512,6 +512,7 @@ var string signalState = "IDLE"
 var int setupDir = 0
 var int setupZoneId = na
 var int setupZoneOriginalDir = 0
+var string setupSourceType = "NONE"
 var string triggerType = "NONE"
 var string setupInteraction = "NONE"
 var float setupTop = na
@@ -538,6 +539,7 @@ if signalState == "IDLE" and not cooldownActive and not na(interactionIdx)
     setupDir := interactionDir
     setupZoneId := array.get(zId, interactionIdx)
     setupZoneOriginalDir := array.get(zDir, interactionIdx)
+    setupSourceType := array.get(zType, interactionIdx)
     triggerType := array.get(zType, interactionIdx)
     setupInteraction := interactionType
     setupTop := array.get(zTop, interactionIdx)
@@ -557,6 +559,7 @@ if strongerFreshInteraction and rearmCooldownOk
     setupDir := interactionDir
     setupZoneId := array.get(zId, interactionIdx)
     setupZoneOriginalDir := array.get(zDir, interactionIdx)
+    setupSourceType := array.get(zType, interactionIdx)
     triggerType := array.get(zType, interactionIdx)
     setupInteraction := interactionType
     setupTop := array.get(zTop, interactionIdx)
@@ -577,17 +580,37 @@ if not na(setupZoneId) and liveCount > 0
             boundIdx := i
 
 bool boundZoneValid = false
+bool directionInvariantOk = false
+bool typeInvariantOk = false
+int liveBoundDir = 0
+string liveBoundType = "NONE"
+string liveBoundState = "NONE"
 if not na(boundIdx)
-    int liveDir = array.get(zDir, boundIdx)
-    string liveType = array.get(zType, boundIdx)
-    string liveState = array.get(zState, boundIdx)
+    liveBoundDir := array.get(zDir, boundIdx)
+    liveBoundType := array.get(zType, boundIdx)
+    liveBoundState := array.get(zState, boundIdx)
     int livePending = array.get(zPendingDir, boundIdx)
-    if setupInteraction == "ZONE_FAILURE" or setupInteraction == "BREAK_RECLAIM"
-        bool justFlipped = liveState == "JUST_FLIPPED" and livePending == setupDir
-        bool converted = (liveState == "FRESH" or liveState == "TERMINAL_FILL") and liveDir == setupDir and (liveType == "IFVG" or liveType == "BREAKER")
-        boundZoneValid := justFlipped or converted
+
+    if setupInteraction == "ZONE_FAILURE"
+        // Failure is the only class allowed to trade opposite the original source.
+        bool justFlipped = liveBoundState == "JUST_FLIPPED" and livePending == setupDir
+        bool converted = (liveBoundState == "FRESH" or liveBoundState == "TERMINAL_FILL") and liveBoundDir == setupDir and (liveBoundType == "IFVG" or liveBoundType == "BREAKER")
+        directionInvariantOk := setupDir == -setupZoneOriginalDir
+        typeInvariantOk := justFlipped or converted
+        boundZoneValid := directionInvariantOk and typeInvariantOk
+    else if setupInteraction == "BREAK_RECLAIM"
+        directionInvariantOk := liveBoundDir == setupDir
+        typeInvariantOk := liveBoundType == "IFVG" or liveBoundType == "BREAKER"
+        boundZoneValid := directionInvariantOk and typeInvariantOk and (liveBoundState == "FRESH" or liveBoundState == "TERMINAL_FILL")
+    else if setupInteraction == "FLIP_RETEST"
+        directionInvariantOk := liveBoundDir == setupDir
+        typeInvariantOk := (liveBoundType == "IFVG" or liveBoundType == "BREAKER") and liveBoundType == triggerType
+        boundZoneValid := directionInvariantOk and typeInvariantOk and (liveBoundState == "FRESH" or liveBoundState == "TERMINAL_FILL")
     else
-        boundZoneValid := (liveState == "FRESH" or liveState == "WEAK" or liveState == "TERMINAL_FILL") and liveDir == setupDir
+        // REJECTION / SWEEP_RECLAIM must always follow the live zone direction.
+        directionInvariantOk := liveBoundDir == setupDir
+        typeInvariantOk := liveBoundType == triggerType and (liveBoundType == "FVG" or liveBoundType == "OB")
+        boundZoneValid := directionInvariantOk and typeInvariantOk and (liveBoundState == "FRESH" or liveBoundState == "WEAK" or liveBoundState == "TERMINAL_FILL")
 
 if signalState == "ARMED" and not boundZoneValid
     signalState := "INVALIDATED"
@@ -596,6 +619,8 @@ if boundZoneValid
     setupTop := array.get(zTop, boundIdx)
     setupBottom := array.get(zBottom, boundIdx)
     setupZoneScore := array.get(zScore, boundIdx)
+    if setupInteraction == "ZONE_FAILURE"
+        triggerType := liveBoundType
 
 // Candle-close reaction classification.
 float closeLoc = f_closeLocation()
@@ -629,7 +654,7 @@ bool failureContextOk = confirmationSpeed == "Conservative" ? contextStillValid 
 bool zoneFailureConfirm = isZoneFailure and reclaimCloseConfirmed and failureCandleDirOk and failureImpulseOk and failureParticipationOk and failureContextOk and liveSetupQuality >= failureQualityThreshold
 
 bool normalConfirm = not isZoneFailure and interactionCloseConfirmed and participationOk and contextStillValid and liveSetupQuality >= minSetupQuality
-bool confirmNow = signalState == "ARMED" and sameBarAllowed and barstate.isconfirmed and boundZoneValid and (zoneFailureConfirm or normalConfirm)
+bool confirmNow = signalState == "ARMED" and sameBarAllowed and barstate.isconfirmed and boundZoneValid and directionInvariantOk and typeInvariantOk and (zoneFailureConfirm or normalConfirm)
 
 // Interaction-specific invalidation.
 bool setupBroken = false
@@ -682,7 +707,8 @@ var label armedMarker = na
 if longConfirmed or shortConfirmed
     color sigColor = longConfirmed ? color.lime : color.red
     string sideText = longConfirmed ? "LONG" : "SHORT"
-    string sigText = signalDisplay == "Minimal" ? sideText : signalDisplay == "Compact" ? sideText + " · " + setupInteraction : "PLUTUS " + sideText + " · " + setupInteraction + " · " + triggerType + " · Q " + str.tostring(setupQuality, "#.0")
+    string zoneSideText = setupDir == 1 ? "BULL " : "BEAR "
+    string sigText = signalDisplay == "Minimal" ? sideText : signalDisplay == "Compact" ? sideText + " · " + zoneSideText + triggerType : "PLUTUS " + sideText + " · " + setupInteraction + " · " + zoneSideText + triggerType + " · Q " + str.tostring(setupQuality, "#.0")
     label lb = label.new(bar_index, close, sigText, xloc=xloc.bar_index, style=longConfirmed ? label.style_label_up : label.style_label_down, textcolor=color.white, color=color.new(sigColor, 15), size=signalDisplay == "Detailed" ? size.small : size.tiny)
     array.push(signalLabels, lb)
     while array.size(signalLabels) > maxTradePreviews
@@ -734,6 +760,7 @@ if barstate.isconfirmed and (signalState == "INVALIDATED" or signalState == "EXP
     setupDir := 0
     setupZoneId := na
     setupZoneOriginalDir := 0
+    setupSourceType := "NONE"
     triggerType := "NONE"
     setupInteraction := "NONE"
     setupTop := na
@@ -750,6 +777,7 @@ if signalState == "COOLDOWN" and not cooldownActive
     setupDir := 0
     setupZoneId := na
     setupZoneOriginalDir := 0
+    setupSourceType := "NONE"
     triggerType := "NONE"
     setupInteraction := "NONE"
     setupTop := na
@@ -782,9 +810,9 @@ if barstate.islast and showStateLabel
     string stateText = signalState + (setupDir == 1 ? " · LONG" : setupDir == -1 ? " · SHORT" : "") + (setupInteraction != "NONE" ? " · " + setupInteraction : "") + (triggerType != "NONE" ? " · " + triggerType : "") + (not na(setupQuality) ? " · Q " + str.tostring(setupQuality, "#.0") : "")
     stateLabel := label.new(bar_index, high + nz(atr) * 0.35, stateText, xloc=xloc.bar_index, style=label.style_label_down, textcolor=color.white, color=color.new(signalState == "ARMED" ? color.orange : signalState == "CONFIRMED" ? color.lime : color.gray, 35), size=size.tiny)
 
-var table diag = table.new(position.bottom_right, 2, 24, border_width=1, frame_width=1, bgcolor=color.new(color.black, 15))
+var table diag = table.new(position.bottom_right, 2, 27, border_width=1, frame_width=1, bgcolor=color.new(color.black, 15))
 if barstate.islast
-    table.clear(diag, 0, 0, 1, 23)
+    table.clear(diag, 0, 0, 1, 26)
     if showDiagnostics
         table.cell(diag, 0, 0, "P09.3 " + signalProfile, text_color=color.white)
         table.cell(diag, 1, 0, signalState, text_color=color.white)
@@ -830,12 +858,18 @@ if barstate.islast
         table.cell(diag, 1, 19, boundLife, text_color=color.white)
         table.cell(diag, 0, 20, "OB revisits", text_color=color.silver)
         table.cell(diag, 1, 20, str.tostring(boundTouches), text_color=color.white)
-        table.cell(diag, 0, 21, "Entry", text_color=color.silver)
-        table.cell(diag, 1, 21, str.tostring(signalEntry, format.mintick), text_color=color.white)
-        table.cell(diag, 0, 22, "Stop", text_color=color.silver)
-        table.cell(diag, 1, 22, str.tostring(signalStop, format.mintick), text_color=color.white)
-        table.cell(diag, 0, 23, "Target", text_color=color.silver)
-        table.cell(diag, 1, 23, str.tostring(signalTarget, format.mintick), text_color=color.white)
+        table.cell(diag, 0, 21, "Live zone", text_color=color.silver)
+        table.cell(diag, 1, 21, (liveBoundDir == 1 ? "BULL " : liveBoundDir == -1 ? "BEAR " : "") + liveBoundType, text_color=liveBoundDir == 1 ? color.lime : liveBoundDir == -1 ? color.red : color.white)
+        table.cell(diag, 0, 22, "Dir invariant", text_color=color.silver)
+        table.cell(diag, 1, 22, directionInvariantOk ? "PASS" : "FAIL", text_color=directionInvariantOk ? color.lime : color.red)
+        table.cell(diag, 0, 23, "Type invariant", text_color=color.silver)
+        table.cell(diag, 1, 23, typeInvariantOk ? "PASS" : "FAIL", text_color=typeInvariantOk ? color.lime : color.red)
+        table.cell(diag, 0, 24, "Entry", text_color=color.silver)
+        table.cell(diag, 1, 24, str.tostring(signalEntry, format.mintick), text_color=color.white)
+        table.cell(diag, 0, 25, "Stop", text_color=color.silver)
+        table.cell(diag, 1, 25, str.tostring(signalStop, format.mintick), text_color=color.white)
+        table.cell(diag, 0, 26, "Target", text_color=color.silver)
+        table.cell(diag, 1, 26, str.tostring(signalTarget, format.mintick), text_color=color.white)
 
 bool rejectionConfirmed = (longConfirmed or shortConfirmed) and setupInteraction == "REJECTION"
 bool sweepConfirmed = (longConfirmed or shortConfirmed) and setupInteraction == "SWEEP_RECLAIM"
