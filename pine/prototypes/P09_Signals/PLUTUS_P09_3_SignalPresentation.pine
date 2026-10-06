@@ -2,7 +2,8 @@
 indicator("PLUTUS P09.3 — Signal Presentation", shorttitle="PLUTUS P09.3", overlay=true, max_boxes_count=320, max_labels_count=260, max_lines_count=180)
 
 // P09.3 preserves the validated P09.2 interaction-first signal architecture and
-// adds final signal presentation, alert granularity and finite entry/stop/target visuals.
+// adds final signal presentation, alert granularity, finite entry/stop/target visuals,
+// and strict zone lifecycle rules for fills, OB decay and one-candle inversions.
 
 // A qualified FVG / IFVG / OB / Breaker can ARM on price interaction before context turns.
 // Confirmation-time participation, value/confluence, regime and session gates decide whether the event is tradable.
@@ -42,6 +43,10 @@ minInversionBreakAtr = input.float(0.10, "Minimum Close Through Zone / ATR", min
 inversionConfirmBars = input.int(2, "Inversion Confirmation Window", minval=1, maxval=5, group=groupInv)
 inversionScoreFactor = input.float(0.75, "Inherited Inversion Score Factor", minval=0.25, maxval=1.0, step=0.05, group=groupInv)
 minInversionScore = input.float(50.0, "Minimum Inversion Quality", minval=0, maxval=100, step=5, group=groupInv)
+obTouchDecayPct = input.float(15.0, "OB Score Decay Per Distinct Revisit %", minval=0, maxval=50, step=2.5, group=groupInv)
+minLiveObScore = input.float(30.0, "Minimum Live OB Score", minval=0, maxval=100, step=5, group=groupInv)
+retireFilledFvg = input.bool(true, "Retire FVG After Full Fill", group=groupInv)
+retireFilledFlips = input.bool(true, "Retire IFVG / Breaker After Full Fill", group=groupInv)
 
 //------------------------------------------------------------------------------
 // Signal quality / context
@@ -208,6 +213,9 @@ var array<float> zScore = array.new_float()
 var array<int> zBorn = array.new_int()
 var array<int> zArmed = array.new_int()
 var array<int> zPendingDir = array.new_int()
+var array<int> zTouches = array.new_int()
+var array<bool> zWasTouching = array.new_bool()
+var array<int> zRetireBar = array.new_int()
 var array<box> zBox = array.new_box()
 var int nextZoneId = 1
 
@@ -262,6 +270,9 @@ for pass = 0 to 3
                 array.shift(zBorn)
                 array.shift(zArmed)
                 array.shift(zPendingDir)
+                array.shift(zTouches)
+                array.shift(zWasTouching)
+                array.shift(zRetireBar)
             int id = nextZoneId
             nextZoneId += 1
             array.push(zId, id)
@@ -274,13 +285,16 @@ for pass = 0 to 3
             array.push(zBorn, bar_index)
             array.push(zArmed, na)
             array.push(zPendingDir, 0)
+            array.push(zTouches, 0)
+            array.push(zWasTouching, false)
+            array.push(zRetireBar, na)
             box b = na
             if showTriggerZones
                 color c = dir == 1 ? color.lime : color.red
                 b := box.new(bar_index, top, bar_index, bottom, xloc=xloc.bar_index, extend=extend.none, border_color=color.new(c, 25), bgcolor=color.new(c, 89), text=(dir == 1 ? "BULL " : "BEAR ") + typ, text_color=c, text_size=size.tiny)
             array.push(zBox, b)
 
-// Lifecycle and inversion conversion.
+// Lifecycle, mitigation, full-fill retirement and strict single-candle inversion.
 int zi = array.size(zId) - 1
 while zi >= 0
     int dir = array.get(zDir, zi)
@@ -293,45 +307,86 @@ while zi >= 0
     int age = bar_index - born
     int armed = array.get(zArmed, zi)
     int pending = array.get(zPendingDir, zi)
+    int touches = array.get(zTouches, zi)
+    bool wasTouching = array.get(zWasTouching, zi)
+    int retireBar = array.get(zRetireBar, zi)
     bool removeZone = false
-    float breakDist = nz(atr, 0.0) * minInversionBreakAtr
-    bool decisiveInvalid = dir == 1 ? close < bottom - breakDist : close > top + breakDist
 
-    if decisiveInvalid and na(armed)
-        bool canInvert = (typ == "FVG" and createIfvg) or (typ == "OB" and createBreaker)
-        if canInvert
+    float breakDist = nz(atr, 0.0) * minInversionBreakAtr
+    bool touchingNow = bar_index > born and low <= top and high >= bottom
+    bool newRevisit = touchingNow and not wasTouching
+
+    // Distinct OB revisits consume resting inventory. Count the transition into the zone,
+    // not every bar that remains inside it.
+    if typ == "OB" and newRevisit
+        touches += 1
+        float decayFactor = math.max(0.0, 1.0 - obTouchDecayPct / 100.0)
+        score := score * decayFactor
+        array.set(zTouches, zi, touches)
+        array.set(zScore, zi, score)
+        if score < minLiveObScore
+            st := "WEAK"
+            array.set(zState, zi, st)
+
+    array.set(zWasTouching, zi, touchingNow)
+
+    // Strict inversion: one candle must traverse the source zone in its body.
+    // Bull source -> candle opens at/above top and closes through bottom.
+    // Bear source -> candle opens at/below bottom and closes through top.
+    bool singleCandleCross = dir == 1 ? (open >= top and close < bottom - breakDist) : (open <= bottom and close > top + breakDist)
+    bool canInvert = (typ == "FVG" and createIfvg) or (typ == "OB" and createBreaker)
+
+    if singleCandleCross and canInvert and (st == "FRESH" or st == "WEAK")
+        float invScore = score * inversionScoreFactor
+        if invScore >= minInversionScore
+            typ := typ == "FVG" ? "IFVG" : "BREAKER"
+            dir := -dir
+            st := "JUST_FLIPPED"
             armed := bar_index
-            pending := -dir
-            st := "ARMED_INVERSION"
+            pending := dir
+            score := invScore
+            born := bar_index
+            age := 0
+            touches := 0
+            array.set(zType, zi, typ)
+            array.set(zDir, zi, dir)
+            array.set(zState, zi, st)
+            array.set(zScore, zi, score)
+            array.set(zBorn, zi, born)
             array.set(zArmed, zi, armed)
             array.set(zPendingDir, zi, pending)
-            array.set(zState, zi, st)
+            array.set(zTouches, zi, 0)
+            array.set(zWasTouching, zi, false)
+            array.set(zRetireBar, zi, na)
         else
             removeZone := true
-
-    if not na(armed)
-        int sinceArm = bar_index - armed
-        bool followThrough = pending == 1 ? close > top : close < bottom
-        if sinceArm >= 1 and sinceArm <= inversionConfirmBars and followThrough
-            float invScore = score * inversionScoreFactor
-            if invScore >= minInversionScore
-                typ := typ == "FVG" ? "IFVG" : "BREAKER"
-                dir := pending
-                st := "FRESH"
-                array.set(zType, zi, typ)
-                array.set(zDir, zi, dir)
-                array.set(zState, zi, st)
-                array.set(zScore, zi, invScore)
-                array.set(zBorn, zi, bar_index)
-                array.set(zArmed, zi, na)
-                array.set(zPendingDir, zi, 0)
-                born := bar_index
-                age := 0
-                score := invScore
-            else
-                removeZone := true
-        else if sinceArm > inversionConfirmBars
+    else
+        // A close beyond the far boundary without a valid single-candle traverse
+        // invalidates the source but must NOT manufacture an IFVG/Breaker from multi-bar drift.
+        bool closePastFarSide = dir == 1 ? close < bottom - breakDist : close > top + breakDist
+        if closePastFarSide and (typ == "FVG" or typ == "OB")
             removeZone := true
+
+    // JUST_FLIPPED is exposed for one bar so P09 can evaluate the immediate failure/reclaim.
+    if st == "JUST_FLIPPED" and bar_index > armed
+        st := "FRESH"
+        array.set(zState, zi, st)
+        array.set(zArmed, zi, na)
+        array.set(zPendingDir, zi, 0)
+
+    // Full fill = price reaches the far edge of a still-directional zone.
+    // Keep it alive for this bar as TERMINAL_FILL so the fill/rejection can generate one last signal.
+    bool fullFill = dir == 1 ? low <= bottom : high >= top
+    bool fillRetires = (typ == "FVG" and retireFilledFvg) or ((typ == "IFVG" or typ == "BREAKER") and retireFilledFlips)
+    if not removeZone and fillRetires and fullFill and bar_index > born and st != "JUST_FLIPPED" and st != "TERMINAL_FILL"
+        st := "TERMINAL_FILL"
+        retireBar := bar_index
+        array.set(zState, zi, st)
+        array.set(zRetireBar, zi, retireBar)
+
+    // Retire only after the terminal fill bar has been available to the signal scan.
+    if st == "TERMINAL_FILL" and not na(retireBar) and bar_index > retireBar
+        removeZone := true
 
     if age > maxZoneAge
         removeZone := true
@@ -351,18 +406,24 @@ while zi >= 0
         array.remove(zBorn, zi)
         array.remove(zArmed, zi)
         array.remove(zPendingDir, zi)
+        array.remove(zTouches, zi)
+        array.remove(zWasTouching, zi)
+        array.remove(zRetireBar, zi)
         array.remove(zBox, zi)
     else
         if showTriggerZones
             color c = dir == 1 ? color.lime : color.red
+            int zoneAlpha = st == "TERMINAL_FILL" ? 94 : st == "WEAK" ? 93 : 89
+            int borderAlpha = st == "TERMINAL_FILL" ? 0 : st == "WEAK" ? 55 : 25
+            string lifeTag = st == "TERMINAL_FILL" ? " · FILLED" : st == "WEAK" ? " · WEAK" : ""
             if na(zb)
-                zb := box.new(born, top, bar_index, bottom, xloc=xloc.bar_index, extend=extend.none, border_color=color.new(c, 25), bgcolor=color.new(c, 89), text=(dir == 1 ? "BULL " : "BEAR ") + typ, text_color=c, text_size=size.tiny)
+                zb := box.new(born, top, bar_index, bottom, xloc=xloc.bar_index, extend=extend.none, border_color=color.new(c, borderAlpha), bgcolor=color.new(c, zoneAlpha), text=(dir == 1 ? "BULL " : "BEAR ") + typ + lifeTag, text_color=c, text_size=size.tiny)
                 array.set(zBox, zi, zb)
             else
                 box.set_right(zb, bar_index)
-                box.set_border_color(zb, color.new(c, st == "ARMED_INVERSION" ? 0 : 25))
-                box.set_bgcolor(zb, color.new(c, st == "ARMED_INVERSION" ? 94 : 89))
-                box.set_text(zb, (dir == 1 ? "BULL " : "BEAR ") + typ)
+                box.set_border_color(zb, color.new(c, borderAlpha))
+                box.set_bgcolor(zb, color.new(c, zoneAlpha))
+                box.set_text(zb, (dir == 1 ? "BULL " : "BEAR ") + typ + lifeTag)
                 box.set_text_color(zb, c)
         else if not na(zb)
             box.delete(zb)
@@ -400,8 +461,8 @@ if zoneCount > 0
         int invArmed = array.get(zArmed, i)
         int pending = array.get(zPendingDir, i)
         bool typeOk = f_typeEnabled(typ)
-        bool normalTouch = st == "FRESH" and bar_index > born and low <= top and high >= bottom
-        bool freshReclaimBreak = st == "ARMED_INVERSION" and not na(invArmed) and bar_index == invArmed and pending != 0
+        bool normalTouch = (st == "FRESH" or st == "WEAK" or st == "TERMINAL_FILL") and bar_index > born and low <= top and high >= bottom
+        bool freshReclaimBreak = st == "JUST_FLIPPED" and not na(invArmed) and bar_index == invArmed and pending != 0
         int intendedDir = freshReclaimBreak ? pending : dir
         bool sameAsLastZone = not na(lastConfirmedZoneId) and id == lastConfirmedZoneId and intendedDir == lastConfirmedDir
         bool sameZoneDelayOk = not sameAsLastZone or na(lastConfirmedZoneBar) or bar_index - lastConfirmedZoneBar >= sameZoneReentryBars
@@ -417,7 +478,8 @@ if zoneCount > 0
             int clusterCount = 1
             if zoneCount > 1
                 for j = 0 to zoneCount - 1
-                    if j != i and array.get(zState, j) == "FRESH" and array.get(zDir, j) == intendedDir
+                    string clusterState = array.get(zState, j)
+                    if j != i and (clusterState == "FRESH" or clusterState == "WEAK" or clusterState == "TERMINAL_FILL") and array.get(zDir, j) == intendedDir
                         float ov = f_overlapPct(top, bottom, array.get(zTop, j), array.get(zBottom, j))
                         if ov >= clusterOverlapPct
                             clusterCount += 1
@@ -517,11 +579,11 @@ if not na(boundIdx)
     string liveState = array.get(zState, boundIdx)
     int livePending = array.get(zPendingDir, boundIdx)
     if setupInteraction == "ZONE_FAILURE" or setupInteraction == "BREAK_RECLAIM"
-        bool stillConverting = liveState == "ARMED_INVERSION" and livePending == setupDir
-        bool converted = liveState == "FRESH" and liveDir == setupDir and (liveType == "IFVG" or liveType == "BREAKER")
-        boundZoneValid := stillConverting or converted
+        bool justFlipped = liveState == "JUST_FLIPPED" and livePending == setupDir
+        bool converted = (liveState == "FRESH" or liveState == "TERMINAL_FILL") and liveDir == setupDir and (liveType == "IFVG" or liveType == "BREAKER")
+        boundZoneValid := justFlipped or converted
     else
-        boundZoneValid := liveState == "FRESH" and liveDir == setupDir
+        boundZoneValid := (liveState == "FRESH" or liveState == "WEAK" or liveState == "TERMINAL_FILL") and liveDir == setupDir
 
 if signalState == "ARMED" and not boundZoneValid
     signalState := "INVALIDATED"
@@ -716,9 +778,9 @@ if barstate.islast and showStateLabel
     string stateText = signalState + (setupDir == 1 ? " · LONG" : setupDir == -1 ? " · SHORT" : "") + (setupInteraction != "NONE" ? " · " + setupInteraction : "") + (triggerType != "NONE" ? " · " + triggerType : "") + (not na(setupQuality) ? " · Q " + str.tostring(setupQuality, "#.0") : "")
     stateLabel := label.new(bar_index, high + nz(atr) * 0.35, stateText, xloc=xloc.bar_index, style=label.style_label_down, textcolor=color.white, color=color.new(signalState == "ARMED" ? color.orange : signalState == "CONFIRMED" ? color.lime : color.gray, 35), size=size.tiny)
 
-var table diag = table.new(position.bottom_right, 2, 22, border_width=1, frame_width=1, bgcolor=color.new(color.black, 15))
+var table diag = table.new(position.bottom_right, 2, 24, border_width=1, frame_width=1, bgcolor=color.new(color.black, 15))
 if barstate.islast
-    table.clear(diag, 0, 0, 1, 21)
+    table.clear(diag, 0, 0, 1, 23)
     if showDiagnostics
         table.cell(diag, 0, 0, "P09.3 " + signalProfile, text_color=color.white)
         table.cell(diag, 1, 0, signalState, text_color=color.white)
@@ -758,12 +820,18 @@ if barstate.islast
         table.cell(diag, 1, 17, confirmationSpeed, text_color=color.white)
         table.cell(diag, 0, 18, "Failure ready", text_color=color.silver)
         table.cell(diag, 1, 18, isZoneFailure ? (zoneFailureConfirm ? "YES" : "WAIT") : "N/A", text_color=zoneFailureConfirm ? color.lime : color.white)
-        table.cell(diag, 0, 19, "Entry", text_color=color.silver)
-        table.cell(diag, 1, 19, str.tostring(signalEntry, format.mintick), text_color=color.white)
-        table.cell(diag, 0, 20, "Stop", text_color=color.silver)
-        table.cell(diag, 1, 20, str.tostring(signalStop, format.mintick), text_color=color.white)
-        table.cell(diag, 0, 21, "Target", text_color=color.silver)
-        table.cell(diag, 1, 21, str.tostring(signalTarget, format.mintick), text_color=color.white)
+        string boundLife = not na(boundIdx) ? array.get(zState, boundIdx) : "NONE"
+        int boundTouches = not na(boundIdx) ? array.get(zTouches, boundIdx) : 0
+        table.cell(diag, 0, 19, "Zone lifecycle", text_color=color.silver)
+        table.cell(diag, 1, 19, boundLife, text_color=color.white)
+        table.cell(diag, 0, 20, "OB revisits", text_color=color.silver)
+        table.cell(diag, 1, 20, str.tostring(boundTouches), text_color=color.white)
+        table.cell(diag, 0, 21, "Entry", text_color=color.silver)
+        table.cell(diag, 1, 21, str.tostring(signalEntry, format.mintick), text_color=color.white)
+        table.cell(diag, 0, 22, "Stop", text_color=color.silver)
+        table.cell(diag, 1, 22, str.tostring(signalStop, format.mintick), text_color=color.white)
+        table.cell(diag, 0, 23, "Target", text_color=color.silver)
+        table.cell(diag, 1, 23, str.tostring(signalTarget, format.mintick), text_color=color.white)
 
 bool rejectionConfirmed = (longConfirmed or shortConfirmed) and setupInteraction == "REJECTION"
 bool sweepConfirmed = (longConfirmed or shortConfirmed) and setupInteraction == "SWEEP_RECLAIM"
