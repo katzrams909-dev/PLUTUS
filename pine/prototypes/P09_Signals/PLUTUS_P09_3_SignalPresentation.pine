@@ -330,10 +330,14 @@ while zi >= 0
 
     array.set(zWasTouching, zi, touchingNow)
 
-    // Strict inversion: one candle must traverse the source zone in its body.
-    // Bull source -> candle opens at/above top and closes through bottom.
-    // Bear source -> candle opens at/below bottom and closes through top.
-    bool singleCandleCross = dir == 1 ? (open >= top and close < bottom - breakDist) : (open <= bottom and close > top + breakDist)
+    // Strict inversion: one completed bar must move price from the source side
+    // to a close beyond the far boundary. Use the PRIOR CLOSE as the source-side
+    // reference so a candle may open slightly inside the zone and still count.
+    // This still rejects multi-bar drift because the immediately prior close
+    // must remain on the original side of the zone.
+    // Bull source -> prior close at/above top, current close below bottom.
+    // Bear source -> prior close at/below bottom, current close above top.
+    bool singleCandleCross = dir == 1 ? (close[1] >= top and close < bottom - breakDist) : (close[1] <= bottom and close > top + breakDist)
     bool canInvert = (typ == "FVG" and createIfvg) or (typ == "OB" and createBreaker)
 
     if singleCandleCross and canInvert and (st == "FRESH" or st == "WEAK")
