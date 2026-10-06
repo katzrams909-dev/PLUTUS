@@ -1425,7 +1425,11 @@ bool longConfirmed=false
 bool shortConfirmed=false
 if signalConfirmNow
     signalState:="CONFIRMED"
-    signalQuality=f_clamp(setupZoneScore*0.45+math.abs(confluenceScore)*0.25+confidence*0.15+liveAbsorption*0.15,0.0,100.0)
+    float qZone=f_clamp(nz(setupZoneScore,0.0),0.0,100.0)
+    float qContext=f_clamp(math.abs(nz(confluenceScore,0.0)),0.0,100.0)
+    float qConfidence=f_clamp(nz(confidence,0.0),0.0,100.0)
+    float qAbsorption=f_clamp(nz(liveAbsorption,0.0),0.0,100.0)
+    signalQuality=f_clamp(qZone*0.45+qContext*0.25+qConfidence*0.15+qAbsorption*0.15,0.0,100.0)
     signalEntry:=close
     signalStop:=prospectiveStop
     float sigRisk=prospectiveRisk
@@ -1452,7 +1456,7 @@ if longConfirmed or shortConfirmed
     color sigColor=longConfirmed?cBull:cBear
     string sideText=longConfirmed?"LONG":"SHORT"
     string zoneText=setupIsCluster?setupProvenance:(setupDir==1?"BULL ":"BEAR ")+setupType+" #"+str.tostring(setupZoneId)
-    string sigText=signalDisplay=="Minimal"?sideText:signalDisplay=="Compact"?sideText+" · "+zoneText:"PLUTUS "+sideText+" · "+setupClass+" · "+zoneText+" · ER "+str.tostring(liveAbsorption,"#.0")+" · Q "+str.tostring(signalQuality,"#.0")
+    string sigText=signalDisplay=="Minimal"?sideText:signalDisplay=="Compact"?sideText+" · "+zoneText:"PLUTUS "+sideText+" · "+setupClass+" · "+zoneText+" · ER "+str.tostring(nz(liveAbsorption,0.0),"#.0")+" · Q "+str.tostring(nz(signalQuality,0.0),"#.0")
     label slb=label.new(bar_index,close,sigText,xloc=xloc.bar_index,style=longConfirmed?label.style_label_up:label.style_label_down,textcolor=color.white,color=color.new(sigColor,15),size=signalDisplay=="Detailed"?size.small:size.tiny)
     array.push(signalLabels,slb)
     while array.size(signalLabels)>maxSignalPreviews
@@ -1543,7 +1547,7 @@ if barstate.islast
         table.cell(signalAudit,0,4,"Invariants",text_color=color.silver)
         table.cell(signalAudit,1,4,(directionInvariantOk?"D✓ ":"D✕ ")+(typeInvariantOk?"T✓ ":"T✕ ")+(clusterInvariantOk?"C✓":"C✕"),text_color=boundZoneValid?cBull:cBear)
         table.cell(signalAudit,0,5,"ER / Q",text_color=color.silver)
-        table.cell(signalAudit,1,5,str.tostring(liveAbsorption,"#.0")+" / "+str.tostring(signalQuality,"#.0"),text_color=color.white)
+        table.cell(signalAudit,1,5,str.tostring(nz(liveAbsorption,0.0),"#.0")+" / "+str.tostring(nz(signalQuality,0.0),"#.0"),text_color=color.white)
         table.cell(signalAudit,0,6,"Context",text_color=color.silver)
         table.cell(signalAudit,1,6,str.tostring(confluenceScore,"#.0")+" · "+str.tostring(confidence,"#.0")+"%",text_color=confluenceScore>0?cBull:confluenceScore<0?cBear:color.white)
         table.cell(signalAudit,0,7,"Risk guard",text_color=color.silver)
