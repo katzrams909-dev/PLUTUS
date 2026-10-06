@@ -62,6 +62,8 @@ bool showDiagnostics = showDiagnosticsInput or presetDiagnostic
 groupTiming = "Timing / Context"
 timezoneInput = input.string("Exchange", "Session Timezone", options=["Exchange", "UTC-2", "UTC-1", "UTC+0", "UTC+1", "UTC+2", "America/New_York", "Europe/London", "Asia/Tokyo"], group=groupTiming)
 string sessionTz = timezoneInput == "Exchange" ? syminfo.timezone : timezoneInput
+calendarTimezoneInput = input.string("Exchange", "Calendar / Reset Timezone", options=["Exchange", "UTC-2", "UTC-1", "UTC+0", "UTC+1", "UTC+2", "America/New_York", "Europe/London", "Asia/Tokyo"], group=groupTiming, tooltip="Controls Day/Week/Month boundaries for Daily/Weekly/Monthly VWAP and Day volume profile. Independent from Session Timezone.")
+string calendarTz = calendarTimezoneInput == "Exchange" ? syminfo.timezone : calendarTimezoneInput
 profileScope = input.string("Day", "Profile Scope", options=["Asia", "London", "New York", "Day"], group=groupTiming)
 valueReference = input.string("Daily", "VWAP Reference", options=["Active Session", "Daily", "Weekly", "Monthly"], group=groupTiming)
 
@@ -335,12 +337,14 @@ bool newNyVisual=newYorkBoxMode=="Full Session"?newNyFullBox:(newNyAmBox or newN
 bool endNyVisual=newYorkBoxMode=="Full Session"?endNyFullBox:(endNyAmBox or endNyPmBox)
 string nyVisualName=newYorkBoxMode=="Full Session"?"NEW YORK":inNyAmBox?"NY AM":inNyPmBox?"NY PM":"NEW YORK"
 
-int localDay=dayofmonth(time,sessionTz)
-int localWeek=weekofyear(time,sessionTz)
-int localMonth=month(time,sessionTz)
-bool newDay=ta.change(localDay)!=0
-bool newWeek=ta.change(localWeek)!=0
-bool newMonth=ta.change(localMonth)!=0
+// Calendar reset clock is intentionally independent from the session clock.
+// Changing Session Timezone must not move Day/Week/Month profile or VWAP boundaries.
+int calendarDay=dayofmonth(time,calendarTz)
+int calendarWeek=weekofyear(time,calendarTz)
+int calendarMonth=month(time,calendarTz)
+bool newDay=ta.change(calendarDay)!=0
+bool newWeek=ta.change(calendarWeek)!=0
+bool newMonth=ta.change(calendarMonth)!=0
 bool profileActive=profileScope=="Asia"?inAsia:profileScope=="London"?inLondon:profileScope=="New York"?inNewYork:true
 bool profileReset=profileScope=="Asia"?newAsia:profileScope=="London"?newLondon:profileScope=="New York"?newNewYork:barstate.isfirst or newDay
 bool profileVisualActive=profileScope=="Day"?true:profileActive
@@ -1694,4 +1698,4 @@ if barstate.islast
         table.cell(diag,0,11,"Sessions",text_color=color.silver)
         table.cell(diag,1,11,str.tostring(array.size(asiaBoxes))+" A",text_color=color.white)
         table.cell(diag,2,11,str.tostring(array.size(londonBoxes))+" L",text_color=color.white)
-        table.cell(diag,3,11,str.tostring(array.size(newYorkBoxes))+" NY",text_color=color.white)
+        table.cell(diag,3,11,str.tostring(array.size(newYorkBoxes))+" NY · S:"+timezoneInput+" · C:"+calendarTimezoneInput,text_color=color.white)
