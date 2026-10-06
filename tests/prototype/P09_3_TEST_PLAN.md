@@ -108,3 +108,18 @@ P09.3 passes when:
 - [ ] Current candle open may be slightly inside the source zone and still qualify.
 - [ ] Multi-bar drift still does not qualify because the immediately prior close must remain on the original side.
 - [ ] XAUUSD 15m regression case forms a bearish IFVG and becomes eligible for a SELL.
+
+
+## Direction / Type Invariant Regression
+- [ ] Fresh Bull FVG REJECTION can only confirm LONG.
+- [ ] Fresh Bear FVG REJECTION can only confirm SHORT.
+- [ ] Fresh Bull OB REJECTION can only confirm LONG.
+- [ ] Fresh Bear OB REJECTION can only confirm SHORT.
+- [ ] SWEEP_RECLAIM must follow the live source-zone direction.
+- [ ] FLIP_RETEST must follow the live IFVG/Breaker direction.
+- [ ] ZONE_FAILURE is the only interaction class permitted to trade opposite the original source direction.
+- [ ] If zone type or direction changes while a setup is armed, the setup is invalidated unless it is the explicitly supported failure/flip path.
+- [ ] Confirmation is blocked when direction invariant fails.
+- [ ] Confirmation is blocked when type invariant fails.
+- [ ] Signal labels explicitly show BULL/BEAR + FVG/IFVG/OB/BREAKER for auditability.
+- [ ] Regression: a visible Bull FVG must never produce a SHORT REJECTION FVG signal.
