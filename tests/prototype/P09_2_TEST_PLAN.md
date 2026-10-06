@@ -122,3 +122,14 @@ P09.2 revision passes when:
 
 ## Integration Note
 P09.2 still uses compact local participation/value/confluence evidence. P10 must bind this state machine to the exact validated P01-P07 outputs and P05 zone inventory.
+
+
+## Valid-Entry Capture Revision
+- [ ] Same-zone re-entry is enabled by default but respects the configured minimum re-entry bars.
+- [ ] A confirmed LONG does not block a valid SHORT when separate directional cooldown is enabled.
+- [ ] A confirmed SHORT does not block a valid LONG when separate directional cooldown is enabled.
+- [ ] Cooldown still blocks rapid duplicate signals in the same direction.
+- [ ] A materially stronger fresh interaction can replace an already-armed weaker setup when enabled.
+- [ ] Re-arming requires the configured quality advantage.
+- [ ] Re-arming never changes a confirmed signal retrospectively.
+- [ ] Diagnostics show independent long/short cooldown state and same-zone re-entry delay.
