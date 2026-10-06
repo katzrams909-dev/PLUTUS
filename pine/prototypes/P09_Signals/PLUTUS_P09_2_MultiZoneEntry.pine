@@ -4,7 +4,7 @@ indicator("PLUTUS P09.2 — Interaction-First Multi-Zone Entry", shorttitle="PLU
 // P09.2 revision: interaction-first institutional-zone signal architecture.
 // A qualified FVG / IFVG / OB / Breaker can ARM on price interaction before context turns.
 // Confirmation-time participation, value/confluence, regime and session gates decide whether the event is tradable.
-// Supported interaction classes: REJECTION, SWEEP_RECLAIM, BREAK_RECLAIM and FLIP_RETEST.
+// Supported interaction classes: REJECTION, SWEEP_RECLAIM, ZONE_FAILURE, BREAK_RECLAIM and FLIP_RETEST.
 // Final P10 integration will consume exact upstream P01-P07/P05 outputs.
 
 //------------------------------------------------------------------------------
@@ -82,7 +82,11 @@ nyPmSession = input.session("1300-1600", "NY PM Window", group=groupSession)
 //------------------------------------------------------------------------------
 groupSignal = "Signal State Machine"
 confirmationMode = input.string("Directional Close", "Close Confirmation", options=["Directional Close", "Close Back Through Midpoint", "Any Valid Close"], group=groupSignal)
+confirmationSpeed = input.string("Standard", "Confirmation Speed", options=["Early", "Standard", "Conservative"], group=groupSignal)
 minCloseLocation = input.float(0.55, "Minimum Directional Close Location", minval=0.0, maxval=1.0, step=0.05, group=groupSignal)
+failureMinBodyAtr = input.float(0.35, "Zone Failure Minimum Body / ATR", minval=0.0, maxval=3.0, step=0.05, group=groupSignal)
+failureMinEfficiency = input.float(0.45, "Zone Failure Minimum Body / Range", minval=0.0, maxval=1.0, step=0.05, group=groupSignal)
+failureMaxOpposingConfluence = input.float(30.0, "Zone Failure Max Opposing Confluence", minval=0.0, maxval=100.0, step=5.0, group=groupSignal)
 armedExpiryBars = input.int(3, "Armed Setup Expiry", minval=1, maxval=20, group=groupSignal)
 cooldownBars = input.int(5, "Signal Cooldown Bars", minval=0, maxval=100, group=groupSignal)
 allowStrongerRearm = input.bool(true, "Allow Stronger Interaction To Replace Armed Setup", group=groupSignal)
@@ -399,7 +403,7 @@ if zoneCount > 0
             bool sweptBoundary = normalTouch and (intendedDir == 1 ? low < bottom : high > top)
             float sweepBeyond = sweptBoundary ? (intendedDir == 1 ? bottom - low : high - top) : 0.0
             bool sweepWithinTolerance = not sweptBoundary or na(atr) or sweepBeyond <= maxSweepBeyondAtr * atr
-            string klass = freshReclaimBreak ? "BREAK_RECLAIM" : (typ == "IFVG" or typ == "BREAKER") ? "FLIP_RETEST" : sweptBoundary and sweepWithinTolerance ? "SWEEP_RECLAIM" : "REJECTION"
+            string klass = freshReclaimBreak ? "ZONE_FAILURE" : (typ == "IFVG" or typ == "BREAKER") ? "FLIP_RETEST" : sweptBoundary and sweepWithinTolerance ? "SWEEP_RECLAIM" : "REJECTION"
 
             int clusterCount = 1
             if zoneCount > 1
@@ -503,7 +507,7 @@ if not na(boundIdx)
     string liveType = array.get(zType, boundIdx)
     string liveState = array.get(zState, boundIdx)
     int livePending = array.get(zPendingDir, boundIdx)
-    if setupInteraction == "BREAK_RECLAIM"
+    if setupInteraction == "ZONE_FAILURE" or setupInteraction == "BREAK_RECLAIM"
         bool stillConverting = liveState == "ARMED_INVERSION" and livePending == setupDir
         bool converted = liveState == "FRESH" and liveDir == setupDir and (liveType == "IFVG" or liveType == "BREAKER")
         boundZoneValid := stillConverting or converted
@@ -527,17 +531,34 @@ bool anyValidClose = setupDir == 1 ? close >= setupBottom : setupDir == -1 ? clo
 bool standardCloseConfirmed = confirmationMode == "Directional Close" ? directionalClose : confirmationMode == "Close Back Through Midpoint" ? midpointClose : anyValidClose
 bool reclaimCloseConfirmed = setupDir == 1 ? close > setupTop : setupDir == -1 ? close < setupBottom : false
 bool sweepCloseConfirmed = setupDir == 1 ? close >= setupBottom : setupDir == -1 ? close <= setupTop : false
-bool interactionCloseConfirmed = setupInteraction == "BREAK_RECLAIM" ? reclaimCloseConfirmed : setupInteraction == "SWEEP_RECLAIM" ? (sweepCloseConfirmed and standardCloseConfirmed) : standardCloseConfirmed
+bool interactionCloseConfirmed = setupInteraction == "ZONE_FAILURE" or setupInteraction == "BREAK_RECLAIM" ? reclaimCloseConfirmed : setupInteraction == "SWEEP_RECLAIM" ? (sweepCloseConfirmed and standardCloseConfirmed) : standardCloseConfirmed
 
 float liveSetupQuality = boundZoneValid ? f_confirmationQuality(setupDir, nz(setupClusterQuality, setupZoneScore), setupBornBar) : 0.0
 bool participationOk = setupDir == 1 ? participation >= minConfirmParticipation : setupDir == -1 ? participation <= -minConfirmParticipation : false
 bool contextStillValid = setupDir == 1 ? bullContextBase : setupDir == -1 ? bearContextBase : false
 bool sameBarAllowed = allowSameBarConfirmation or na(armedBar) or bar_index > armedBar
-bool confirmNow = signalState == "ARMED" and sameBarAllowed and barstate.isconfirmed and interactionCloseConfirmed and participationOk and contextStillValid and liveSetupQuality >= minSetupQuality and boundZoneValid
+
+// ZONE_FAILURE is intentionally allowed to confirm before the full composite context flips.
+// The failed zone itself is evidence; opposite candle quality + participation must still validate it.
+bool isZoneFailure = setupInteraction == "ZONE_FAILURE"
+bool failureCandleDirOk = setupDir == 1 ? close > open : setupDir == -1 ? close < open : false
+bool failureImpulseOk = bodyAtr >= failureMinBodyAtr and efficiency >= failureMinEfficiency
+float opposingConf = setupDir == 1 ? math.max(-confluence, 0.0) : math.max(confluence, 0.0)
+bool failureConfluenceOk = opposingConf <= failureMaxOpposingConfluence
+bool failureParticipationEarly = setupDir == 1 ? participation > -conflictThreshold : setupDir == -1 ? participation < conflictThreshold : false
+bool failureParticipationStandard = setupDir == 1 ? participation >= 0.0 : setupDir == -1 ? participation <= 0.0 : false
+bool failureParticipationConservative = participationOk
+bool failureParticipationOk = confirmationSpeed == "Early" ? failureParticipationEarly : confirmationSpeed == "Conservative" ? failureParticipationConservative : failureParticipationStandard
+float failureQualityThreshold = confirmationSpeed == "Early" ? minSetupQuality * 0.75 : confirmationSpeed == "Conservative" ? minSetupQuality : minSetupQuality * 0.85
+bool failureContextOk = confirmationSpeed == "Conservative" ? contextStillValid : sessionOk and f_regimeOk(setupDir) and failureConfluenceOk
+bool zoneFailureConfirm = isZoneFailure and reclaimCloseConfirmed and failureCandleDirOk and failureImpulseOk and failureParticipationOk and failureContextOk and liveSetupQuality >= failureQualityThreshold
+
+bool normalConfirm = not isZoneFailure and interactionCloseConfirmed and participationOk and contextStillValid and liveSetupQuality >= minSetupQuality
+bool confirmNow = signalState == "ARMED" and sameBarAllowed and barstate.isconfirmed and boundZoneValid and (zoneFailureConfirm or normalConfirm)
 
 // Interaction-specific invalidation.
 bool setupBroken = false
-if setupInteraction == "BREAK_RECLAIM"
+if setupInteraction == "ZONE_FAILURE" or setupInteraction == "BREAK_RECLAIM"
     setupBroken := setupDir == 1 ? close < setupBottom : setupDir == -1 ? close > setupTop : false
 else
     setupBroken := setupDir == 1 ? close < setupBottom : setupDir == -1 ? close > setupTop : false
@@ -569,7 +590,7 @@ if confirmNow
     shortConfirmed := setupDir == -1
 
 bool armedCooldown = signalState == "ARMED" and (setupDir == 1 ? longCooldownActive : setupDir == -1 ? shortCooldownActive : false)
-string blockReason = signalState == "IDLE" and cooldownActive ? "COOLDOWN" : signalState == "ARMED" and not sessionOk ? "WAIT SESSION" : signalState == "ARMED" and not contextStillValid ? "WAIT CONTEXT" : signalState == "ARMED" and not participationOk ? "WAIT PARTICIPATION" : signalState == "ARMED" and not interactionCloseConfirmed ? "WAIT CLOSE" : signalState == "ARMED" ? "VALIDATING" : na(interactionIdx) ? "NO INTERACTION" : "INTERACTION READY"
+string blockReason = signalState == "IDLE" and cooldownActive ? "COOLDOWN" : signalState == "ARMED" and isZoneFailure and not failureImpulseOk ? "WAIT FAILURE IMPULSE" : signalState == "ARMED" and isZoneFailure and not failureParticipationOk ? "WAIT FAILURE PARTICIPATION" : signalState == "ARMED" and isZoneFailure and not failureContextOk ? "WAIT FAILURE CONTEXT" : signalState == "ARMED" and not sessionOk ? "WAIT SESSION" : signalState == "ARMED" and not contextStillValid and not isZoneFailure ? "WAIT CONTEXT" : signalState == "ARMED" and not participationOk and not isZoneFailure ? "WAIT PARTICIPATION" : signalState == "ARMED" and not interactionCloseConfirmed ? "WAIT CLOSE" : signalState == "ARMED" ? "VALIDATING" : na(interactionIdx) ? "NO INTERACTION" : "INTERACTION READY"
 
 //------------------------------------------------------------------------------
 // Confirmed trade previews
@@ -642,9 +663,9 @@ if barstate.islast and showStateLabel
     string stateText = signalState + (setupDir == 1 ? " · LONG" : setupDir == -1 ? " · SHORT" : "") + (setupInteraction != "NONE" ? " · " + setupInteraction : "") + (triggerType != "NONE" ? " · " + triggerType : "") + (not na(setupQuality) ? " · Q " + str.tostring(setupQuality, "#.0") : "")
     stateLabel := label.new(bar_index, high + nz(atr) * 0.35, stateText, xloc=xloc.bar_index, style=label.style_label_down, textcolor=color.white, color=color.new(signalState == "ARMED" ? color.orange : signalState == "CONFIRMED" ? color.lime : color.gray, 35), size=size.tiny)
 
-var table diag = table.new(position.bottom_right, 2, 20, border_width=1, frame_width=1, bgcolor=color.new(color.black, 15))
+var table diag = table.new(position.bottom_right, 2, 22, border_width=1, frame_width=1, bgcolor=color.new(color.black, 15))
 if barstate.islast
-    table.clear(diag, 0, 0, 1, 19)
+    table.clear(diag, 0, 0, 1, 21)
     if showDiagnostics
         table.cell(diag, 0, 0, "P09.2 " + signalProfile, text_color=color.white)
         table.cell(diag, 1, 0, signalState, text_color=color.white)
@@ -680,12 +701,16 @@ if barstate.islast
         table.cell(diag, 1, 15, "L " + (longCooldownActive ? "ON" : "OFF") + " / S " + (shortCooldownActive ? "ON" : "OFF"), text_color=color.white)
         table.cell(diag, 0, 16, "Same-zone re-entry", text_color=color.silver)
         table.cell(diag, 1, 16, allowRepeatSameZone ? str.tostring(sameZoneReentryBars) + " bars" : "OFF", text_color=color.white)
-        table.cell(diag, 0, 17, "Entry", text_color=color.silver)
-        table.cell(diag, 1, 17, str.tostring(signalEntry, format.mintick), text_color=color.white)
-        table.cell(diag, 0, 18, "Stop", text_color=color.silver)
-        table.cell(diag, 1, 18, str.tostring(signalStop, format.mintick), text_color=color.white)
-        table.cell(diag, 0, 19, "Target", text_color=color.silver)
-        table.cell(diag, 1, 19, str.tostring(signalTarget, format.mintick), text_color=color.white)
+        table.cell(diag, 0, 17, "Confirm speed", text_color=color.silver)
+        table.cell(diag, 1, 17, confirmationSpeed, text_color=color.white)
+        table.cell(diag, 0, 18, "Failure ready", text_color=color.silver)
+        table.cell(diag, 1, 18, isZoneFailure ? (zoneFailureConfirm ? "YES" : "WAIT") : "N/A", text_color=zoneFailureConfirm ? color.lime : color.white)
+        table.cell(diag, 0, 19, "Entry", text_color=color.silver)
+        table.cell(diag, 1, 19, str.tostring(signalEntry, format.mintick), text_color=color.white)
+        table.cell(diag, 0, 20, "Stop", text_color=color.silver)
+        table.cell(diag, 1, 20, str.tostring(signalStop, format.mintick), text_color=color.white)
+        table.cell(diag, 0, 21, "Target", text_color=color.silver)
+        table.cell(diag, 1, 21, str.tostring(signalTarget, format.mintick), text_color=color.white)
 
-alertcondition(longConfirmed, "PLUTUS P09.2 Long Confirmed", "PLUTUS P09.2 confirmed an interaction-first bullish institutional-zone setup on candle close.")
-alertcondition(shortConfirmed, "PLUTUS P09.2 Short Confirmed", "PLUTUS P09.2 confirmed an interaction-first bearish institutional-zone setup on candle close.")
+alertcondition(longConfirmed, "PLUTUS P09.2 Long Confirmed", "PLUTUS P09.2 confirmed an interaction-first bullish institutional-zone setup, including early zone-failure logic, on candle close.")
+alertcondition(shortConfirmed, "PLUTUS P09.2 Short Confirmed", "PLUTUS P09.2 confirmed an interaction-first bearish institutional-zone setup, including early zone-failure logic, on candle close.")
