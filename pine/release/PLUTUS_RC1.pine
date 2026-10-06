@@ -187,6 +187,16 @@ signalCooldownBars = input.int(5, "Directional Cooldown Bars", minval=0, maxval=
 sameZoneReentryBars = input.int(3, "Same-Zone Re-entry Delay", minval=0, maxval=50, group=groupSignals)
 allowSameBarConfirmation = input.bool(true, "Allow Interaction-Bar Close Confirmation", group=groupSignals)
 
+groupObSignals = "Order Block Signal Quality"
+obMinOriginQuality = input.float(65.0, "Minimum OB Origin Quality", minval=0, maxval=100, step=5, group=groupObSignals)
+obMaxRetests = input.int(2, "Maximum OB Retests For Entry", minval=1, maxval=10, group=groupObSignals)
+obMaxMitigationPct = input.float(70.0, "Maximum OB Mitigation For Entry %", minval=10, maxval=100, step=5, group=groupObSignals)
+obMaxOpposingArrival = input.float(65.0, "Maximum Opposing Arrival Pressure", minval=0, maxval=100, step=5, group=groupObSignals)
+obMinReactionAbsorption = input.float(45.0, "Minimum OB Reaction Absorption", minval=0, maxval=100, step=5, group=groupObSignals)
+obRequireMidpointReclaim = input.bool(true, "Require OB Midpoint Reclaim", group=groupObSignals)
+obFirstTouchBonus = input.float(7.5, "First-Touch OB Quality Bonus", minval=0, maxval=25, step=2.5, group=groupObSignals)
+obSecondTouchPenalty = input.float(10.0, "Second-Touch OB Quality Penalty", minval=0, maxval=30, step=2.5, group=groupObSignals)
+
 groupCluster = "Institutional Cluster / Unicorn"
 enableInstitutionalClusters = input.bool(true, "Enable Breaker + FVG-Family Clusters", group=groupCluster)
 clusterMinOverlapPct = input.float(40.0, "Minimum Cluster Overlap %", minval=10, maxval=100, step=5, group=groupCluster)
@@ -1246,6 +1256,12 @@ if enableSignals and signalZoneCount>0
         bool normalTouch=(zst=="FRESH" or zst=="RETESTED" or zst=="PARTIAL" or zst=="TERMINAL_FILL") and bar_index>zborn and low<=ztop and high>=zbot
         bool justFlipped=zst=="JUST_FLIPPED" and not na(zarmed) and bar_index==zarmed
         int intendedDir=zdir
+        bool standaloneOb=ztyp=="OB"
+        float obOriginQ=standaloneOb?array.get(zBaseScore,i):100.0
+        int obRetestCount=standaloneOb?array.get(zRetests,i):0
+        float obMitigation=standaloneOb?array.get(zMitigation,i):0.0
+        float obOpposingArrival=standaloneOb?(zdir==1?math.max(-p01,0.0):math.max(p01,0.0)):0.0
+        bool obInventoryOk=not standaloneOb or (obOriginQ>=obMinOriginQuality and obRetestCount<=obMaxRetests and obMitigation<=obMaxMitigationPct and obOpposingArrival<=obMaxOpposingArrival)
         int clusterMate=na
         float clusterTop=na
         float clusterBottom=na
@@ -1285,7 +1301,7 @@ if enableSignals and signalZoneCount>0
         bool touchOk=hasCluster and clusterRequireIntersectionTouch?clusterTouch:normalTouch
         touchOk:=justFlipped?true:touchOk
 
-        if typeOk and not sameZoneTooSoon and touchOk
+        if typeOk and obInventoryOk and not sameZoneTooSoon and touchOk
             float zwidth=math.max(activeTop-activeBottom,syminfo.mintick)
             float depth=intendedDir==1?f_clamp((activeTop-low)/zwidth,0.0,2.0):f_clamp((high-activeBottom)/zwidth,0.0,2.0)
             bool swept=not justFlipped and (intendedDir==1?low<activeBottom:high>activeTop)
@@ -1295,7 +1311,8 @@ if enableSignals and signalZoneCount>0
             float absorption=intendedDir==1?bullAbsorption:bearAbsorption
             float erBoost=effortResultMode=="Off"?0.0:effortResultBoost*absorption/100.0
             float baseQ=hasCluster?clusterBaseQ:zscore
-            float q=f_clamp(baseQ*0.80+f_clamp(depth*50.0,0.0,100.0)*0.10+erBoost,0.0,100.0)
+            float obTouchAdj=standaloneOb?(obRetestCount<=1?obFirstTouchBonus:obRetestCount==2?-obSecondTouchPenalty:-obSecondTouchPenalty*2.0):0.0
+            float q=f_clamp(baseQ*0.80+f_clamp(depth*50.0,0.0,100.0)*0.10+erBoost+obTouchAdj,0.0,100.0)
             bool effortPass=effortResultMode!="Require" or absorption>=minAbsorptionScore
             if effortPass and q>=minSignalZoneQuality and q>interactionQuality
                 interactionIdx:=i
@@ -1320,6 +1337,7 @@ var string setupClass="NONE"
 var float setupTop=na
 var float setupBottom=na
 var float setupZoneScore=na
+var float setupArmQuality=na
 var bool setupIsCluster=false
 var float setupAbsorption=0.0
 var string setupProvenance="NONE"
@@ -1329,6 +1347,10 @@ var float signalEntry=na
 var float signalStop=na
 var float signalTarget=na
 var float signalQuality=na
+var float signalQZone=na
+var float signalQContext=na
+var float signalQConfidence=na
+var float signalQAbsorption=na
 
 bool longCooldown=not na(lastLongSignalBar) and bar_index-lastLongSignalBar<=signalCooldownBars
 bool shortCooldown=not na(lastShortSignalBar) and bar_index-lastShortSignalBar<=signalCooldownBars
@@ -1345,6 +1367,7 @@ if signalState=="IDLE" and not interactionCooldown and not na(interactionIdx)
     setupTop:=interactionTop
     setupBottom:=interactionBottom
     setupZoneScore:=interactionQuality
+    setupArmQuality:=interactionQuality
     setupIsCluster:=interactionIsCluster
     setupAbsorption:=interactionAbsorption
     setupProvenance:=interactionProvenance
@@ -1430,7 +1453,16 @@ bool failureContextOk=confirmationSpeed=="Conservative"?signalContextOk:(signalS
 bool failureConfirm=isFailure and failureCloseOk and failureImpulseOk and failurePartOk and failureContextOk
 float liveAbsorption=setupDir==1?bullAbsorption:bearAbsorption
 bool effortConfirmOk=effortResultMode!="Require" or liveAbsorption>=minAbsorptionScore
-bool standardConfirm=not isFailure and normalCloseOk and signalParticipationOk and signalContextOk and effortConfirmOk
+bool isStandaloneObSetup=setupType=="OB" and not setupIsCluster
+float liveObMitigation=not na(boundIdx) and isStandaloneObSetup?array.get(zMitigation,boundIdx):0.0
+int liveObRetests=not na(boundIdx) and isStandaloneObSetup?array.get(zRetests,boundIdx):0
+float liveObOriginQ=not na(boundIdx) and isStandaloneObSetup?array.get(zBaseScore,boundIdx):100.0
+float liveObOpposingArrival=isStandaloneObSetup?(setupDir==1?math.max(-p01,0.0):math.max(p01,0.0)):0.0
+bool obMidpointReclaimOk=not isStandaloneObSetup or not obRequireMidpointReclaim or (setupDir==1?close>=setupMid:close<=setupMid)
+bool obReactionAbsorptionOk=not isStandaloneObSetup or liveAbsorption>=obMinReactionAbsorption
+bool obLiveInventoryOk=not isStandaloneObSetup or (liveObOriginQ>=obMinOriginQuality and liveObRetests<=obMaxRetests and liveObMitigation<=obMaxMitigationPct and liveObOpposingArrival<=obMaxOpposingArrival)
+bool obSignalConfirmOk=obMidpointReclaimOk and obReactionAbsorptionOk and obLiveInventoryOk
+bool standardConfirm=not isFailure and normalCloseOk and signalParticipationOk and signalContextOk and effortConfirmOk and obSignalConfirmOk
 bool sameBarOk=allowSameBarConfirmation or na(setupArmedBar) or bar_index>setupArmedBar
 float prospectiveBuffer=nz(atr,0.0)*stopBufferAtr
 float prospectiveStop=setupDir==1?setupBottom-prospectiveBuffer:setupDir==-1?setupTop+prospectiveBuffer:na
@@ -1445,11 +1477,11 @@ bool longConfirmed=false
 bool shortConfirmed=false
 if signalConfirmNow
     signalState:="CONFIRMED"
-    float qZone=f_clamp(nz(setupZoneScore,0.0),0.0,100.0)
-    float qContext=f_clamp(math.abs(nz(confluenceScore,0.0)),0.0,100.0)
-    float qConfidence=f_clamp(nz(confidence,0.0),0.0,100.0)
-    float qAbsorption=f_clamp(nz(liveAbsorption,0.0),0.0,100.0)
-    signalQuality=f_clamp(qZone*0.45+qContext*0.25+qConfidence*0.15+qAbsorption*0.15,0.0,100.0)
+    signalQZone=f_clamp(nz(setupArmQuality,setupZoneScore),0.0,100.0)
+    signalQContext=f_clamp(math.abs(nz(confluenceScore,0.0)),0.0,100.0)
+    signalQConfidence=f_clamp(nz(confidence,0.0),0.0,100.0)
+    signalQAbsorption=f_clamp(nz(liveAbsorption,setupAbsorption),0.0,100.0)
+    signalQuality=f_clamp(signalQZone*0.45+signalQContext*0.25+signalQConfidence*0.15+signalQAbsorption*0.15,0.0,100.0)
     signalEntry:=close
     signalStop:=prospectiveStop
     float sigRisk=prospectiveRisk
@@ -1476,7 +1508,7 @@ if longConfirmed or shortConfirmed
     color sigColor=longConfirmed?cBull:cBear
     string sideText=longConfirmed?"LONG":"SHORT"
     string zoneText=setupIsCluster?setupProvenance:(setupDir==1?"BULL ":"BEAR ")+setupType+" #"+str.tostring(setupZoneId)
-    string sigText=signalDisplay=="Minimal"?sideText:signalDisplay=="Compact"?sideText+" · "+zoneText:"PLUTUS "+sideText+" · "+setupClass+" · "+zoneText+" · ER "+str.tostring(nz(liveAbsorption,0.0),"#.0")+" · Q "+str.tostring(nz(signalQuality,0.0),"#.0")
+    string sigText=signalDisplay=="Minimal"?sideText:signalDisplay=="Compact"?sideText+" · "+zoneText:"PLUTUS "+sideText+" · "+setupClass+" · "+zoneText+" · ER "+str.tostring(nz(signalQAbsorption,0.0),"0.0")+" · SQ "+str.tostring(nz(signalQuality,0.0),"0.0")
     label slb=label.new(bar_index,close,sigText,xloc=xloc.bar_index,style=longConfirmed?label.style_label_up:label.style_label_down,textcolor=color.white,color=color.new(sigColor,15),size=signalDisplay=="Detailed"?size.small:size.tiny)
     array.push(signalLabels,slb)
     while array.size(signalLabels)>maxSignalPreviews
@@ -1525,6 +1557,7 @@ if barstate.isconfirmed and (signalState=="INVALIDATED" or signalState=="EXPIRED
     setupTop:=na
     setupBottom:=na
     setupZoneScore:=na
+    setupArmQuality:=na
     setupIsCluster:=false
     setupAbsorption:=0.0
     setupProvenance:="NONE"
@@ -1552,9 +1585,9 @@ var string lastSignalAudit="NONE"
 if longConfirmed or shortConfirmed
     lastSignalAudit=(longConfirmed?"LONG":"SHORT")+" · "+setupClass+" · "+(setupIsCluster?setupProvenance:(setupDir==1?"BULL ":"BEAR ")+setupType+" #"+str.tostring(setupZoneId))
 
-var table signalAudit=table.new(position.middle_right,2,9,border_width=1,frame_width=1,bgcolor=color.new(color.black,15))
+var table signalAudit=table.new(position.middle_right,2,10,border_width=1,frame_width=1,bgcolor=color.new(color.black,15))
 if barstate.islast
-    table.clear(signalAudit,0,0,1,8)
+    table.clear(signalAudit,0,0,1,9)
     if showDiagnostics
         table.cell(signalAudit,0,0,"PLUTUS RC1 SIGNAL AUDIT",text_color=color.white)
         table.cell(signalAudit,1,0,signalState,text_color=signalState=="ARMED"?color.orange:signalState=="CONFIRMED"?cBull:color.white)
@@ -1566,14 +1599,16 @@ if barstate.islast
         table.cell(signalAudit,1,3,(setupDir==1?"BULL ":setupDir==-1?"BEAR ":"")+setupType,text_color=setupDir==1?cBull:setupDir==-1?cBear:color.white)
         table.cell(signalAudit,0,4,"Invariants",text_color=color.silver)
         table.cell(signalAudit,1,4,(directionInvariantOk?"D✓ ":"D✕ ")+(typeInvariantOk?"T✓ ":"T✕ ")+(clusterInvariantOk?"C✓":"C✕"),text_color=boundZoneValid?cBull:cBear)
-        table.cell(signalAudit,0,5,"ER / Q",text_color=color.silver)
-        table.cell(signalAudit,1,5,str.tostring(nz(liveAbsorption,0.0),"#.0")+" / "+str.tostring(nz(signalQuality,0.0),"#.0"),text_color=color.white)
+        table.cell(signalAudit,0,5,"ZONE / CTX / CONF / ER / SQ",text_color=color.silver)
+        table.cell(signalAudit,1,5,str.tostring(nz(signalQZone,setupArmQuality),"0")+" / "+str.tostring(nz(signalQContext,0.0),"0")+" / "+str.tostring(nz(signalQConfidence,0.0),"0")+" / "+str.tostring(nz(signalQAbsorption,liveAbsorption),"0")+" / "+str.tostring(nz(signalQuality,0.0),"0.0"),text_color=color.white)
         table.cell(signalAudit,0,6,"Context",text_color=color.silver)
         table.cell(signalAudit,1,6,str.tostring(confluenceScore,"#.0")+" · "+str.tostring(confidence,"#.0")+"%",text_color=confluenceScore>0?cBull:confluenceScore<0?cBear:color.white)
         table.cell(signalAudit,0,7,"Risk guard",text_color=color.silver)
         table.cell(signalAudit,1,7,signalRiskOk?"PASS":"BLOCK",text_color=signalRiskOk?cBull:cBear)
-        table.cell(signalAudit,0,8,"Last confirmed",text_color=color.silver)
-        table.cell(signalAudit,1,8,lastSignalAudit,text_color=color.white)
+        table.cell(signalAudit,0,8,"OB gate",text_color=color.silver)
+        table.cell(signalAudit,1,8,isStandaloneObSetup?(obSignalConfirmOk?"PASS":"BLOCK")+" · R"+str.tostring(liveObRetests)+" · M"+str.tostring(liveObMitigation,"0")+" · A"+str.tostring(liveObOpposingArrival,"0"):"N/A",text_color=isStandaloneObSetup?(obSignalConfirmOk?cBull:cBear):color.gray)
+        table.cell(signalAudit,0,9,"Last confirmed",text_color=color.silver)
+        table.cell(signalAudit,1,9,lastSignalAudit,text_color=color.white)
 
 //------------------------------------------------------------------------------
 // Production status panel — restored full information set
