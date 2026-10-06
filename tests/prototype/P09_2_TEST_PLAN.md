@@ -133,3 +133,20 @@ P09.2 still uses compact local participation/value/confluence evidence. P10 must
 - [ ] Re-arming requires the configured quality advantage.
 - [ ] Re-arming never changes a confirmed signal retrospectively.
 - [ ] Diagnostics show independent long/short cooldown state and same-zone re-entry delay.
+
+
+## Zone-Failure Latency Revision
+- [ ] `ZONE_FAILURE` is emitted on decisive failure of an active source zone before full IFVG/Breaker conversion is required.
+- [ ] A bullish source zone can produce a SHORT zone-failure setup.
+- [ ] A bearish source zone can produce a LONG zone-failure setup.
+- [ ] Zone-failure trade direction can differ from the source zone direction.
+- [ ] Early mode can confirm on the first qualified opposite close when candle impulse/efficiency and relaxed participation/context checks pass.
+- [ ] Standard mode requires opposite directional participation to be at least neutral-to-supportive, plus valid failure impulse and no excessive opposing confluence.
+- [ ] Conservative mode continues to require the full directional context/participation gate.
+- [ ] Zone failure does not require VWAP/value/confluence to have fully flipped in Early or Standard mode.
+- [ ] Failure candle must close beyond the failed side of the source zone.
+- [ ] Failure candle body / ATR and body / range thresholds are respected.
+- [ ] Excessive opposing confluence blocks Early/Standard failure confirmation.
+- [ ] Session/regime constraints remain active for Early/Standard failure signals.
+- [ ] XAUUSD 15m regression case should confirm near the marked first bearish failure close rather than several candles later when conditions qualify.
+- [ ] Diagnostics show confirmation speed and zone-failure readiness.
