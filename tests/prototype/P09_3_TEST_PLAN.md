@@ -100,3 +100,11 @@ P09.3 passes when:
 - [ ] Previously stale IFVG/Breaker zones that kept producing signals after complete fill now retire.
 - [ ] A full-fill rejection can still generate one final signal in the zone direction before retirement.
 - [ ] Multi-candle closes progressively through an OB/FVG no longer manufacture a flipped zone.
+
+
+## Inversion Traversal Correction
+- [ ] Bullish FVG/OB can invert bearish when the prior close is at/above the source top and the current candle closes below the far boundary.
+- [ ] Bearish FVG/OB can invert bullish when the prior close is at/below the source bottom and the current candle closes above the far boundary.
+- [ ] Current candle open may be slightly inside the source zone and still qualify.
+- [ ] Multi-bar drift still does not qualify because the immediately prior close must remain on the original side.
+- [ ] XAUUSD 15m regression case forms a bearish IFVG and becomes eligible for a SELL.
