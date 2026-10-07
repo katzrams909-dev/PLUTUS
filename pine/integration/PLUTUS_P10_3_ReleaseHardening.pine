@@ -1327,6 +1327,26 @@ var int lastSignalZoneBar=na
 var int lastLongSignalBar=na
 var int lastShortSignalBar=na
 
+// Multi-zone pending reaction inventory. First touch only opens an observation
+// window; completed reactions arbitrate for the single downstream signal slot.
+var array<int> prZoneId=array.new_int()
+var array<int> prSecondId=array.new_int()
+var array<int> prDir=array.new_int()
+var array<string> prType=array.new_string()
+var array<string> prClass=array.new_string()
+var array<float> prTop=array.new_float()
+var array<float> prBottom=array.new_float()
+var array<float> prSourceQ=array.new_float()
+var array<float> prBaseRank=array.new_float()
+var array<int> prStartBar=array.new_int()
+var array<int> prDeadline=array.new_int()
+var array<bool> prWick=array.new_bool()
+var array<float> prBestAbs=array.new_float()
+var array<float> prBestRvol=array.new_float()
+var array<float> prBestDiv=array.new_float()
+var array<string> prProv=array.new_string()
+maxPendingReactions = 12
+
 int interactionIdx=na
 int interactionSecondIdx=na
 int interactionDir=0
@@ -1339,6 +1359,11 @@ float interactionTop=na
 float interactionBottom=na
 float interactionAbsorption=0.0
 string interactionProvenance="NONE"
+int interactionStartBar=na
+bool interactionHadWick=false
+float interactionBestAbsorption=0.0
+float interactionBestRvol=0.0
+float interactionBestDiv=0.0
 
 float fallbackRangeHigh=ta.highest(high,math.max(structureLookback*2,10))
 float fallbackRangeLow=ta.lowest(low,math.max(structureLookback*2,10))
@@ -1455,6 +1480,49 @@ if enableSignals and signalZoneCount>0
         bool candidateWickOnlyTouch=touchOk and not candidateBodyTouches
         bool candidateWickRejection=countWickRejection and candidateWickOnlyTouch and candidateCloseOutsideCorrect
 
+        if typeOk and obInventoryOk and breakerInventoryOk and not sameZoneTooSoon and touchOk
+            float pendingAbs=intendedDir==1?bullAbsorption:bearAbsorption
+            float pendingDiv=intendedDir==1?math.max(p06,0.0):math.max(-p06,0.0)
+            bool pendingWick=candidateWickOnlyTouch
+            int pendingSecond=hasCluster?candidateSecondId:na
+            int pendingFound=na
+            if array.size(prZoneId)>0
+                for pi=0 to array.size(prZoneId)-1
+                    bool samePrimary=array.get(prZoneId,pi)==zid
+                    int oldSecond=array.get(prSecondId,pi)
+                    bool sameSecond=(na(oldSecond) and na(pendingSecond)) or (not na(oldSecond) and not na(pendingSecond) and oldSecond==pendingSecond)
+                    if samePrimary and sameSecond
+                        pendingFound:=pi
+            if na(pendingFound)
+                if array.size(prZoneId)>=maxPendingReactions
+                    array.shift(prZoneId), array.shift(prSecondId), array.shift(prDir), array.shift(prType), array.shift(prClass)
+                    array.shift(prTop), array.shift(prBottom), array.shift(prSourceQ), array.shift(prBaseRank)
+                    array.shift(prStartBar), array.shift(prDeadline), array.shift(prWick)
+                    array.shift(prBestAbs), array.shift(prBestRvol), array.shift(prBestDiv), array.shift(prProv)
+                array.push(prZoneId,zid)
+                array.push(prSecondId,pendingSecond)
+                array.push(prDir,intendedDir)
+                array.push(prType,ztyp)
+                array.push(prClass,hasCluster?"CLUSTER_REJECTION":ztyp=="IFVG"?"IFVG_RETEST":ztyp=="BREAKER"?"BREAKER_RETEST":ztyp=="OB"?"OB_REJECTION":"FVG_REJECTION")
+                array.push(prTop,activeTop)
+                array.push(prBottom,activeBottom)
+                array.push(prSourceQ,hasCluster?clusterBaseQ:zscore)
+                array.push(prBaseRank,(hasCluster?18.0:standaloneBreaker?14.0:standaloneOb?10.0:ztyp=="IFVG"?6.0:0.0)+(pendingWick?4.0:0.0))
+                array.push(prStartBar,bar_index)
+                array.push(prDeadline,bar_index+reactionConfirmBars-1)
+                array.push(prWick,pendingWick)
+                array.push(prBestAbs,pendingAbs)
+                array.push(prBestRvol,rvolNow)
+                array.push(prBestDiv,pendingDiv)
+                array.push(prProv,hasCluster?clusterProv:(zdir==1?"BULL ":"BEAR ")+ztyp+" #"+str.tostring(zid)+(pendingDiv>0?" + DIV":""))
+            else
+                array.set(prTop,pendingFound,activeTop)
+                array.set(prBottom,pendingFound,activeBottom)
+                array.set(prWick,pendingFound,array.get(prWick,pendingFound) or pendingWick)
+                array.set(prBestAbs,pendingFound,math.max(array.get(prBestAbs,pendingFound),pendingAbs))
+                array.set(prBestRvol,pendingFound,math.max(array.get(prBestRvol,pendingFound),rvolNow))
+                array.set(prBestDiv,pendingFound,math.max(array.get(prBestDiv,pendingFound),pendingDiv))
+
         if typeOk and obInventoryOk and breakerInventoryOk and institutionalContextOk and institutionalRegimeOk and (not institutionalCandidate or not unabsorbedArrival) and not sameZoneTooSoon and touchOk
             float zwidth=math.max(activeTop-activeBottom,syminfo.mintick)
             float depth=intendedDir==1?f_clamp((activeTop-low)/zwidth,0.0,2.0):f_clamp((high-activeBottom)/zwidth,0.0,2.0)
@@ -1496,19 +1564,106 @@ if enableSignals and signalZoneCount>0
             float regimePriority=institutionalCandidate?(adxOpposing?-12.0:adxAligned and adxRising?6.0:adxLateRollover?-8.0:0.0):0.0
             float arrivalReactionPriority=institutionalCandidate?(unabsorbedArrival?-12.0:reactionDominant?7.0:0.0):0.0
             float candidateRank=q+reactionScore*0.35+typePriority+directionPriority+divergencePriority+locationPriority+volumePriority+regimePriority+arrivalReactionPriority
-            if (immediateCandidatePass or wickCandidatePass or pendingCandidatePass) and candidateRank>interactionRank
-                interactionIdx:=i
-                interactionSecondIdx:=clusterMate
-                interactionDir:=intendedDir
-                interactionClass:=klass
-                interactionQuality:=q
-                interactionRank:=candidateRank
-                interactionDepth:=depth
-                interactionIsCluster:=hasCluster
-                interactionTop:=activeTop
-                interactionBottom:=activeBottom
-                interactionAbsorption:=absorption
-                interactionProvenance:=hasCluster?clusterProv:(zdir==1?"BULL ":"BEAR ")+ztyp+" #"+str.tostring(zid)+(institutionalCandidate and alignedDiv?" + DIV":"")
+            // Instantaneous quality updates the matching pending thesis, but does
+            // not monopolize the downstream signal slot.
+            if immediateCandidatePass or wickCandidatePass or pendingCandidatePass
+                int qPending=na
+                if array.size(prZoneId)>0
+                    for qi=0 to array.size(prZoneId)-1
+                        int qSecond=array.get(prSecondId,qi)
+                        bool qSameSecond=(na(qSecond) and na(candidateSecondId)) or (not na(qSecond) and not na(candidateSecondId) and qSecond==candidateSecondId)
+                        if array.get(prZoneId,qi)==zid and qSameSecond
+                            qPending:=qi
+                if not na(qPending)
+                    array.set(prSourceQ,qPending,math.max(array.get(prSourceQ,qPending),q))
+                    array.set(prBaseRank,qPending,math.max(array.get(prBaseRank,qPending),candidateRank))
+                    array.set(prClass,qPending,klass)
+                    array.set(prBestAbs,qPending,math.max(array.get(prBestAbs,qPending),absorption))
+
+// Confirmation-time arbitration across all pending reactions.
+int pri=array.size(prZoneId)-1
+while pri>=0
+    int pzid=array.get(prZoneId,pri)
+    int psid=array.get(prSecondId,pri)
+    int pdir=array.get(prDir,pri)
+    string ptyp=array.get(prType,pri)
+    float ptop=array.get(prTop,pri)
+    float pbot=array.get(prBottom,pri)
+    int pstart=array.get(prStartBar,pri)
+    int pdeadline=array.get(prDeadline,pri)
+
+    int liveIdx=na
+    int liveSecondIdx=na
+    if array.size(zId)>0
+        for li=0 to array.size(zId)-1
+            if array.get(zId,li)==pzid
+                liveIdx:=li
+            if not na(psid) and array.get(zId,li)==psid
+                liveSecondIdx:=li
+
+    bool pLive=not na(liveIdx)
+    if pLive
+        string lst=array.get(zState,liveIdx)
+        pLive:=lst=="FRESH" or lst=="RETESTED" or lst=="PARTIAL" or lst=="TERMINAL_FILL"
+        pLive:=pLive and array.get(zDir,liveIdx)==pdir
+        if not na(psid)
+            pLive:=pLive and not na(liveSecondIdx) and array.get(zDir,liveSecondIdx)==pdir
+
+    bool pExpired=bar_index>pdeadline
+    if not pLive or pExpired
+        array.remove(prZoneId,pri), array.remove(prSecondId,pri), array.remove(prDir,pri), array.remove(prType,pri), array.remove(prClass,pri)
+        array.remove(prTop,pri), array.remove(prBottom,pri), array.remove(prSourceQ,pri), array.remove(prBaseRank,pri)
+        array.remove(prStartBar,pri), array.remove(prDeadline,pri), array.remove(prWick,pri)
+        array.remove(prBestAbs,pri), array.remove(prBestRvol,pri), array.remove(prBestDiv,pri), array.remove(prProv,pri)
+    else
+        if not na(liveIdx)
+            if na(psid)
+                ptop:=array.get(zTop,liveIdx)
+                pbot:=array.get(zBottom,liveIdx)
+            else
+                ptop:=math.min(array.get(zTop,liveIdx),array.get(zTop,liveSecondIdx))
+                pbot:=math.max(array.get(zBottom,liveIdx),array.get(zBottom,liveSecondIdx))
+            array.set(prTop,pri,ptop)
+            array.set(prBottom,pri,pbot)
+
+        float pRange=math.max(high-low,syminfo.mintick)
+        float pCloseLoc=(close-low)/pRange
+        float pMid=(ptop+pbot)*0.5
+        bool pOutside=pdir==1?close>ptop:close<pbot
+        bool pMidOk=pdir==1?close>=pMid:close<=pMid
+        bool pDirClose=pdir==1?close>open and pCloseLoc>=minSignalCloseLocation:close<open and pCloseLoc<=1.0-minSignalCloseLocation
+        bool pDeparture=not requireDirectionalDeparture or (pdir==1?close>open:close<open)
+        bool pReclaim=reactionReclaimMode=="Outside Zone"?pOutside:reactionReclaimMode=="Midpoint"?pMidOk:pDirClose
+        bool pConfirmBar=bar_index==pstart?(allowSameBarConfirmation and pDeparture and (pDirClose or (array.get(prWick,pri) and pOutside))):(bar_index<=pdeadline and pDeparture and pReclaim)
+
+        float pAbsNow=pdir==1?bullAbsorption:bearAbsorption
+        float pDivNow=pdir==1?math.max(p06,0.0):math.max(-p06,0.0)
+        array.set(prBestAbs,pri,math.max(array.get(prBestAbs,pri),pAbsNow))
+        array.set(prBestRvol,pri,math.max(array.get(prBestRvol,pri),rvolNow))
+        array.set(prBestDiv,pri,math.max(array.get(prBestDiv,pri),pDivNow))
+
+        if pConfirmBar
+            float pReactionQ=f_clamp(pAbsNow*0.40+(pdir==1?pCloseLoc:(1.0-pCloseLoc))*100.0*0.35+(((pdir==1 and close>open) or (pdir==-1 and close<open))?bodyEff*100.0:0.0)*0.25,0.0,100.0)
+            float pCompletedRank=array.get(prBaseRank,pri)+pReactionQ*0.45+array.get(prBestAbs,pri)*0.20+array.get(prBestDiv,pri)*0.10
+            if pCompletedRank>interactionRank
+                interactionIdx:=liveIdx
+                interactionSecondIdx:=liveSecondIdx
+                interactionDir:=pdir
+                interactionClass:=array.get(prClass,pri)
+                interactionQuality:=array.get(prSourceQ,pri)
+                interactionRank:=pCompletedRank
+                interactionDepth:=0.0
+                interactionIsCluster:=not na(psid)
+                interactionTop:=ptop
+                interactionBottom:=pbot
+                interactionAbsorption:=array.get(prBestAbs,pri)
+                interactionProvenance:=array.get(prProv,pri)
+                interactionStartBar:=pstart
+                interactionHadWick:=array.get(prWick,pri)
+                interactionBestAbsorption:=array.get(prBestAbs,pri)
+                interactionBestRvol:=array.get(prBestRvol,pri)
+                interactionBestDiv:=array.get(prBestDiv,pri)
+    pri-=1
 
 var string signalState="IDLE"
 var int setupDir=0
@@ -1599,20 +1754,20 @@ if signalState=="IDLE" and not interactionCooldown and not na(interactionIdx)
     setupRegime:=armTrendDir==0?"TREND":interactionDir==armTrendDir?"TREND":"COUNTERTREND"
     setupProvenance:=interactionProvenance
     setupBorn:=array.get(zBorn,interactionIdx)
-    setupArmedBar:=bar_index
-    setupReactionDeadline:=bar_index+reactionConfirmBars-1
+    setupArmedBar:=nz(interactionStartBar,bar_index)
+    setupReactionDeadline:=setupArmedBar+reactionConfirmBars-1
     bool armCloseInside=close<=interactionTop and close>=interactionBottom
     bool armWickEntered=low<=interactionTop and high>=interactionBottom
     float armBodyLow=math.min(open,close)
     float armBodyHigh=math.max(open,close)
     bool armBodyEntered=armBodyLow<=interactionTop and armBodyHigh>=interactionBottom
-    setupTouchedWithWick:=armWickEntered and not armBodyEntered
+    setupTouchedWithWick:=interactionHadWick or (armWickEntered and not armBodyEntered)
     setupInitialCloseInside:=armCloseInside
     setupInitialRegime:=setupRegime
-    setupBestAbsorption:=interactionAbsorption
+    setupBestAbsorption:=math.max(interactionAbsorption,interactionBestAbsorption)
     setupBestReactionQuality:=0.0
-    setupBestRvol:=rvolNow
-    setupBestAlignedDiv:=setupAlignedDiv
+    setupBestRvol:=math.max(rvolNow,interactionBestRvol)
+    setupBestAlignedDiv:=math.max(setupAlignedDiv,interactionBestDiv)
     setupConfirmBarsUsed:=0
 
 int boundIdx=na
@@ -1921,6 +2076,17 @@ if signalConfirmNow
     lastSignalZoneId:=setupZoneId
     lastSignalSecondZoneId:=setupSecondZoneId
     lastSignalZoneBar:=bar_index
+    if array.size(prZoneId)>0
+        int rpi=array.size(prZoneId)-1
+        while rpi>=0
+            int rSecond=array.get(prSecondId,rpi)
+            bool rSameSecond=(na(rSecond) and na(setupSecondZoneId)) or (not na(rSecond) and not na(setupSecondZoneId) and rSecond==setupSecondZoneId)
+            if array.get(prZoneId,rpi)==setupZoneId and rSameSecond
+                array.remove(prZoneId,rpi), array.remove(prSecondId,rpi), array.remove(prDir,rpi), array.remove(prType,rpi), array.remove(prClass,rpi)
+                array.remove(prTop,rpi), array.remove(prBottom,rpi), array.remove(prSourceQ,rpi), array.remove(prBaseRank,rpi)
+                array.remove(prStartBar,rpi), array.remove(prDeadline,rpi), array.remove(prWick,rpi)
+                array.remove(prBestAbs,rpi), array.remove(prBestRvol,rpi), array.remove(prBestDiv,rpi), array.remove(prProv,rpi)
+            rpi-=1
     if setupDir==1
         lastLongSignalBar:=bar_index
         longConfirmed:=true
