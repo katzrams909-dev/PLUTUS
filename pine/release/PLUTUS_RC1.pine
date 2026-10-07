@@ -144,7 +144,6 @@ retestPenalty = input.float(5.0, "Penalty Per Retest", minval=0.0, maxval=25.0, 
 freshnessDecayPer100Bars = input.float(10.0, "Freshness Decay Per 100 Bars", minval=0.0, maxval=50.0, step=1.0, group=groupLifecycle)
 maxZoneAgeBars = input.int(250, "Maximum Zone Age (Bars)", minval=10, maxval=2000, group=groupLifecycle)
 maxTrackedZones = input.int(30, "Maximum Tracked Zones", minval=4, maxval=80, group=groupLifecycle)
-removeFullyMitigated = input.bool(true, "Remove Fully Mitigated Zones", group=groupLifecycle)
 removeInvalidated = input.bool(true, "Remove Invalidated Zones", group=groupLifecycle)
 removeExpired = input.bool(true, "Remove Expired Zones", group=groupLifecycle)
 showOnlyQualified = input.bool(true, "Show Only Qualified Zones", group=groupLifecycle)
@@ -157,7 +156,6 @@ createIfvg = input.bool(true, "Create IFVG From Invalidated FVG", group=groupInv
 createBreaker = input.bool(true, "Create Breaker From Invalidated OB", group=groupInversion)
 inversionMechanicFactor = input.float(0.70, "Inherited Mechanical Quality", minval=0.25, maxval=1.0, step=0.05, group=groupInversion)
 minInversionBreakAtr = input.float(0.10, "Minimum Close Through Zone / ATR", minval=0.0, step=0.05, group=groupInversion)
-inversionConfirmBars = input.int(2, "Inversion Confirmation Window", minval=1, maxval=5, group=groupInversion)
 minInversionScore = input.float(60.0, "Minimum Inversion Qualification", minval=0.0, maxval=100.0, step=5.0, group=groupInversion)
 retireFilledFvg = input.bool(true, "Retire FVG After Full Fill", group=groupInversion)
 retireFilledFlips = input.bool(true, "Retire IFVG / Breaker After Full Fill", group=groupInversion)
@@ -218,6 +216,17 @@ highVolatilityRatio = input.float(1.75, "High Volatility ATR Ratio", minval=1.10
 lowVolatilityRatio = input.float(0.60, "Low Volatility ATR Ratio", minval=0.10, maxval=1.0, step=0.05, group=groupMarketState)
 extremeVolMinReactionQuality = input.float(65.0, "Extreme Volatility Minimum Reaction Quality", minval=0, maxval=100, step=2.5, group=groupMarketState)
 allowReversalInExtremeVol = input.bool(true, "Allow Qualified Reversals In Extreme Volatility", group=groupMarketState)
+
+groupSignalQuality = "Final Signal Quality"
+minTrendFinalSQ = input.float(45.0, "Trend Minimum Final SQ", minval=0, maxval=100, step=2.5, group=groupSignalQuality)
+minCountertrendFinalSQ = input.float(55.0, "Countertrend Minimum Final SQ", minval=0, maxval=100, step=2.5, group=groupSignalQuality)
+minReversalFinalSQ = input.float(55.0, "Reversal Minimum Final SQ", minval=0, maxval=100, step=2.5, group=groupSignalQuality)
+sqSourceWeight = input.float(20.0, "Source / Setup Weight", minval=0, maxval=50, step=2.5, group=groupSignalQuality)
+sqReactionWeight = input.float(25.0, "Reaction Weight", minval=0, maxval=50, step=2.5, group=groupSignalQuality)
+sqParticipationWeight = input.float(20.0, "Participation / Flow Weight", minval=0, maxval=50, step=2.5, group=groupSignalQuality)
+sqRegimeWeight = input.float(15.0, "Regime Weight", minval=0, maxval=50, step=2.5, group=groupSignalQuality)
+sqContextWeight = input.float(10.0, "Context / Confidence Weight", minval=0, maxval=50, step=2.5, group=groupSignalQuality)
+sqSpaceWeight = input.float(10.0, "Reward-Space Weight", minval=0, maxval=50, step=2.5, group=groupSignalQuality)
 
 groupLiquiditySignals = "Liquidity / Reward Space"
 useLiquiditySweepEvidence = input.bool(true, "Use Swing-Liquidity Sweep Evidence", group=groupLiquiditySignals)
@@ -1415,6 +1424,7 @@ if enableSignals and signalZoneCount>0
         float clusterTop=na
         float clusterBottom=na
         float clusterBaseQ=zscore
+        float clusterBestQ=-1.0
         string clusterProv="NONE"
         if enableInstitutionalClusters and signalZoneCount>1
             for j=0 to signalZoneCount-1
@@ -1431,11 +1441,12 @@ if enableSignals and signalZoneCount>0
                             float cb=math.max(zbot,jb)
                             if ct>cb
                                 float cq=f_clamp((zscore+array.get(zScore,j))*0.5+clusterQualityBoost,0.0,100.0)
-                                if na(clusterMate) or cq>clusterBaseQ
+                                if na(clusterMate) or cq>clusterBestQ
                                     clusterMate:=j
                                     clusterTop:=ct
                                     clusterBottom:=cb
                                     clusterBaseQ:=cq
+                                    clusterBestQ:=cq
                                     clusterProv=(zdir==1?"BULL ":"BEAR ")+ztyp+" #"+str.tostring(zid)+" + "+jtyp+" #"+str.tostring(array.get(zId,j))
 
         bool hasCluster=not na(clusterMate)
@@ -1536,10 +1547,15 @@ var float signalStop=na
 var float signalTarget=na
 var float signalQuality=na
 var float signalQZone=na
+var float signalQReaction=na
+var float signalQParticipation=na
+var float signalQRegime=na
 var float signalQContext=na
+var float signalQSpace=na
 var float signalQConfidence=na
 var float signalQAbsorption=na
 var float signalAvailableRewardR=na
+var string signalVetoReason="NONE"
 
 bool longCooldown=not na(lastLongSignalBar) and bar_index-lastLongSignalBar<=signalCooldownBars
 bool shortCooldown=not na(lastShortSignalBar) and bar_index-lastShortSignalBar<=signalCooldownBars
@@ -1766,7 +1782,61 @@ float availableRewardDistance=not na(nearestRewardTarget)?math.abs(nearestReward
 float availableRewardR=not na(prospectiveRisk) and prospectiveRisk>0 and not na(availableRewardDistance)?availableRewardDistance/prospectiveRisk:na
 bool rewardSpaceOk=na(nearestRewardTarget) or na(availableRewardR) or availableRewardR>=minAvailableRewardR
 bool signalRiskOk=not na(prospectiveRisk) and prospectiveRisk>=syminfo.mintick
-bool signalConfirmNow=signalState=="ARMED" and sameBarOk and barstate.isconfirmed and boundZoneValid and signalRiskOk and rewardSpaceOk and (failureConfirm or standardConfirm)
+
+// Final SQ is setup-centric. Hard vetoes are evaluated separately and cannot be
+// mathematically rescued by a high score in another component.
+float prospectiveQSource=f_clamp(nz(setupArmQuality,setupZoneScore),0.0,100.0)
+float prospectiveQReaction=f_clamp(confirmReactionScore,0.0,100.0)
+float flowRatioQuality=f_clamp(nz(setupReactionArrivalRatio,confirmReactionArrivalRatio)/math.max(minReactionVsArrivalRatio,0.10)*60.0,0.0,100.0)
+float rvolQuality=f_clamp(reactionRvol/math.max(strongReactionRvol,0.10)*70.0,0.0,100.0)
+float prospectiveQParticipation=f_clamp(liveAbsorption*0.45+flowRatioQuality*0.30+rvolQuality*0.25,0.0,100.0)
+float trendRegimeQuality=f_clamp(50.0+(setupDir*confluenceScore)*0.40+(setupAdxAligned?15.0:0.0)+(setupVolumeStrong?10.0:0.0),0.0,100.0)
+float countertrendRegimeQuality=f_clamp(regimeQualityWithSweep*0.45+regimeAbsorption*0.25+nz(setupAlignedDiv,0.0)*0.20+(alignedLiquiditySweep?10.0:0.0),0.0,100.0)
+float reversalRegimeQuality=f_clamp(regimeQualityWithSweep*0.35+regimeAbsorption*0.20+nz(setupAlignedDiv,0.0)*0.20+(reversalReactionEvidence?15.0:0.0)+(alignedLiquiditySweep?10.0:0.0)+(trendDeteriorationEvidence?10.0:0.0),0.0,100.0)
+float prospectiveQRegime=setupRegime=="REVERSAL"?reversalRegimeQuality:setupRegime=="COUNTERTREND"?countertrendRegimeQuality:trendRegimeQuality
+float directionalContextQuality=setupRegime=="TREND"?f_clamp(50.0+(setupDir*confluenceScore)*0.50,0.0,100.0):f_clamp(50.0+math.max(-(setupDir*confluenceScore),0.0)*0.25,0.0,100.0)
+float prospectiveQContext=f_clamp(directionalContextQuality*0.55+confidence*0.45,0.0,100.0)
+float prospectiveQSpace=na(availableRewardR)?60.0:f_clamp(availableRewardR/math.max(targetR,0.25)*100.0,0.0,100.0)
+float sqWeightTotal=math.max(sqSourceWeight+sqReactionWeight+sqParticipationWeight+sqRegimeWeight+sqContextWeight+sqSpaceWeight,0.0001)
+float prospectiveSignalQuality=f_clamp((prospectiveQSource*sqSourceWeight+prospectiveQReaction*sqReactionWeight+prospectiveQParticipation*sqParticipationWeight+prospectiveQRegime*sqRegimeWeight+prospectiveQContext*sqContextWeight+prospectiveQSpace*sqSpaceWeight)/sqWeightTotal,0.0,100.0)
+float finalSqThreshold=setupRegime=="REVERSAL"?minReversalFinalSQ:setupRegime=="COUNTERTREND"?minCountertrendFinalSQ:minTrendFinalSQ
+bool finalSqOk=prospectiveSignalQuality>=finalSqThreshold
+bool baseConfirmationOk=failureConfirm or standardConfirm
+
+string liveVetoReason="READY"
+if signalState!="ARMED"
+    liveVetoReason:="NOT_ARMED"
+else if not boundZoneValid
+    liveVetoReason:="ZONE_INVALID"
+else if not sameBarOk
+    liveVetoReason:="WAIT_NEXT_BAR"
+else if not signalSessionOk
+    liveVetoReason:="SESSION"
+else if not signalRiskOk
+    liveVetoReason:="RISK"
+else if not rewardSpaceOk
+    liveVetoReason:="NO_SPACE"
+else if not marketStateOk
+    liveVetoReason:=compositeChop?"CHOP":"HIGH_VOL"
+else if not signalContextOk
+    liveVetoReason:=setupRegime=="REVERSAL"?"REVERSAL_EVIDENCE":setupRegime=="COUNTERTREND"?"COUNTERTREND_EVIDENCE":"CONTEXT"
+else if not effortConfirmOk
+    liveVetoReason:="EFFORT_RESULT"
+else if not obSignalConfirmOk
+    liveVetoReason:="OB_REACTION"
+else if not breakerSignalConfirmOk
+    liveVetoReason:="BREAKER_REACTION"
+else if not institutionalContextConfirmOk
+    liveVetoReason:="INST_CONTEXT"
+else if not institutionalRegimeConfirmOk
+    liveVetoReason:="FLOW_ADX"
+else if not baseConfirmationOk
+    liveVetoReason:="WAIT_CONFIRM"
+else if not finalSqOk
+    liveVetoReason:="SQ"
+signalVetoReason:=liveVetoReason
+
+bool signalConfirmNow=signalState=="ARMED" and sameBarOk and barstate.isconfirmed and boundZoneValid and signalRiskOk and rewardSpaceOk and baseConfirmationOk and finalSqOk
 
 if signalState=="ARMED" and not na(setupArmedBar) and bar_index-setupArmedBar>armedExpiryBars
     signalState:="EXPIRED"
@@ -1775,11 +1845,16 @@ bool longConfirmed=false
 bool shortConfirmed=false
 if signalConfirmNow
     signalState:="CONFIRMED"
-    signalQZone:=f_clamp(nz(setupArmQuality,setupZoneScore),0.0,100.0)
-    signalQContext:=f_clamp(math.abs(nz(confluenceScore,0.0)),0.0,100.0)
+    signalQZone:=prospectiveQSource
+    signalQReaction:=prospectiveQReaction
+    signalQParticipation:=prospectiveQParticipation
+    signalQRegime:=prospectiveQRegime
+    signalQContext:=prospectiveQContext
+    signalQSpace:=prospectiveQSpace
     signalQConfidence:=f_clamp(nz(confidence,0.0),0.0,100.0)
     signalQAbsorption:=f_clamp(nz(liveAbsorption,setupAbsorption),0.0,100.0)
-    signalQuality:=f_clamp(signalQZone*0.45+signalQContext*0.25+signalQConfidence*0.15+signalQAbsorption*0.15,0.0,100.0)
+    signalQuality:=prospectiveSignalQuality
+    signalVetoReason:="CONFIRMED"
     signalAvailableRewardR:=availableRewardR
     signalEntry:=close
     signalStop:=prospectiveStop
@@ -1879,6 +1954,10 @@ if barstate.isconfirmed and (signalState=="INVALIDATED" or signalState=="EXPIRED
     setupProvenance:="NONE"
     setupBorn:=na
     setupArmedBar:=na
+    signalQReaction:=na
+    signalQParticipation:=na
+    signalQRegime:=na
+    signalQSpace:=na
 
 bool fvgReactionConfirmed=(longConfirmed or shortConfirmed) and (setupClass=="FVG_REJECTION" or setupClass=="FVG_SWEEP_RECLAIM")
 bool ifvgReactionConfirmed=(longConfirmed or shortConfirmed) and setupClass=="IFVG_RETEST"
@@ -1909,9 +1988,9 @@ var string lastSignalAudit="NONE"
 if longConfirmed or shortConfirmed
     lastSignalAudit=setupRegime+" · "+(longConfirmed?"LONG":"SHORT")+" · "+setupClass+" · "+(setupIsCluster?setupProvenance:(setupDir==1?"BULL ":"BEAR ")+setupType+" #"+str.tostring(setupZoneId))
 
-var table signalAudit=table.new(position.middle_right,2,10,border_width=1,frame_width=1,bgcolor=color.new(color.black,15))
+var table signalAudit=table.new(position.middle_right,2,12,border_width=1,frame_width=1,bgcolor=color.new(color.black,15))
 if barstate.islast
-    table.clear(signalAudit,0,0,1,9)
+    table.clear(signalAudit,0,0,1,11)
     if showDiagnostics
         table.cell(signalAudit,0,0,"PLUTUS RC1 SIGNAL AUDIT",text_color=color.white)
         table.cell(signalAudit,1,0,signalState,text_color=signalState=="ARMED"?color.orange:signalState=="CONFIRMED"?cBull:color.white)
@@ -1923,20 +2002,24 @@ if barstate.islast
         table.cell(signalAudit,1,3,(setupDir==1?"BULL ":setupDir==-1?"BEAR ":"")+setupType,text_color=setupDir==1?cBull:setupDir==-1?cBear:color.white)
         table.cell(signalAudit,0,4,"Invariants",text_color=color.silver)
         table.cell(signalAudit,1,4,(directionInvariantOk?"D✓ ":"D✕ ")+(typeInvariantOk?"T✓ ":"T✕ ")+(clusterInvariantOk?"C✓":"C✕"),text_color=boundZoneValid?cBull:cBear)
-        table.cell(signalAudit,0,5,"ZONE / CTX / CONF / ER / SQ",text_color=color.silver)
-        table.cell(signalAudit,1,5,str.tostring(nz(signalQZone,setupArmQuality),"0")+" / "+str.tostring(nz(signalQContext,0.0),"0")+" / "+str.tostring(nz(signalQConfidence,0.0),"0")+" / "+str.tostring(nz(signalQAbsorption,liveAbsorption),"0")+" / "+str.tostring(nz(signalQuality,0.0),"0.0"),text_color=color.white)
-        table.cell(signalAudit,0,6,"Context",text_color=color.silver)
-        table.cell(signalAudit,1,6,str.tostring(confluenceScore,"#.0")+" · "+str.tostring(confidence,"#.0")+"%",text_color=confluenceScore>0?cBull:confluenceScore<0?cBear:color.white)
-        table.cell(signalAudit,0,7,"Risk / space",text_color=color.silver)
+        table.cell(signalAudit,0,5,"SRC / REACT / FLOW / REG",text_color=color.silver)
+        table.cell(signalAudit,1,5,str.tostring(nz(signalQZone,prospectiveQSource),"0")+" / "+str.tostring(nz(signalQReaction,prospectiveQReaction),"0")+" / "+str.tostring(nz(signalQParticipation,prospectiveQParticipation),"0")+" / "+str.tostring(nz(signalQRegime,prospectiveQRegime),"0"),text_color=color.white)
+        table.cell(signalAudit,0,6,"CTX / SPACE / SQ",text_color=color.silver)
+        table.cell(signalAudit,1,6,str.tostring(nz(signalQContext,prospectiveQContext),"0")+" / "+str.tostring(nz(signalQSpace,prospectiveQSpace),"0")+" / "+str.tostring(nz(signalQuality,prospectiveSignalQuality),"0.0")+" ≥ "+str.tostring(finalSqThreshold,"0.0"),text_color=finalSqOk?cBull:cBear)
+        table.cell(signalAudit,0,7,"Veto / state",text_color=color.silver)
+        table.cell(signalAudit,1,7,signalVetoReason,text_color=signalVetoReason=="READY" or signalVetoReason=="CONFIRMED"?cBull:signalVetoReason=="WAIT_CONFIRM" or signalVetoReason=="WAIT_NEXT_BAR"?color.orange:cBear)
+        table.cell(signalAudit,0,8,"Risk / space",text_color=color.silver)
         string spaceAudit=(signalRiskOk?"RISK PASS":"RISK BLOCK")+" · "+(rewardSpaceOk?"SPACE PASS":"SPACE BLOCK")+(not na(availableRewardR)?" "+str.tostring(availableRewardR,"0.0")+"R":"")
-        table.cell(signalAudit,1,7,spaceAudit,text_color=signalRiskOk and rewardSpaceOk?cBull:cBear)
-        table.cell(signalAudit,0,8,"OB / BB context",text_color=color.silver)
-        string instGate=isStandaloneObSetup?(obSignalConfirmOk and institutionalContextConfirmOk?"OB PASS":"OB BLOCK")+" · R"+str.tostring(liveObRetests)+" M"+str.tostring(liveObMitigation,"0"):isStandaloneBreakerSetup?(breakerSignalConfirmOk and institutionalContextConfirmOk?"BB PASS":"BB BLOCK")+" · R"+str.tostring(liveBreakerRetests)+" M"+str.tostring(liveBreakerMitigation,"0"):"N/A"
+        table.cell(signalAudit,1,8,spaceAudit,text_color=signalRiskOk and rewardSpaceOk?cBull:cBear)
+        table.cell(signalAudit,0,9,"OB / BB context",text_color=color.silver)
+        string instGate=isStandaloneObSetup?(obSignalConfirmOk and institutionalContextConfirmOk and institutionalRegimeConfirmOk?"OB PASS":"OB BLOCK")+" · R"+str.tostring(liveObRetests)+" M"+str.tostring(liveObMitigation,"0"):isStandaloneBreakerSetup?(breakerSignalConfirmOk and institutionalContextConfirmOk and institutionalRegimeConfirmOk?"BB PASS":"BB BLOCK")+" · R"+str.tostring(liveBreakerRetests)+" M"+str.tostring(liveBreakerMitigation,"0"):"N/A"
         string ctxTail=(isStandaloneObSetup or isStandaloneBreakerSetup)?" · L"+str.tostring(nz(setupRangeLocation,50.0),"0")+" E"+str.tostring(nz(setupExpansionAtr,0.0),"0.0")+" D+"+str.tostring(nz(setupAlignedDiv,0.0),"0")+" D-"+str.tostring(nz(setupOpposingDiv,0.0),"0")+" V"+str.tostring(rvolNow,"0.00")+" A"+str.tostring(nz(adxValue,0.0),"0")+" DI"+str.tostring(confirmAlignedDi,"0")+"/"+str.tostring(confirmOpposingDi,"0"):""
-        table.cell(signalAudit,1,8,instGate+ctxTail,text_color=(isStandaloneObSetup or isStandaloneBreakerSetup)?(((obSignalConfirmOk and isStandaloneObSetup) or (breakerSignalConfirmOk and isStandaloneBreakerSetup)) and institutionalContextConfirmOk?cBull:cBear):color.gray)
-        table.cell(signalAudit,0,9,"Market / flow",text_color=color.silver)
+        table.cell(signalAudit,1,9,instGate+ctxTail,text_color=(isStandaloneObSetup or isStandaloneBreakerSetup)?(((obSignalConfirmOk and isStandaloneObSetup) or (breakerSignalConfirmOk and isStandaloneBreakerSetup)) and institutionalContextConfirmOk and institutionalRegimeConfirmOk?cBull:cBear):color.gray)
+        table.cell(signalAudit,0,10,"Market / flow",text_color=color.silver)
         string marketAudit=(compositeChop?"CHOP":highVolatilityRegime?"HIGH VOL":lowVolatilityRegime?"LOW VOL":"NORMAL")+" · O"+str.tostring(avgBarOverlap,"0.00")+" · VR"+str.tostring(atrRegimeRatio,"0.00")+" · AR"+str.tostring(nz(setupReactionArrivalRatio,0.0),"0.00")
-        table.cell(signalAudit,1,9,marketAudit,text_color=marketStateOk?color.white:cBear)
+        table.cell(signalAudit,1,10,marketAudit,text_color=marketStateOk?color.white:cBear)
+        table.cell(signalAudit,0,11,"Last confirmed",text_color=color.silver)
+        table.cell(signalAudit,1,11,lastSignalAudit,text_color=color.white)
 
 //------------------------------------------------------------------------------
 // Production status panel — restored full information set
