@@ -425,3 +425,69 @@ PLUTUS v1.0 may be tagged only when:
 - [ ] RC is frozen and tagged as v1.0.
 
 Current status: **RC1 COMPILE-PASS / REGRESSION PENDING**.
+
+
+---
+
+## Q. P10.4 Reaction State Machine Regression
+
+Baseline reaction-state commits:
+- P10.3: `a4808d7adf8ac3a7102a616350da87aa5cfe7fc4`
+- RC1: `ed840b27a02ff7e4a15351ef7aa5d2cf78368568`
+
+### Wick interaction
+- [ ] Wick-only overlap with FVG is recognized as interaction.
+- [ ] Wick-only overlap with OB is recognized as interaction.
+- [ ] Wick-only overlap with IFVG is recognized only on a later retest bar.
+- [ ] Wick-only overlap with Breaker is recognized only on a later retest bar.
+- [ ] Wick enters Bull zone + closes above zone can confirm bullish rejection.
+- [ ] Wick enters Bear zone + closes below zone can confirm bearish rejection.
+- [ ] Mitigation-basis setting does not make signal wick interaction invisible.
+
+### 1 / 2 / 3-bar reaction window
+- [ ] 1-bar immediate reaction confirms on interaction-bar close.
+- [ ] Bar 1 closes inside + Bar 2 reclaims correctly -> confirms on Bar 2.
+- [ ] Bar 1 inside + Bar 2 remains valid + Bar 3 reclaims -> confirms on Bar 3.
+- [ ] Bar 4 reclaim with 3-bar maximum -> rejected as expired.
+- [ ] Earliest valid confirmation wins.
+- [ ] Reaction deadline does not reset merely because price remains inside the same zone.
+- [ ] Pending setup invalidates immediately if the bound zone invalidates/retires.
+
+### Reclaim modes
+- [ ] Outside Zone requires Bull close > zoneTop / Bear close < zoneBottom.
+- [ ] Midpoint requires directional reclaim through zone midpoint.
+- [ ] Directional Close follows configured directional-close quality.
+- [ ] Directional-departure requirement works independently of reclaim mode.
+
+### IFVG / Breaker post-flip invariant
+- [ ] Flip candle creates IFVG/Breaker but cannot signal.
+- [ ] Flip candle is never counted as the retest.
+- [ ] Earliest eligible interaction is bar strictly after flip bar.
+- [ ] Later 1-bar wick/body retest can confirm.
+- [ ] Later 2-bar retest can confirm.
+- [ ] Later 3-bar retest can confirm.
+- [ ] No same-candle ZONE_FAILURE entry leaks through the flipped-zone path.
+
+### Multi-bar evidence retention
+- [ ] Best absorption from Bar A/B is available to Bar B/C confirmation.
+- [ ] Best reaction quality within the pending window is retained.
+- [ ] Best RVOL within the pending window contributes to final flow quality.
+- [ ] Aligned divergence discovered within the short pending window is retained.
+- [ ] Evidence after reaction expiry cannot retroactively qualify the old setup.
+
+### Regime / labels
+- [ ] Initial regime is retained for diagnostics.
+- [ ] Final regime is classified on confirmation bar.
+- [ ] Countertrend can upgrade to Reversal during a valid multi-bar sequence.
+- [ ] Detailed label shows 1B / 2B / 3B.
+- [ ] Detailed label adds WICK when a wick-only interaction occurred.
+- [ ] Entry remains on actual confirmation-bar close, never back-plotted to first touch.
+
+### Screenshot regression cases
+- [ ] NAS100 1m circled two-stage bullish reactions are rechecked.
+- [ ] NAS100 15m delayed reclaim case is rechecked.
+- [ ] SPX500 15m delayed bullish reclaim is rechecked.
+- [ ] AUDUSD 1h bearish wick/retest example is rechecked.
+- [ ] Prior GBPUSD blue-box false long remains absent after the reaction-state change.
+
+Any same-flip-bar IFVG/Breaker signal or back-plotted delayed entry is a P0 release blocker.
