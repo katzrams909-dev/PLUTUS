@@ -189,6 +189,20 @@ signalCooldownBars = input.int(5, "Directional Cooldown Bars", minval=0, maxval=
 sameZoneReentryBars = input.int(3, "Same-Zone Re-entry Delay", minval=0, maxval=50, group=groupSignals)
 allowSameBarConfirmation = input.bool(true, "Allow Interaction-Bar Close Confirmation", group=groupSignals)
 
+groupRegimeSignals = "Signal Regime Filters"
+enableTrendSignals = input.bool(true, "Enable Trend Signals", group=groupRegimeSignals)
+enableCountertrendSignals = input.bool(true, "Enable Countertrend Signals", group=groupRegimeSignals)
+enableReversalSignals = input.bool(true, "Enable Reversal Signals", group=groupRegimeSignals)
+countertrendMinSetupQuality = input.float(62.5, "Countertrend Minimum Setup Quality", minval=0, maxval=100, step=2.5, group=groupRegimeSignals)
+countertrendMinAbsorption = input.float(50.0, "Countertrend Minimum Absorption", minval=0, maxval=100, step=5, group=groupRegimeSignals)
+reversalMinSetupQuality = input.float(55.0, "Reversal Minimum Setup Quality", minval=0, maxval=100, step=2.5, group=groupRegimeSignals)
+reversalMinDivergence = input.float(20.0, "Reversal Minimum Aligned Divergence", minval=0, maxval=100, step=5, group=groupRegimeSignals)
+reversalExtremeLocationPct = input.float(65.0, "Reversal Extreme Location %", minval=50, maxval=90, step=2.5, group=groupRegimeSignals)
+reversalRequireInstitutionalZone = input.bool(true, "Reversal Requires OB / Breaker / IFVG / Cluster", group=groupRegimeSignals)
+chopAdxThreshold = input.float(17.0, "Chop ADX Threshold", minval=5, maxval=40, step=1, group=groupRegimeSignals)
+chopMaxConfluence = input.float(15.0, "Chop Maximum |Confluence|", minval=0, maxval=50, step=5, group=groupRegimeSignals)
+allowSweepInChop = input.bool(true, "Allow Sweep/Reclaim In Chop", group=groupRegimeSignals)
+
 groupObSignals = "Order Block / Breaker Signal Quality"
 obMinOriginQuality = input.float(40.0, "OB Minimum Origin Quality Floor", minval=0, maxval=100, step=5, group=groupObSignals)
 obPreferredOriginQuality = input.float(65.0, "OB Preferred Origin Quality", minval=0, maxval=100, step=5, group=groupObSignals)
@@ -1386,7 +1400,7 @@ if enableSignals and signalZoneCount>0
             bool swept=not justFlipped and (intendedDir==1?low<activeBottom:high>activeTop)
             float sweepBeyond=swept?(intendedDir==1?activeBottom-low:high-activeTop):0.0
             bool sweepOk=not swept or na(atr) or sweepBeyond<=maxSweepBeyondAtr*atr
-            string klass=justFlipped?"ZONE_FAILURE":hasCluster?(swept and sweepOk?"CLUSTER_SWEEP_RECLAIM":"CLUSTER_REJECTION"):(ztyp=="IFVG" or ztyp=="BREAKER")?"FLIP_RETEST":swept and sweepOk?"SWEEP_RECLAIM":"REJECTION"
+            string klass=justFlipped?"ZONE_FAILURE":hasCluster?(swept and sweepOk?"CLUSTER_SWEEP_RECLAIM":"CLUSTER_REJECTION"):ztyp=="IFVG"?"IFVG_RETEST":ztyp=="BREAKER"?"BREAKER_RETEST":ztyp=="OB"?(swept and sweepOk?"OB_SWEEP_RECLAIM":"OB_REJECTION"):(swept and sweepOk?"FVG_SWEEP_RECLAIM":"FVG_REJECTION")
             float absorption=intendedDir==1?bullAbsorption:bearAbsorption
             float erBoost=effortResultMode=="Off"?0.0:effortResultBoost*absorption/100.0
             float baseQ=hasCluster?clusterBaseQ:zscore
@@ -1452,6 +1466,7 @@ var float setupAlignedDi=na
 var float setupOpposingDi=na
 var bool setupVolumeStrong=false
 var bool setupAdxAligned=false
+var string setupRegime="NONE"
 var string setupProvenance="NONE"
 var int setupBorn=na
 var int setupArmedBar=na
@@ -1492,6 +1507,8 @@ if signalState=="IDLE" and not interactionCooldown and not na(interactionIdx)
     setupOpposingDi:=interactionDir==1?diMinus:interactionDir==-1?diPlus:na
     setupVolumeStrong:=interactionDir!=0 and rvolNow>=strongReactionRvol and volumeExpanding and ((interactionDir==1 and close>open) or (interactionDir==-1 and close<open))
     setupAdxAligned:=interactionDir!=0 and not na(adxValue) and adxValue>=adxTrendThreshold and nz(setupAlignedDi,0.0)>=nz(setupOpposingDi,0.0)
+    int armTrendDir=confluenceScore>=hysteresisEnter?1:confluenceScore<=-hysteresisEnter?-1:0
+    setupRegime:=armTrendDir==0?"TREND":interactionDir==armTrendDir?"TREND":"COUNTERTREND"
     setupProvenance:=interactionProvenance
     setupBorn:=array.get(zBorn,interactionIdx)
     setupArmedBar:=bar_index
@@ -1519,7 +1536,7 @@ if not na(boundIdx)
     if setupClass=="ZONE_FAILURE"
         directionInvariantOk:=setupDir==-setupOriginalDir and liveSignalDir==setupDir
         typeInvariantOk:=(liveSignalType=="IFVG" or liveSignalType=="BREAKER") and liveSignalState=="JUST_FLIPPED"
-    else if setupClass=="FLIP_RETEST"
+    else if setupClass=="IFVG_RETEST" or setupClass=="BREAKER_RETEST"
         directionInvariantOk:=liveSignalDir==setupDir
         typeInvariantOk:=(liveSignalType=="IFVG" or liveSignalType=="BREAKER") and liveSignalType==setupType
     else if setupIsCluster
@@ -1564,15 +1581,38 @@ bool normalCloseOk=confirmationMode=="Directional Close"?signalDirectionalClose:
 bool failureCloseOk=setupDir==1?close>setupTop:setupDir==-1?close<setupBottom:false
 
 bool signalParticipationOk=setupDir==1?p01>=minSignalParticipation:setupDir==-1?p01<=-minSignalParticipation:false
-bool signalContextOk=setupDir==1?confluenceScore>=minSignalConfluence:setupDir==-1?confluenceScore<=-minSignalConfluence:false
-signalContextOk:=signalContextOk and confidence>=minSignalConfidence and signalSessionOk
+bool directionalContextAligned=setupDir==1?confluenceScore>=minSignalConfluence:setupDir==-1?confluenceScore<=-minSignalConfluence:false
+bool baseContextQualityOk=confidence>=minSignalConfidence and signalSessionOk
+
+int prevailingTrendDir=confluenceScore>=hysteresisEnter?1:confluenceScore<=-hysteresisEnter?-1:0
+bool setupOpposesTrend=prevailingTrendDir!=0 and setupDir!=prevailingTrendDir
+bool institutionalReversalSource=setupIsCluster or setupType=="OB" or setupType=="BREAKER" or setupType=="IFVG"
+bool extremeReversalLocation=setupDir==1?nz(setupRangeLocation,50.0)<=100.0-reversalExtremeLocationPct:nz(setupRangeLocation,50.0)>=reversalExtremeLocationPct
+bool flipEvidence=setupClass=="ZONE_FAILURE" or setupClass=="BREAKER_RETEST" or setupClass=="IFVG_RETEST"
+bool reversalReactionEvidence=setupClass=="OB_SWEEP_RECLAIM" or setupClass=="CLUSTER_SWEEP_RECLAIM" or flipEvidence
+bool divergenceReversalEvidence=nz(setupAlignedDiv,0.0)>=reversalMinDivergence
+bool trendDeteriorationEvidence=adxFalling or nz(setupOpposingDi,0.0)>nz(setupAlignedDi,0.0) or not setupAdxAligned
+float regimeAbsorption=math.max(nz(setupAbsorption,0.0),setupDir==1?bullAbsorption:setupDir==-1?bearAbsorption:0.0)
+bool reversalEvidence=setupOpposesTrend and (not reversalRequireInstitutionalZone or institutionalReversalSource) and nz(setupArmQuality,0.0)>=reversalMinSetupQuality and (reversalReactionEvidence or (extremeReversalLocation and divergenceReversalEvidence) or (divergenceReversalEvidence and trendDeteriorationEvidence))
+string liveRegime=reversalEvidence?"REVERSAL":setupOpposesTrend?"COUNTERTREND":"TREND"
+setupRegime:=liveRegime
+
+bool trendRegimeOk=liveRegime!="TREND" or (enableTrendSignals and directionalContextAligned and baseContextQualityOk)
+bool countertrendEvidence=nz(setupArmQuality,0.0)>=countertrendMinSetupQuality and regimeAbsorption>=countertrendMinAbsorption and (extremeReversalLocation or nz(setupAlignedDiv,0.0)>0.0 or setupIsCluster or setupClass=="OB_SWEEP_RECLAIM")
+bool countertrendRegimeOk=liveRegime!="COUNTERTREND" or (enableCountertrendSignals and baseContextQualityOk and countertrendEvidence)
+bool reversalRegimeOk=liveRegime!="REVERSAL" or (enableReversalSignals and baseContextQualityOk and reversalEvidence)
+bool signalContextOk=trendRegimeOk and countertrendRegimeOk and reversalRegimeOk and signalSessionOk
+
+bool lowTrendChop=not na(adxValue) and adxValue<chopAdxThreshold and math.abs(confluenceScore)<=chopMaxConfluence
+bool chopException=setupClass=="FVG_SWEEP_RECLAIM" or setupClass=="OB_SWEEP_RECLAIM" or setupClass=="CLUSTER_SWEEP_RECLAIM" or setupClass=="ZONE_FAILURE"
+bool marketStateOk=not lowTrendChop or (allowSweepInChop and chopException)
 
 bool isFailure=setupClass=="ZONE_FAILURE"
 float opposingConfluence=setupDir==1?math.max(-confluenceScore,0.0):math.max(confluenceScore,0.0)
 bool failureImpulseOk=bodyAtr>=failureMinBodyAtr and bodyEff>=failureMinEfficiency
 bool failurePartOk=confirmationSpeed=="Early"?(setupDir==1?p01>-35.0:p01<35.0):confirmationSpeed=="Conservative"?signalParticipationOk:(setupDir==1?p01>=0:p01<=0)
 bool failureContextOk=confirmationSpeed=="Conservative"?signalContextOk:(signalSessionOk and opposingConfluence<=failureMaxOpposingConfluence and confidence>=minSignalConfidence*0.75)
-bool failureConfirm=isFailure and failureCloseOk and failureImpulseOk and failurePartOk and failureContextOk
+bool failureConfirm=isFailure and failureCloseOk and failureImpulseOk and failurePartOk and failureContextOk and marketStateOk and (setupRegime=="REVERSAL"?enableReversalSignals:setupRegime=="COUNTERTREND"?enableCountertrendSignals:enableTrendSignals)
 float liveAbsorption=setupDir==1?bullAbsorption:bearAbsorption
 bool effortConfirmOk=effortResultMode!="Require" or liveAbsorption>=minAbsorptionScore
 bool isStandaloneObSetup=setupType=="OB" and not setupIsCluster
@@ -1608,7 +1648,7 @@ bool confirmVolumeRecovery=not institutionalReactionSetup or not useInstitutiona
 bool lateWeakRegime=institutionalReactionSetup and nz(setupExpansionAtr,0.0)>maxExpansionFromZoneAtr and confirmVolumeWeak and confirmAdxLateRollover
 bool institutionalRegimeConfirmOk=not institutionalReactionSetup or (not confirmAdxOpposing and not lateWeakRegime and confirmVolumeRecovery)
 bool genericCloseRequirement=institutionalReactionSetup?true:normalCloseOk
-bool standardConfirm=not isFailure and genericCloseRequirement and signalParticipationOk and signalContextOk and effortConfirmOk and obSignalConfirmOk and breakerSignalConfirmOk and institutionalContextConfirmOk and institutionalRegimeConfirmOk
+bool standardConfirm=not isFailure and genericCloseRequirement and signalParticipationOk and signalContextOk and marketStateOk and effortConfirmOk and obSignalConfirmOk and breakerSignalConfirmOk and institutionalContextConfirmOk and institutionalRegimeConfirmOk
 bool sameBarOk=allowSameBarConfirmation or na(setupArmedBar) or bar_index>setupArmedBar
 float prospectiveBuffer=nz(atr,0.0)*stopBufferAtr
 float prospectiveStop=setupDir==1?setupBottom-prospectiveBuffer:setupDir==-1?setupTop+prospectiveBuffer:na
@@ -1655,7 +1695,7 @@ if longConfirmed or shortConfirmed
     string sideText=longConfirmed?"LONG":"SHORT"
     string zoneText=setupProvenance!="NONE"?setupProvenance:(setupDir==1?"BULL ":"BEAR ")+setupType+" #"+str.tostring(setupZoneId)
     string regimeText=(setupType=="OB" or setupType=="BREAKER")?" · V "+str.tostring(rvolNow,"0.00")+" · ADX "+str.tostring(nz(adxValue,0.0),"0.0"):""
-    string sigText=signalDisplay=="Minimal"?sideText:signalDisplay=="Compact"?sideText+" · "+zoneText:"PLUTUS "+sideText+" · "+setupClass+" · "+zoneText+" · ER "+str.tostring(nz(signalQAbsorption,0.0),"0.0")+regimeText+" · SQ "+str.tostring(nz(signalQuality,0.0),"0.0")
+    string sigText=signalDisplay=="Minimal"?sideText:signalDisplay=="Compact"?setupRegime+" "+sideText+" · "+zoneText:"PLUTUS "+setupRegime+" "+sideText+" · "+setupClass+" · "+zoneText+" · ER "+str.tostring(nz(signalQAbsorption,0.0),"0.0")+regimeText+" · SQ "+str.tostring(nz(signalQuality,0.0),"0.0")
     label slb=label.new(bar_index,close,sigText,xloc=xloc.bar_index,style=longConfirmed?label.style_label_up:label.style_label_down,textcolor=color.white,color=color.new(sigColor,15),size=signalDisplay=="Detailed"?size.small:size.tiny)
     array.push(signalLabels,slb)
     while array.size(signalLabels)>maxSignalPreviews
@@ -1717,30 +1757,39 @@ if barstate.isconfirmed and (signalState=="INVALIDATED" or signalState=="EXPIRED
     setupOpposingDi:=na
     setupVolumeStrong:=false
     setupAdxAligned:=false
+    setupRegime:="NONE"
     setupProvenance:="NONE"
     setupBorn:=na
     setupArmedBar:=na
 
-bool rejectionConfirmed=(longConfirmed or shortConfirmed) and setupClass=="REJECTION"
-bool sweepConfirmed=(longConfirmed or shortConfirmed) and setupClass=="SWEEP_RECLAIM"
+bool fvgReactionConfirmed=(longConfirmed or shortConfirmed) and (setupClass=="FVG_REJECTION" or setupClass=="FVG_SWEEP_RECLAIM")
+bool ifvgReactionConfirmed=(longConfirmed or shortConfirmed) and setupClass=="IFVG_RETEST"
+bool obReactionConfirmed=(longConfirmed or shortConfirmed) and (setupClass=="OB_REJECTION" or setupClass=="OB_SWEEP_RECLAIM")
+bool breakerReactionConfirmed=(longConfirmed or shortConfirmed) and setupClass=="BREAKER_RETEST"
 bool failureConfirmed=(longConfirmed or shortConfirmed) and setupClass=="ZONE_FAILURE"
-bool flipRetestConfirmed=(longConfirmed or shortConfirmed) and setupClass=="FLIP_RETEST"
 bool clusterConfirmed=(longConfirmed or shortConfirmed) and (setupClass=="CLUSTER_REJECTION" or setupClass=="CLUSTER_SWEEP_RECLAIM")
+bool trendConfirmed=(longConfirmed or shortConfirmed) and setupRegime=="TREND"
+bool countertrendConfirmed=(longConfirmed or shortConfirmed) and setupRegime=="COUNTERTREND"
+bool reversalConfirmed=(longConfirmed or shortConfirmed) and setupRegime=="REVERSAL"
 
 alertcondition(longConfirmed,"PLUTUS RC1 Long Confirmed","PLUTUS RC1 confirmed a LONG institutional-zone setup.")
 alertcondition(shortConfirmed,"PLUTUS RC1 Short Confirmed","PLUTUS RC1 confirmed a SHORT institutional-zone setup.")
-alertcondition(rejectionConfirmed,"PLUTUS RC1 Rejection","PLUTUS RC1 confirmed a zone rejection.")
-alertcondition(sweepConfirmed,"PLUTUS RC1 Sweep Reclaim","PLUTUS RC1 confirmed a sweep/reclaim.")
+alertcondition(fvgReactionConfirmed,"PLUTUS RC1 FVG Reaction","PLUTUS RC1 confirmed an FVG rejection or sweep/reclaim.")
+alertcondition(ifvgReactionConfirmed,"PLUTUS RC1 IFVG Retest","PLUTUS RC1 confirmed an IFVG retest.")
+alertcondition(obReactionConfirmed,"PLUTUS RC1 OB Reaction","PLUTUS RC1 confirmed an Order Block rejection or sweep/reclaim.")
+alertcondition(breakerReactionConfirmed,"PLUTUS RC1 Breaker Retest","PLUTUS RC1 confirmed a Breaker Block retest.")
 alertcondition(failureConfirmed,"PLUTUS RC1 Zone Failure","PLUTUS RC1 confirmed a failed-zone inversion.")
-alertcondition(flipRetestConfirmed,"PLUTUS RC1 Flip Retest","PLUTUS RC1 confirmed an IFVG/Breaker retest.")
 alertcondition(clusterConfirmed,"PLUTUS RC1 Institutional Cluster","PLUTUS RC1 confirmed a Breaker + FVG-family cluster reaction.")
+alertcondition(trendConfirmed,"PLUTUS RC1 Trend Signal","PLUTUS RC1 confirmed a trend signal.")
+alertcondition(countertrendConfirmed,"PLUTUS RC1 Countertrend Signal","PLUTUS RC1 confirmed a countertrend signal.")
+alertcondition(reversalConfirmed,"PLUTUS RC1 Reversal Signal","PLUTUS RC1 confirmed a reversal signal.")
 
 //------------------------------------------------------------------------------
 // P10.3 signal audit — diagnostic only, never feeds logic
 //------------------------------------------------------------------------------
 var string lastSignalAudit="NONE"
 if longConfirmed or shortConfirmed
-    lastSignalAudit=(longConfirmed?"LONG":"SHORT")+" · "+setupClass+" · "+(setupIsCluster?setupProvenance:(setupDir==1?"BULL ":"BEAR ")+setupType+" #"+str.tostring(setupZoneId))
+    lastSignalAudit=setupRegime+" · "+(longConfirmed?"LONG":"SHORT")+" · "+setupClass+" · "+(setupIsCluster?setupProvenance:(setupDir==1?"BULL ":"BEAR ")+setupType+" #"+str.tostring(setupZoneId))
 
 var table signalAudit=table.new(position.middle_right,2,10,border_width=1,frame_width=1,bgcolor=color.new(color.black,15))
 if barstate.islast
@@ -1749,7 +1798,7 @@ if barstate.islast
         table.cell(signalAudit,0,0,"PLUTUS RC1 SIGNAL AUDIT",text_color=color.white)
         table.cell(signalAudit,1,0,signalState,text_color=signalState=="ARMED"?color.orange:signalState=="CONFIRMED"?cBull:color.white)
         table.cell(signalAudit,0,1,"Setup",text_color=color.silver)
-        table.cell(signalAudit,1,1,setupClass,text_color=color.white)
+        table.cell(signalAudit,1,1,setupRegime+" · "+setupClass,text_color=color.white)
         table.cell(signalAudit,0,2,"Provenance",text_color=color.silver)
         table.cell(signalAudit,1,2,setupProvenance,text_color=color.white)
         table.cell(signalAudit,0,3,"Dir / Type",text_color=color.silver)
