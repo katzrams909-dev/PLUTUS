@@ -186,6 +186,9 @@ armedExpiryBars = input.int(3, "Armed Setup Expiry", minval=1, maxval=20, group=
 signalCooldownBars = input.int(5, "Directional Cooldown Bars", minval=0, maxval=100, group=groupSignals)
 sameZoneReentryBars = input.int(3, "Same-Zone Re-entry Delay", minval=0, maxval=50, group=groupSignals)
 allowSameBarConfirmation = input.bool(true, "Allow Interaction-Bar Close Confirmation", group=groupSignals)
+reactionConfirmBars = input.int(3, "Reaction Confirmation Window (Bars)", minval=1, maxval=3, group=groupSignals)
+countWickRejection = input.bool(true, "Count Wick-In / Close-Out Rejection", group=groupSignals)
+delayedReactionRequireOutsideClose = input.bool(true, "Delayed Reaction Requires Close Back Outside Zone", group=groupSignals)
 
 groupRegimeSignals = "Signal Regime Filters"
 enableTrendSignals = input.bool(true, "Enable Trend Signals", group=groupRegimeSignals)
@@ -1459,7 +1462,9 @@ if enableSignals and signalZoneCount>0
         float activeBottom=hasCluster?clusterBottom:zbot
         bool clusterTouch=hasCluster and low<=clusterTop and high>=clusterBottom
         bool touchOk=hasCluster and clusterRequireIntersectionTouch?clusterTouch:normalTouch
-        touchOk:=justFlipped?true:touchOk
+        // IFVG / Breaker creation bar is never a retest. A flipped zone becomes
+        // eligible only on a later bar after the JUST_FLIPPED transition.
+        touchOk:=justFlipped?false:touchOk
 
         if typeOk and obInventoryOk and breakerInventoryOk and institutionalContextOk and institutionalRegimeOk and (not institutionalCandidate or not unabsorbedArrival) and not sameZoneTooSoon and touchOk
             float zwidth=math.max(activeTop-activeBottom,syminfo.mintick)
@@ -1467,7 +1472,7 @@ if enableSignals and signalZoneCount>0
             bool swept=not justFlipped and (intendedDir==1?low<activeBottom:high>activeTop)
             float sweepBeyond=swept?(intendedDir==1?activeBottom-low:high-activeTop):0.0
             bool sweepOk=not swept or na(atr) or sweepBeyond<=maxSweepBeyondAtr*atr
-            string klass=justFlipped?"ZONE_FAILURE":hasCluster?(swept and sweepOk?"CLUSTER_SWEEP_RECLAIM":"CLUSTER_REJECTION"):ztyp=="IFVG"?"IFVG_RETEST":ztyp=="BREAKER"?"BREAKER_RETEST":ztyp=="OB"?(swept and sweepOk?"OB_SWEEP_RECLAIM":"OB_REJECTION"):(swept and sweepOk?"FVG_SWEEP_RECLAIM":"FVG_REJECTION")
+            string klass=hasCluster?(swept and sweepOk?"CLUSTER_SWEEP_RECLAIM":"CLUSTER_REJECTION"):ztyp=="IFVG"?"IFVG_RETEST":ztyp=="BREAKER"?"BREAKER_RETEST":ztyp=="OB"?(swept and sweepOk?"OB_SWEEP_RECLAIM":"OB_REJECTION"):(swept and sweepOk?"FVG_SWEEP_RECLAIM":"FVG_REJECTION")
             float absorption=intendedDir==1?bullAbsorption:bearAbsorption
             float erBoost=effortResultMode=="Off"?0.0:effortResultBoost*absorption/100.0
             float baseQ=hasCluster?clusterBaseQ:zscore
@@ -1542,6 +1547,9 @@ var string setupRegime="NONE"
 var string setupProvenance="NONE"
 var int setupBorn=na
 var int setupArmedBar=na
+var int setupReactionDeadline=na
+var bool setupTouchedWithWick=false
+var bool setupInitialCloseInside=false
 var float signalEntry=na
 var float signalStop=na
 var float signalTarget=na
@@ -1593,6 +1601,12 @@ if signalState=="IDLE" and not interactionCooldown and not na(interactionIdx)
     setupProvenance:=interactionProvenance
     setupBorn:=array.get(zBorn,interactionIdx)
     setupArmedBar:=bar_index
+    setupReactionDeadline:=bar_index+reactionConfirmBars-1
+    bool armCloseInside=close<=interactionTop and close>=interactionBottom
+    bool armWickEntered=low<=interactionTop and high>=interactionBottom
+    bool armClosedOutsideCorrect=interactionDir==1?close>interactionTop:interactionDir==-1?close<interactionBottom:false
+    setupTouchedWithWick:=armWickEntered and armClosedOutsideCorrect
+    setupInitialCloseInside:=armCloseInside
 
 int boundIdx=na
 int boundSecondIdx=na
@@ -1658,7 +1672,23 @@ float setupMid=(setupTop+setupBottom)*0.5
 bool signalDirectionalClose=setupDir==1?close>open and signalCloseLoc>=minSignalCloseLocation:setupDir==-1?close<open and signalCloseLoc<=1.0-minSignalCloseLocation:false
 bool signalMidClose=setupDir==1?close>=setupMid:setupDir==-1?close<=setupMid:false
 bool signalAnyClose=setupDir==1?close>=setupBottom:setupDir==-1?close<=setupTop:false
-bool normalCloseOk=confirmationMode=="Directional Close"?signalDirectionalClose:confirmationMode=="Close Back Through Midpoint"?signalMidClose:signalAnyClose
+bool baseNormalCloseOk=confirmationMode=="Directional Close"?signalDirectionalClose:confirmationMode=="Close Back Through Midpoint"?signalMidClose:signalAnyClose
+
+bool currentBarTouchesZone=low<=setupTop and high>=setupBottom
+bool currentCloseInsideZone=close<=setupTop and close>=setupBottom
+bool currentCloseOutsideCorrect=setupDir==1?close>setupTop:setupDir==-1?close<setupBottom:false
+bool currentWickRejection=countWickRejection and currentBarTouchesZone and currentCloseOutsideCorrect
+bool withinReactionWindow=not na(setupReactionDeadline) and bar_index<=setupReactionDeadline
+bool delayedReactionBar=not na(setupArmedBar) and bar_index>setupArmedBar
+bool delayedCloseOutOk=not delayedReactionRequireOutsideClose or currentCloseOutsideCorrect
+
+// Valid reaction timing:
+// 1) immediate confirmed rejection on interaction bar,
+// 2) wick enters zone and closes back outside,
+// 3) bar 2 or 3 closes back out after an initial inside-zone retest.
+bool immediateReactionOk=bar_index==setupArmedBar and allowSameBarConfirmation and (baseNormalCloseOk or currentWickRejection)
+bool delayedReactionOk=delayedReactionBar and withinReactionWindow and delayedCloseOutOk and baseNormalCloseOk
+bool normalCloseOk=immediateReactionOk or delayedReactionOk
 bool failureCloseOk=setupDir==1?close>setupTop:setupDir==-1?close<setupBottom:false
 
 bool signalParticipationOk=setupDir==1?p01>=minSignalParticipation:setupDir==-1?p01<=-minSignalParticipation:false
@@ -1746,7 +1776,7 @@ bool confirmArrivalOk=not institutionalReactionSetup or not confirmArrivalAggres
 bool institutionalRegimeConfirmOk=not institutionalReactionSetup or (not confirmAdxOpposing and not lateWeakRegime and confirmVolumeRecovery and confirmArrivalOk)
 bool genericCloseRequirement=institutionalReactionSetup?true:normalCloseOk
 bool standardConfirm=not isFailure and genericCloseRequirement and signalParticipationOk and signalContextOk and marketStateOk and effortConfirmOk and obSignalConfirmOk and breakerSignalConfirmOk and institutionalContextConfirmOk and institutionalRegimeConfirmOk
-bool sameBarOk=allowSameBarConfirmation or na(setupArmedBar) or bar_index>setupArmedBar
+bool sameBarOk=(bar_index==setupArmedBar?allowSameBarConfirmation:true) and withinReactionWindow
 float prospectiveBuffer=nz(atr,0.0)*stopBufferAtr
 float prospectiveStop=setupDir==1?setupBottom-prospectiveBuffer:setupDir==-1?setupTop+prospectiveBuffer:na
 float prospectiveRisk=not na(prospectiveStop)?math.abs(close-prospectiveStop):na
@@ -1830,6 +1860,8 @@ else if not institutionalContextConfirmOk
     liveVetoReason:="INST_CONTEXT"
 else if not institutionalRegimeConfirmOk
     liveVetoReason:="FLOW_ADX"
+else if not normalCloseOk and signalState=="ARMED"
+    liveVetoReason:=withinReactionWindow?"WAIT_RECLAIM":"REACTION_EXPIRED"
 else if not baseConfirmationOk
     liveVetoReason:="WAIT_CONFIRM"
 else if not finalSqOk
@@ -1838,7 +1870,7 @@ signalVetoReason:=liveVetoReason
 
 bool signalConfirmNow=signalState=="ARMED" and sameBarOk and barstate.isconfirmed and boundZoneValid and signalRiskOk and rewardSpaceOk and baseConfirmationOk and finalSqOk
 
-if signalState=="ARMED" and not na(setupArmedBar) and bar_index-setupArmedBar>armedExpiryBars
+if signalState=="ARMED" and ((not na(setupReactionDeadline) and bar_index>setupReactionDeadline) or (not na(setupArmedBar) and bar_index-setupArmedBar>armedExpiryBars))
     signalState:="EXPIRED"
 
 bool longConfirmed=false
@@ -1954,6 +1986,9 @@ if barstate.isconfirmed and (signalState=="INVALIDATED" or signalState=="EXPIRED
     setupProvenance:="NONE"
     setupBorn:=na
     setupArmedBar:=na
+    setupReactionDeadline:=na
+    setupTouchedWithWick:=false
+    setupInitialCloseInside:=false
     signalQReaction:=na
     signalQParticipation:=na
     signalQRegime:=na
