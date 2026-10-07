@@ -203,6 +203,15 @@ chopAdxThreshold = input.float(17.0, "Chop ADX Threshold", minval=5, maxval=40, 
 chopMaxConfluence = input.float(15.0, "Chop Maximum |Confluence|", minval=0, maxval=50, step=5, group=groupRegimeSignals)
 allowSweepInChop = input.bool(true, "Allow Sweep/Reclaim In Chop", group=groupRegimeSignals)
 
+groupLiquiditySignals = "Liquidity / Reward Space"
+useLiquiditySweepEvidence = input.bool(true, "Use Swing-Liquidity Sweep Evidence", group=groupLiquiditySignals)
+liquiditySweepBars = input.int(3, "Liquidity Sweep Lookback Bars", minval=1, maxval=10, group=groupLiquiditySignals)
+useOpposingInventorySpace = input.bool(true, "Use Opposing Inventory Reward-Space Filter", group=groupLiquiditySignals)
+useSwingLiquiditySpace = input.bool(true, "Use Swing Liquidity As Reward-Space Target", group=groupLiquiditySignals)
+minAvailableRewardR = input.float(1.25, "Minimum Available Reward Space (R)", minval=0.25, maxval=5.0, step=0.25, group=groupLiquiditySignals)
+rewardSpaceBufferAtr = input.float(0.05, "Opposing Inventory Buffer / ATR", minval=0.0, maxval=1.0, step=0.05, group=groupLiquiditySignals)
+liquiditySweepRegimeBonus = input.float(7.5, "Sweep Evidence Setup Bonus", minval=0, maxval=25, step=2.5, group=groupLiquiditySignals)
+
 groupObSignals = "Order Block / Breaker Signal Quality"
 obMinOriginQuality = input.float(40.0, "OB Minimum Origin Quality Floor", minval=0, maxval=100, step=5, group=groupObSignals)
 obPreferredOriginQuality = input.float(65.0, "OB Preferred Origin Quality", minval=0, maxval=100, step=5, group=groupObSignals)
@@ -1478,6 +1487,7 @@ var float signalQZone=na
 var float signalQContext=na
 var float signalQConfidence=na
 var float signalQAbsorption=na
+var float signalAvailableRewardR=na
 
 bool longCooldown=not na(lastLongSignalBar) and bar_index-lastLongSignalBar<=signalCooldownBars
 bool shortCooldown=not na(lastShortSignalBar) and bar_index-lastShortSignalBar<=signalCooldownBars
@@ -1592,13 +1602,17 @@ bool flipEvidence=setupClass=="ZONE_FAILURE" or setupClass=="BREAKER_RETEST" or 
 bool reversalReactionEvidence=setupClass=="OB_SWEEP_RECLAIM" or setupClass=="CLUSTER_SWEEP_RECLAIM" or flipEvidence
 bool divergenceReversalEvidence=nz(setupAlignedDiv,0.0)>=reversalMinDivergence
 bool trendDeteriorationEvidence=adxFalling or nz(setupOpposingDi,0.0)>nz(setupAlignedDi,0.0) or not setupAdxAligned
+bool bullishLiquiditySweep=useLiquiditySweepEvidence and setupDir==1 and not na(prevPL) and ta.lowest(low,liquiditySweepBars)<prevPL and close>prevPL
+bool bearishLiquiditySweep=useLiquiditySweepEvidence and setupDir==-1 and not na(prevPH) and ta.highest(high,liquiditySweepBars)>prevPH and close<prevPH
+bool alignedLiquiditySweep=bullishLiquiditySweep or bearishLiquiditySweep
 float regimeAbsorption=math.max(nz(setupAbsorption,0.0),setupDir==1?bullAbsorption:setupDir==-1?bearAbsorption:0.0)
-bool reversalEvidence=setupOpposesTrend and (not reversalRequireInstitutionalZone or institutionalReversalSource) and nz(setupArmQuality,0.0)>=reversalMinSetupQuality and (reversalReactionEvidence or (extremeReversalLocation and divergenceReversalEvidence) or (divergenceReversalEvidence and trendDeteriorationEvidence))
+float regimeQualityWithSweep=f_clamp(nz(setupArmQuality,0.0)+(alignedLiquiditySweep?liquiditySweepRegimeBonus:0.0),0.0,100.0)
+bool reversalEvidence=setupOpposesTrend and (not reversalRequireInstitutionalZone or institutionalReversalSource) and regimeQualityWithSweep>=reversalMinSetupQuality and (reversalReactionEvidence or alignedLiquiditySweep or (extremeReversalLocation and divergenceReversalEvidence) or (divergenceReversalEvidence and trendDeteriorationEvidence))
 string liveRegime=reversalEvidence?"REVERSAL":setupOpposesTrend?"COUNTERTREND":"TREND"
 setupRegime:=liveRegime
 
 bool trendRegimeOk=liveRegime!="TREND" or (enableTrendSignals and directionalContextAligned and baseContextQualityOk)
-bool countertrendEvidence=nz(setupArmQuality,0.0)>=countertrendMinSetupQuality and regimeAbsorption>=countertrendMinAbsorption and (extremeReversalLocation or nz(setupAlignedDiv,0.0)>0.0 or setupIsCluster or setupClass=="OB_SWEEP_RECLAIM")
+bool countertrendEvidence=regimeQualityWithSweep>=countertrendMinSetupQuality and regimeAbsorption>=countertrendMinAbsorption and (extremeReversalLocation or nz(setupAlignedDiv,0.0)>0.0 or alignedLiquiditySweep or setupIsCluster or setupClass=="OB_SWEEP_RECLAIM")
 bool countertrendRegimeOk=liveRegime!="COUNTERTREND" or (enableCountertrendSignals and baseContextQualityOk and countertrendEvidence)
 bool reversalRegimeOk=liveRegime!="REVERSAL" or (enableReversalSignals and baseContextQualityOk and reversalEvidence)
 bool signalContextOk=trendRegimeOk and countertrendRegimeOk and reversalRegimeOk and signalSessionOk
@@ -1653,8 +1667,39 @@ bool sameBarOk=allowSameBarConfirmation or na(setupArmedBar) or bar_index>setupA
 float prospectiveBuffer=nz(atr,0.0)*stopBufferAtr
 float prospectiveStop=setupDir==1?setupBottom-prospectiveBuffer:setupDir==-1?setupTop+prospectiveBuffer:na
 float prospectiveRisk=not na(prospectiveStop)?math.abs(close-prospectiveStop):na
+
+float nearestOpposingInventory=na
+if useOpposingInventorySpace and array.size(zDir)>0 and setupDir!=0
+    for oi=0 to array.size(zDir)-1
+        int odir=array.get(zDir,oi)
+        string ost=array.get(zState,oi)
+        bool olive=ost=="FRESH" or ost=="RETESTED" or ost=="PARTIAL" or ost=="TERMINAL_FILL" or ost=="JUST_FLIPPED"
+        if olive and odir==-setupDir
+            float obstacle=setupDir==1?array.get(zBottom,oi):array.get(zTop,oi)
+            bool ahead=setupDir==1?obstacle>close:obstacle<close
+            if ahead
+                if na(nearestOpposingInventory) or (setupDir==1?obstacle<nearestOpposingInventory:obstacle>nearestOpposingInventory)
+                    nearestOpposingInventory:=obstacle
+
+float swingLiquidityTarget=na
+if useSwingLiquiditySpace and setupDir==1 and not na(prevPH) and prevPH>close
+    swingLiquidityTarget:=prevPH
+else if useSwingLiquiditySpace and setupDir==-1 and not na(prevPL) and prevPL<close
+    swingLiquidityTarget:=prevPL
+
+float bufferedOpposingTarget=na(nearestOpposingInventory)?na:(setupDir==1?nearestOpposingInventory-nz(atr,0.0)*rewardSpaceBufferAtr:nearestOpposingInventory+nz(atr,0.0)*rewardSpaceBufferAtr)
+float nearestRewardTarget=na
+if not na(bufferedOpposingTarget)
+    nearestRewardTarget:=bufferedOpposingTarget
+if not na(swingLiquidityTarget)
+    if na(nearestRewardTarget) or (setupDir==1?swingLiquidityTarget<nearestRewardTarget:swingLiquidityTarget>nearestRewardTarget)
+        nearestRewardTarget:=swingLiquidityTarget
+
+float availableRewardDistance=not na(nearestRewardTarget)?math.abs(nearestRewardTarget-close):na
+float availableRewardR=not na(prospectiveRisk) and prospectiveRisk>0 and not na(availableRewardDistance)?availableRewardDistance/prospectiveRisk:na
+bool rewardSpaceOk=na(nearestRewardTarget) or na(availableRewardR) or availableRewardR>=minAvailableRewardR
 bool signalRiskOk=not na(prospectiveRisk) and prospectiveRisk>=syminfo.mintick
-bool signalConfirmNow=signalState=="ARMED" and sameBarOk and barstate.isconfirmed and boundZoneValid and signalRiskOk and (failureConfirm or standardConfirm)
+bool signalConfirmNow=signalState=="ARMED" and sameBarOk and barstate.isconfirmed and boundZoneValid and signalRiskOk and rewardSpaceOk and (failureConfirm or standardConfirm)
 
 if signalState=="ARMED" and not na(setupArmedBar) and bar_index-setupArmedBar>armedExpiryBars
     signalState:="EXPIRED"
@@ -1668,6 +1713,7 @@ if signalConfirmNow
     signalQConfidence:=f_clamp(nz(confidence,0.0),0.0,100.0)
     signalQAbsorption:=f_clamp(nz(liveAbsorption,setupAbsorption),0.0,100.0)
     signalQuality:=f_clamp(signalQZone*0.45+signalQContext*0.25+signalQConfidence*0.15+signalQAbsorption*0.15,0.0,100.0)
+    signalAvailableRewardR:=availableRewardR
     signalEntry:=close
     signalStop:=prospectiveStop
     float sigRisk=prospectiveRisk
@@ -1695,7 +1741,8 @@ if longConfirmed or shortConfirmed
     string sideText=longConfirmed?"LONG":"SHORT"
     string zoneText=setupProvenance!="NONE"?setupProvenance:(setupDir==1?"BULL ":"BEAR ")+setupType+" #"+str.tostring(setupZoneId)
     string regimeText=(setupType=="OB" or setupType=="BREAKER")?" · V "+str.tostring(rvolNow,"0.00")+" · ADX "+str.tostring(nz(adxValue,0.0),"0.0"):""
-    string sigText=signalDisplay=="Minimal"?sideText:signalDisplay=="Compact"?setupRegime+" "+sideText+" · "+zoneText:"PLUTUS "+setupRegime+" "+sideText+" · "+setupClass+" · "+zoneText+" · ER "+str.tostring(nz(signalQAbsorption,0.0),"0.0")+regimeText+" · SQ "+str.tostring(nz(signalQuality,0.0),"0.0")
+    string spaceText=not na(signalAvailableRewardR)?" · SPACE "+str.tostring(signalAvailableRewardR,"0.0")+"R":""
+    string sigText=signalDisplay=="Minimal"?sideText:signalDisplay=="Compact"?setupRegime+" "+sideText+" · "+zoneText:"PLUTUS "+setupRegime+" "+sideText+" · "+setupClass+" · "+zoneText+" · ER "+str.tostring(nz(signalQAbsorption,0.0),"0.0")+regimeText+spaceText+" · SQ "+str.tostring(nz(signalQuality,0.0),"0.0")
     label slb=label.new(bar_index,close,sigText,xloc=xloc.bar_index,style=longConfirmed?label.style_label_up:label.style_label_down,textcolor=color.white,color=color.new(sigColor,15),size=signalDisplay=="Detailed"?size.small:size.tiny)
     array.push(signalLabels,slb)
     while array.size(signalLabels)>maxSignalPreviews
@@ -1809,8 +1856,9 @@ if barstate.islast
         table.cell(signalAudit,1,5,str.tostring(nz(signalQZone,setupArmQuality),"0")+" / "+str.tostring(nz(signalQContext,0.0),"0")+" / "+str.tostring(nz(signalQConfidence,0.0),"0")+" / "+str.tostring(nz(signalQAbsorption,liveAbsorption),"0")+" / "+str.tostring(nz(signalQuality,0.0),"0.0"),text_color=color.white)
         table.cell(signalAudit,0,6,"Context",text_color=color.silver)
         table.cell(signalAudit,1,6,str.tostring(confluenceScore,"#.0")+" · "+str.tostring(confidence,"#.0")+"%",text_color=confluenceScore>0?cBull:confluenceScore<0?cBear:color.white)
-        table.cell(signalAudit,0,7,"Risk guard",text_color=color.silver)
-        table.cell(signalAudit,1,7,signalRiskOk?"PASS":"BLOCK",text_color=signalRiskOk?cBull:cBear)
+        table.cell(signalAudit,0,7,"Risk / space",text_color=color.silver)
+        string spaceAudit=(signalRiskOk?"RISK PASS":"RISK BLOCK")+" · "+(rewardSpaceOk?"SPACE PASS":"SPACE BLOCK")+(not na(availableRewardR)?" "+str.tostring(availableRewardR,"0.0")+"R":"")
+        table.cell(signalAudit,1,7,spaceAudit,text_color=signalRiskOk and rewardSpaceOk?cBull:cBear)
         table.cell(signalAudit,0,8,"OB / BB context",text_color=color.silver)
         string instGate=isStandaloneObSetup?(obSignalConfirmOk and institutionalContextConfirmOk?"OB PASS":"OB BLOCK")+" · R"+str.tostring(liveObRetests)+" M"+str.tostring(liveObMitigation,"0"):isStandaloneBreakerSetup?(breakerSignalConfirmOk and institutionalContextConfirmOk?"BB PASS":"BB BLOCK")+" · R"+str.tostring(liveBreakerRetests)+" M"+str.tostring(liveBreakerMitigation,"0"):"N/A"
         string ctxTail=(isStandaloneObSetup or isStandaloneBreakerSetup)?" · L"+str.tostring(nz(setupRangeLocation,50.0),"0")+" E"+str.tostring(nz(setupExpansionAtr,0.0),"0.0")+" D+"+str.tostring(nz(setupAlignedDiv,0.0),"0")+" D-"+str.tostring(nz(setupOpposingDiv,0.0),"0")+" V"+str.tostring(rvolNow,"0.00")+" A"+str.tostring(nz(adxValue,0.0),"0")+" DI"+str.tostring(confirmAlignedDi,"0")+"/"+str.tostring(confirmOpposingDi,"0"):""
