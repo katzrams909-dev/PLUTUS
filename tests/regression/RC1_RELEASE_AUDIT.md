@@ -1,7 +1,7 @@
 # PLUTUS RC1 — Final Regression & Release Audit
 
 Baseline under test: `pine/release/PLUTUS_RC1.pine`
-Baseline commit: `ba37382917aaa5d43ed2a53151496c6131f0c468`
+Baseline commit: `ed840b27a02ff7e4a15351ef7aa5d2cf78368568`
 
 ## Release policy
 
@@ -424,7 +424,7 @@ PLUTUS v1.0 may be tagged only when:
 - [ ] final RC commit SHA is recorded.
 - [ ] RC is frozen and tagged as v1.0.
 
-Current status: **RC1 COMPILE-PASS / REGRESSION PENDING**.
+Current status: **RC1 P10.4 COMPILE-PASS / REGRESSION PENDING**.
 
 
 ---
@@ -491,3 +491,10 @@ Baseline reaction-state commits:
 - [ ] Prior GBPUSD blue-box false long remains absent after the reaction-state change.
 
 Any same-flip-bar IFVG/Breaker signal or back-plotted delayed entry is a P0 release blocker.
+
+
+### P10.4 compile checkpoint
+- [x] User compile confirmation for P10.4 RC1 `ed840b27a02ff7e4a15351ef7aa5d2cf78368568`.
+- [ ] Recheck named multi-bar/wick regression cases on chart.
+- [ ] Confirm no same-flip-bar IFVG/Breaker signals.
+- [ ] Confirm prior GBPUSD false-long regression remains closed.
