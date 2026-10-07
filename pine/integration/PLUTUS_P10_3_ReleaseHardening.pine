@@ -185,6 +185,14 @@ breakerMaxMitigationPct = input.float(85.0, "Maximum Breaker Mitigation For Entr
 breakerMinReactionScore = input.float(47.5, "Minimum Breaker Reaction Score", minval=0, maxval=100, step=2.5, group=groupObSignals)
 breakerQualityRelief = input.float(20.0, "Breaker Zone-Quality Threshold Relief", minval=0, maxval=40, step=2.5, group=groupObSignals)
 obQualityRelief = input.float(12.5, "OB Zone-Quality Threshold Relief", minval=0, maxval=30, step=2.5, group=groupObSignals)
+useInstitutionalLocationFilter = input.bool(true, "Use OB / Breaker Dealing-Range Filter", group=groupObSignals)
+locationPremiumPct = input.float(65.0, "Bullish Premium Veto Above %", minval=50, maxval=90, step=2.5, group=groupObSignals)
+locationDiscountPct = input.float(35.0, "Bearish Discount Veto Below %", minval=10, maxval=50, step=2.5, group=groupObSignals)
+maxExpansionFromZoneAtr = input.float(3.0, "Maximum Expansion From Zone / ATR", minval=0.5, maxval=10, step=0.25, group=groupObSignals)
+maxOpposingContextForInstitutional = input.float(45.0, "Maximum Opposing P10 Context", minval=0, maxval=100, step=5, group=groupObSignals)
+alignedDivergenceBonus = input.float(15.0, "Aligned Divergence Reaction Bonus", minval=0, maxval=30, step=2.5, group=groupObSignals)
+opposingDivergencePenalty = input.float(20.0, "Opposing Divergence Penalty", minval=0, maxval=40, step=2.5, group=groupObSignals)
+divergenceVetoThreshold = input.float(55.0, "Opposing Divergence Veto Strength", minval=0, maxval=100, step=5, group=groupObSignals)
 
 groupCluster = "Institutional Cluster / Unicorn"
 enableInstitutionalClusters = input.bool(true, "Enable Breaker + FVG-Family Clusters", group=groupCluster)
@@ -1232,6 +1240,12 @@ float interactionBottom=na
 float interactionAbsorption=0.0
 string interactionProvenance="NONE"
 
+float fallbackRangeHigh=ta.highest(high,math.max(structureLookback*2,10))
+float fallbackRangeLow=ta.lowest(low,math.max(structureLookback*2,10))
+float institutionalRangeHigh=not na(prevPH) and not na(prevPL) and prevPH>prevPL?prevPH:fallbackRangeHigh
+float institutionalRangeLow=not na(prevPH) and not na(prevPL) and prevPH>prevPL?prevPL:fallbackRangeLow
+float institutionalRangeWidth=math.max(institutionalRangeHigh-institutionalRangeLow,syminfo.mintick)
+
 int signalZoneCount=array.size(zDir)
 if enableSignals and signalZoneCount>0
     for i=0 to signalZoneCount-1
@@ -1256,6 +1270,19 @@ if enableSignals and signalZoneCount>0
         float opposingArrival=(standaloneOb or standaloneBreaker)?(zdir==1?math.max(-p01,0.0):math.max(p01,0.0)):0.0
         bool obInventoryOk=not standaloneOb or (obOriginQ>=obMinOriginQuality and zoneRetestCount<=obMaxRetests and zoneMitigation<=obMaxMitigationPct and opposingArrival<=obMaxOpposingArrival)
         bool breakerInventoryOk=not standaloneBreaker or (zoneRetestCount<=breakerMaxRetests and zoneMitigation<=breakerMaxMitigationPct)
+        bool institutionalCandidate=standaloneOb or standaloneBreaker
+        float zoneMid=(ztop+zbot)*0.5
+        float rangeLocation=f_clamp((zoneMid-institutionalRangeLow)/institutionalRangeWidth*100.0,0.0,100.0)
+        bool poorLocation=institutionalCandidate and useInstitutionalLocationFilter and (zdir==1?rangeLocation>=locationPremiumPct:rangeLocation<=locationDiscountPct)
+        float expansionAtr=institutionalCandidate and not na(atr) and atr>0?math.abs(close-zoneMid)/atr:0.0
+        bool expansionExhausted=institutionalCandidate and expansionAtr>maxExpansionFromZoneAtr
+        float opposingContext=institutionalCandidate?(zdir==1?math.max(-confluenceScore,0.0):math.max(confluenceScore,0.0)):0.0
+        bool contextVeto=institutionalCandidate and opposingContext>maxOpposingContextForInstitutional
+        float alignedDivStrength=institutionalCandidate?(zdir==1?math.max(p06,0.0):math.max(-p06,0.0)):0.0
+        float opposingDivStrength=institutionalCandidate?(zdir==1?math.max(-p06,0.0):math.max(p06,0.0)):0.0
+        bool alignedDiv=alignedDivStrength>0.0
+        bool opposingDivVeto=opposingDivStrength>=divergenceVetoThreshold
+        bool institutionalContextOk=not institutionalCandidate or (not contextVeto and not opposingDivVeto and not (poorLocation and expansionExhausted))
         int clusterMate=na
         float clusterTop=na
         float clusterBottom=na
@@ -1295,7 +1322,7 @@ if enableSignals and signalZoneCount>0
         bool touchOk=hasCluster and clusterRequireIntersectionTouch?clusterTouch:normalTouch
         touchOk:=justFlipped?true:touchOk
 
-        if typeOk and obInventoryOk and breakerInventoryOk and not sameZoneTooSoon and touchOk
+        if typeOk and obInventoryOk and breakerInventoryOk and institutionalContextOk and not sameZoneTooSoon and touchOk
             float zwidth=math.max(activeTop-activeBottom,syminfo.mintick)
             float depth=intendedDir==1?f_clamp((activeTop-low)/zwidth,0.0,2.0):f_clamp((high-activeBottom)/zwidth,0.0,2.0)
             bool swept=not justFlipped and (intendedDir==1?low<activeBottom:high>activeTop)
@@ -1311,14 +1338,19 @@ if enableSignals and signalZoneCount>0
             float directionBodyQuality=(intendedDir==1 and close>open) or (intendedDir==-1 and close<open)?bodyEff*100.0:0.0
             float mitigationQuality=(standaloneOb or standaloneBreaker)?100.0-f_clamp(zoneMitigation,0.0,100.0):50.0
             float reactionScore=f_clamp(absorption*0.35+directionalCloseQuality*0.30+directionBodyQuality*0.20+mitigationQuality*0.15,0.0,100.0)
-            float q=f_clamp(baseQ*0.60+reactionScore*0.25+f_clamp(depth*50.0,0.0,100.0)*0.05+erBoost+touchAdj,0.0,100.0)
+            float divReactionAdj=institutionalCandidate?(alignedDivergenceBonus*alignedDivStrength/100.0-opposingDivergencePenalty*opposingDivStrength/100.0):0.0
+            float locationAdj=institutionalCandidate?(zdir==1?(50.0-rangeLocation)*0.10:(rangeLocation-50.0)*0.10):0.0
+            float exhaustionPenalty=institutionalCandidate and expansionExhausted?10.0:0.0
+            float q=f_clamp(baseQ*0.60+reactionScore*0.25+f_clamp(depth*50.0,0.0,100.0)*0.05+erBoost+touchAdj+divReactionAdj+locationAdj-exhaustionPenalty,0.0,100.0)
             float effectiveThreshold=standaloneBreaker?math.max(25.0,minSignalZoneQuality-breakerQualityRelief):standaloneOb?math.max(30.0,minSignalZoneQuality-obQualityRelief):minSignalZoneQuality
             bool originPreferred=not standaloneOb or obOriginQ>=obPreferredOriginQuality
             bool reactionPass=standaloneBreaker?reactionScore>=breakerMinReactionScore:standaloneOb?(reactionScore>=obMinReactionScore or (originPreferred and reactionScore>=obMinReactionScore-10.0)):true
             bool effortPass=effortResultMode!="Require" or absorption>=minAbsorptionScore
             float typePriority=hasCluster?18.0:standaloneBreaker?14.0:standaloneOb?10.0:ztyp=="IFVG"?6.0:0.0
             float directionPriority=((intendedDir==1 and close>=open) or (intendedDir==-1 and close<=open))?8.0:-4.0
-            float candidateRank=q+reactionScore*0.35+typePriority+directionPriority
+            float divergencePriority=institutionalCandidate?(alignedDivStrength*0.20-opposingDivStrength*0.25):0.0
+            float locationPriority=institutionalCandidate?(poorLocation?-8.0:4.0):0.0
+            float candidateRank=q+reactionScore*0.35+typePriority+directionPriority+divergencePriority+locationPriority
             if effortPass and reactionPass and q>=effectiveThreshold and candidateRank>interactionRank
                 interactionIdx:=i
                 interactionSecondIdx:=clusterMate
@@ -1331,7 +1363,7 @@ if enableSignals and signalZoneCount>0
                 interactionTop:=activeTop
                 interactionBottom:=activeBottom
                 interactionAbsorption:=absorption
-                interactionProvenance:=hasCluster?clusterProv:(zdir==1?"BULL ":"BEAR ")+ztyp+" #"+str.tostring(zid)
+                interactionProvenance:=hasCluster?clusterProv:(zdir==1?"BULL ":"BEAR ")+ztyp+" #"+str.tostring(zid)+(institutionalCandidate and alignedDiv?" + DIV":"")
 
 var string signalState="IDLE"
 var int setupDir=0
@@ -1346,6 +1378,10 @@ var float setupZoneScore=na
 var float setupArmQuality=na
 var bool setupIsCluster=false
 var float setupAbsorption=0.0
+var float setupRangeLocation=na
+var float setupExpansionAtr=na
+var float setupAlignedDiv=0.0
+var float setupOpposingDiv=0.0
 var string setupProvenance="NONE"
 var int setupBorn=na
 var int setupArmedBar=na
@@ -1376,6 +1412,10 @@ if signalState=="IDLE" and not interactionCooldown and not na(interactionIdx)
     setupArmQuality:=interactionQuality
     setupIsCluster:=interactionIsCluster
     setupAbsorption:=interactionAbsorption
+    setupRangeLocation:=not na(interactionIdx)?f_clamp((((array.get(zTop,interactionIdx)+array.get(zBottom,interactionIdx))*0.5)-institutionalRangeLow)/institutionalRangeWidth*100.0,0.0,100.0):na
+    setupExpansionAtr:=not na(interactionIdx) and not na(atr) and atr>0?math.abs(close-(array.get(zTop,interactionIdx)+array.get(zBottom,interactionIdx))*0.5)/atr:na
+    setupAlignedDiv:=interactionDir==1?math.max(p06,0.0):interactionDir==-1?math.max(-p06,0.0):0.0
+    setupOpposingDiv:=interactionDir==1?math.max(-p06,0.0):interactionDir==-1?math.max(p06,0.0):0.0
     setupProvenance:=interactionProvenance
     setupBorn:=array.get(zBorn,interactionIdx)
     setupArmedBar:=bar_index
@@ -1480,8 +1520,11 @@ bool breakerLiveInventoryOk=not isStandaloneBreakerSetup or (liveBreakerRetests<
 bool breakerReactionOk=not isStandaloneBreakerSetup or (confirmReactionScore>=breakerMinReactionScore and ((setupDir==1 and close>open) or (setupDir==-1 and close<open)))
 bool breakerSignalConfirmOk=breakerLiveInventoryOk and breakerReactionOk
 bool institutionalReactionSetup=isStandaloneObSetup or isStandaloneBreakerSetup
+float liveOpposingContext=institutionalReactionSetup?(setupDir==1?math.max(-confluenceScore,0.0):math.max(confluenceScore,0.0)):0.0
+float liveOpposingDiv=institutionalReactionSetup?(setupDir==1?math.max(-p06,0.0):math.max(p06,0.0)):0.0
+bool institutionalContextConfirmOk=not institutionalReactionSetup or (liveOpposingContext<=maxOpposingContextForInstitutional and liveOpposingDiv<divergenceVetoThreshold and not ((setupDir==1 and nz(setupRangeLocation,50.0)>=locationPremiumPct) or (setupDir==-1 and nz(setupRangeLocation,50.0)<=locationDiscountPct)) or nz(setupExpansionAtr,0.0)<=maxExpansionFromZoneAtr)
 bool genericCloseRequirement=institutionalReactionSetup?true:normalCloseOk
-bool standardConfirm=not isFailure and genericCloseRequirement and signalParticipationOk and signalContextOk and effortConfirmOk and obSignalConfirmOk and breakerSignalConfirmOk
+bool standardConfirm=not isFailure and genericCloseRequirement and signalParticipationOk and signalContextOk and effortConfirmOk and obSignalConfirmOk and breakerSignalConfirmOk and institutionalContextConfirmOk
 bool sameBarOk=allowSameBarConfirmation or na(setupArmedBar) or bar_index>setupArmedBar
 float prospectiveBuffer=nz(atr,0.0)*stopBufferAtr
 float prospectiveStop=setupDir==1?setupBottom-prospectiveBuffer:setupDir==-1?setupTop+prospectiveBuffer:na
@@ -1526,7 +1569,7 @@ var array<label> signalPriceLabels=array.new_label()
 if longConfirmed or shortConfirmed
     color sigColor=longConfirmed?cBull:cBear
     string sideText=longConfirmed?"LONG":"SHORT"
-    string zoneText=setupIsCluster?setupProvenance:(setupDir==1?"BULL ":"BEAR ")+setupType+" #"+str.tostring(setupZoneId)
+    string zoneText=setupProvenance!="NONE"?setupProvenance:(setupDir==1?"BULL ":"BEAR ")+setupType+" #"+str.tostring(setupZoneId)
     string sigText=signalDisplay=="Minimal"?sideText:signalDisplay=="Compact"?sideText+" · "+zoneText:"PLUTUS "+sideText+" · "+setupClass+" · "+zoneText+" · ER "+str.tostring(nz(signalQAbsorption,0.0),"0.0")+" · SQ "+str.tostring(nz(signalQuality,0.0),"0.0")
     label slb=label.new(bar_index,close,sigText,xloc=xloc.bar_index,style=longConfirmed?label.style_label_up:label.style_label_down,textcolor=color.white,color=color.new(sigColor,15),size=signalDisplay=="Detailed"?size.small:size.tiny)
     array.push(signalLabels,slb)
@@ -1579,6 +1622,10 @@ if barstate.isconfirmed and (signalState=="INVALIDATED" or signalState=="EXPIRED
     setupArmQuality:=na
     setupIsCluster:=false
     setupAbsorption:=0.0
+    setupRangeLocation:=na
+    setupExpansionAtr:=na
+    setupAlignedDiv:=0.0
+    setupOpposingDiv:=0.0
     setupProvenance:="NONE"
     setupBorn:=na
     setupArmedBar:=na
@@ -1624,9 +1671,10 @@ if barstate.islast
         table.cell(signalAudit,1,6,str.tostring(confluenceScore,"#.0")+" · "+str.tostring(confidence,"#.0")+"%",text_color=confluenceScore>0?cBull:confluenceScore<0?cBear:color.white)
         table.cell(signalAudit,0,7,"Risk guard",text_color=color.silver)
         table.cell(signalAudit,1,7,signalRiskOk?"PASS":"BLOCK",text_color=signalRiskOk?cBull:cBear)
-        table.cell(signalAudit,0,8,"OB / BB gate",text_color=color.silver)
-        string instGate=isStandaloneObSetup?(obSignalConfirmOk?"OB PASS":"OB BLOCK")+" · R"+str.tostring(liveObRetests)+" · M"+str.tostring(liveObMitigation,"0")+" · A"+str.tostring(liveObOpposingArrival,"0"):isStandaloneBreakerSetup?(breakerSignalConfirmOk?"BB PASS":"BB BLOCK")+" · R"+str.tostring(liveBreakerRetests)+" · M"+str.tostring(liveBreakerMitigation,"0"):"N/A"
-        table.cell(signalAudit,1,8,instGate,text_color=(isStandaloneObSetup or isStandaloneBreakerSetup)?((obSignalConfirmOk and isStandaloneObSetup) or (breakerSignalConfirmOk and isStandaloneBreakerSetup)?cBull:cBear):color.gray)
+        table.cell(signalAudit,0,8,"OB / BB context",text_color=color.silver)
+        string instGate=isStandaloneObSetup?(obSignalConfirmOk and institutionalContextConfirmOk?"OB PASS":"OB BLOCK")+" · R"+str.tostring(liveObRetests)+" M"+str.tostring(liveObMitigation,"0"):isStandaloneBreakerSetup?(breakerSignalConfirmOk and institutionalContextConfirmOk?"BB PASS":"BB BLOCK")+" · R"+str.tostring(liveBreakerRetests)+" M"+str.tostring(liveBreakerMitigation,"0"):"N/A"
+        string ctxTail=(isStandaloneObSetup or isStandaloneBreakerSetup)?" · L"+str.tostring(nz(setupRangeLocation,50.0),"0")+" E"+str.tostring(nz(setupExpansionAtr,0.0),"0.0")+" D+"+str.tostring(nz(setupAlignedDiv,0.0),"0")+" D-"+str.tostring(nz(setupOpposingDiv,0.0),"0"):""
+        table.cell(signalAudit,1,8,instGate+ctxTail,text_color=(isStandaloneObSetup or isStandaloneBreakerSetup)?(((obSignalConfirmOk and isStandaloneObSetup) or (breakerSignalConfirmOk and isStandaloneBreakerSetup)) and institutionalContextConfirmOk?cBull:cBear):color.gray)
         table.cell(signalAudit,0,9,"Last confirmed",text_color=color.silver)
         table.cell(signalAudit,1,9,lastSignalAudit,text_color=color.white)
 
