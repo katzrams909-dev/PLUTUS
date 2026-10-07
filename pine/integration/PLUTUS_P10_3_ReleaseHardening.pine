@@ -183,6 +183,22 @@ chopAdxThreshold = input.float(17.0, "Chop ADX Threshold", minval=5, maxval=40, 
 chopMaxConfluence = input.float(15.0, "Chop Maximum |Confluence|", minval=0, maxval=50, step=5, group=groupRegimeSignals)
 allowSweepInChop = input.bool(true, "Allow Sweep/Reclaim In Chop", group=groupRegimeSignals)
 
+groupMarketState = "Participation / Market State"
+arrivalWindowBars = input.int(4, "Arrival Participation Window", minval=2, maxval=20, group=groupMarketState)
+reactionWindowBars = input.int(2, "Reaction Participation Window", minval=1, maxval=10, group=groupMarketState)
+maxOpposingArrivalPressure = input.float(62.5, "Maximum Unabsorbed Opposing Arrival", minval=0, maxval=100, step=2.5, group=groupMarketState)
+minReactionVsArrivalRatio = input.float(0.70, "Minimum Reaction / Arrival Ratio", minval=0.10, maxval=3.0, step=0.05, group=groupMarketState)
+arrivalAbsorptionThreshold = input.float(55.0, "Absorption Override Score", minval=0, maxval=100, step=5, group=groupMarketState)
+strongArrivalPenalty = input.float(10.0, "Unabsorbed Arrival Penalty", minval=0, maxval=30, step=2.5, group=groupMarketState)
+reactionDominanceBonus = input.float(7.5, "Reaction Dominance Bonus", minval=0, maxval=25, step=2.5, group=groupMarketState)
+chopOverlapThreshold = input.float(0.55, "Chop Bar-Overlap Threshold", minval=0.10, maxval=0.95, step=0.05, group=groupMarketState)
+chopOverlapLookback = input.int(5, "Chop Overlap Lookback", minval=2, maxval=20, group=groupMarketState)
+volatilityLookback = input.int(30, "ATR Regime Lookback", minval=10, maxval=200, group=groupMarketState)
+highVolatilityRatio = input.float(1.75, "High Volatility ATR Ratio", minval=1.10, maxval=5.0, step=0.05, group=groupMarketState)
+lowVolatilityRatio = input.float(0.60, "Low Volatility ATR Ratio", minval=0.10, maxval=1.0, step=0.05, group=groupMarketState)
+extremeVolMinReactionQuality = input.float(65.0, "Extreme Volatility Minimum Reaction Quality", minval=0, maxval=100, step=2.5, group=groupMarketState)
+allowReversalInExtremeVol = input.bool(true, "Allow Qualified Reversals In Extreme Volatility", group=groupMarketState)
+
 groupLiquiditySignals = "Liquidity / Reward Space"
 useLiquiditySweepEvidence = input.bool(true, "Use Swing-Liquidity Sweep Evidence", group=groupLiquiditySignals)
 liquiditySweepBars = input.int(3, "Liquidity Sweep Lookback Bars", minval=1, maxval=10, group=groupLiquiditySignals)
@@ -1240,6 +1256,27 @@ float rvolPrev=nz(rvol[1],rvolNow)
 bool volumeExpanding=rvolNow>rvolPrev
 float directionalParticipation=barDir==1?math.max(p01,0.0):barDir==-1?math.max(-p01,0.0):0.0
 
+// Arrival vs reaction participation. Arrival uses completed bars before the interaction;
+// reaction includes the current bar and therefore measures whether price is actually
+// responding to the zone rather than merely arriving with high volume.
+float bullParticipationSeries=math.max(p01,0.0)
+float bearParticipationSeries=math.max(-p01,0.0)
+float bullArrivalPressure=nz(ta.sma(bullParticipationSeries,arrivalWindowBars)[1],0.0)
+float bearArrivalPressure=nz(ta.sma(bearParticipationSeries,arrivalWindowBars)[1],0.0)
+float bullReactionPressure=nz(ta.sma(bullParticipationSeries,reactionWindowBars),0.0)
+float bearReactionPressure=nz(ta.sma(bearParticipationSeries,reactionWindowBars),0.0)
+float reactionRvol=nz(ta.sma(rvolNow,reactionWindowBars),rvolNow)
+
+// Market-state metrics: overlap + ATR regime.
+float priorOverlapRange=math.max(math.min(high,high[1])-math.max(low,low[1]),0.0)
+float overlapDenom=math.max(math.min(high-low,high[1]-low[1]),syminfo.mintick)
+float barOverlapRatio=f_clamp(priorOverlapRange/overlapDenom,0.0,1.0)
+float avgBarOverlap=nz(ta.sma(barOverlapRatio,chopOverlapLookback),0.0)
+float atrRegimeBase=ta.sma(atr,volatilityLookback)
+float atrRegimeRatio=not na(atr) and not na(atrRegimeBase) and atrRegimeBase>0?atr/atrRegimeBase:1.0
+bool highVolatilityRegime=atrRegimeRatio>=highVolatilityRatio
+bool lowVolatilityRegime=atrRegimeRatio<=lowVolatilityRatio
+
 //------------------------------------------------------------------------------
 // P10.3 interaction-first signal engine — clusters + effort/result
 //------------------------------------------------------------------------------
@@ -1344,6 +1381,16 @@ if enableSignals and signalZoneCount>0
         bool reactionVolumeStrong=institutionalCandidate and useInstitutionalVolumeFilter and rvolNow>=strongReactionRvol and volumeExpanding and reactionDirBar
         bool weakLateParticipation=institutionalCandidate and reactionVolumeWeak and expansionExhausted and poorLocation
         bool institutionalRegimeOk=not institutionalCandidate or (not adxOpposing and not weakLateParticipation)
+        float alignedArrivalPressure=intendedDir==1?bullArrivalPressure:bearArrivalPressure
+        float opposingArrivalPressure=intendedDir==1?bearArrivalPressure:bullArrivalPressure
+        float alignedReactionPressure=intendedDir==1?bullReactionPressure:bearReactionPressure
+        float opposingReactionPressure=intendedDir==1?bearReactionPressure:bullReactionPressure
+        float reactionArrivalRatio=alignedReactionPressure/math.max(opposingArrivalPressure,1.0)
+        float candidateAbsorption=intendedDir==1?bullAbsorption:bearAbsorption
+        bool aggressiveOpposingArrival=opposingArrivalPressure>=maxOpposingArrivalPressure
+        bool arrivalAbsorbed=candidateAbsorption>=arrivalAbsorptionThreshold or reactionArrivalRatio>=minReactionVsArrivalRatio
+        bool unabsorbedArrival=aggressiveOpposingArrival and not arrivalAbsorbed
+        bool reactionDominant=alignedReactionPressure>opposingReactionPressure and reactionArrivalRatio>=minReactionVsArrivalRatio
         int clusterMate=na
         float clusterTop=na
         float clusterBottom=na
@@ -1383,7 +1430,7 @@ if enableSignals and signalZoneCount>0
         bool touchOk=hasCluster and clusterRequireIntersectionTouch?clusterTouch:normalTouch
         touchOk:=justFlipped?true:touchOk
 
-        if typeOk and obInventoryOk and breakerInventoryOk and institutionalContextOk and institutionalRegimeOk and not sameZoneTooSoon and touchOk
+        if typeOk and obInventoryOk and breakerInventoryOk and institutionalContextOk and institutionalRegimeOk and (not institutionalCandidate or not unabsorbedArrival) and not sameZoneTooSoon and touchOk
             float zwidth=math.max(activeTop-activeBottom,syminfo.mintick)
             float depth=intendedDir==1?f_clamp((activeTop-low)/zwidth,0.0,2.0):f_clamp((high-activeBottom)/zwidth,0.0,2.0)
             bool swept=not justFlipped and (intendedDir==1?low<activeBottom:high>activeTop)
@@ -1406,7 +1453,8 @@ if enableSignals and signalZoneCount>0
             float exhaustionPenalty=institutionalCandidate and expansionExhausted?10.0:0.0
             float volumeAdj=not institutionalCandidate or not useInstitutionalVolumeFilter?0.0:reactionVolumeStrong?strongVolumeBonus:reactionVolumeWeak?-weakVolumePenalty:0.0
             float adxAdj=not institutionalCandidate or not useInstitutionalAdxFilter?0.0:adxOpposing?-adxOpposingPenalty:adxAligned and adxRising?adxAlignedBonus:adxLateRollover?-adxRolloverPenalty:0.0
-            float q=f_clamp(baseQ*0.55+reactionScore*0.30+f_clamp(depth*50.0,0.0,100.0)*0.05+erBoost+touchAdj+divReactionAdj+locationAdj+volumeAdj+adxAdj-exhaustionPenalty,0.0,100.0)
+            float arrivalReactionAdj=not institutionalCandidate?0.0:unabsorbedArrival?-strongArrivalPenalty:reactionDominant?reactionDominanceBonus:0.0
+            float q=f_clamp(baseQ*0.52+reactionScore*0.30+f_clamp(depth*50.0,0.0,100.0)*0.05+erBoost+touchAdj+divReactionAdj+locationAdj+volumeAdj+adxAdj+arrivalReactionAdj-exhaustionPenalty,0.0,100.0)
             float effectiveThreshold=standaloneBreaker?math.max(25.0,minSignalZoneQuality-breakerQualityRelief):standaloneOb?math.max(30.0,minSignalZoneQuality-obQualityRelief):minSignalZoneQuality
             bool originPreferred=not standaloneOb or obOriginQ>=obPreferredOriginQuality
             bool reactionPass=standaloneBreaker?reactionScore>=breakerMinReactionScore:standaloneOb?(reactionScore>=obMinReactionScore or (originPreferred and reactionScore>=obMinReactionScore-10.0)):true
@@ -1417,7 +1465,8 @@ if enableSignals and signalZoneCount>0
             float locationPriority=institutionalCandidate?(poorLocation?-8.0:4.0):0.0
             float volumePriority=institutionalCandidate?(reactionVolumeStrong?8.0:reactionVolumeWeak?-8.0:0.0):0.0
             float regimePriority=institutionalCandidate?(adxOpposing?-12.0:adxAligned and adxRising?6.0:adxLateRollover?-8.0:0.0):0.0
-            float candidateRank=q+reactionScore*0.35+typePriority+directionPriority+divergencePriority+locationPriority+volumePriority+regimePriority
+            float arrivalReactionPriority=institutionalCandidate?(unabsorbedArrival?-12.0:reactionDominant?7.0:0.0):0.0
+            float candidateRank=q+reactionScore*0.35+typePriority+directionPriority+divergencePriority+locationPriority+volumePriority+regimePriority+arrivalReactionPriority
             if effortPass and reactionPass and q>=effectiveThreshold and candidateRank>interactionRank
                 interactionIdx:=i
                 interactionSecondIdx:=clusterMate
@@ -1455,6 +1504,9 @@ var float setupAlignedDi=na
 var float setupOpposingDi=na
 var bool setupVolumeStrong=false
 var bool setupAdxAligned=false
+var float setupArrivalPressure=na
+var float setupReactionPressure=na
+var float setupReactionArrivalRatio=na
 var string setupRegime="NONE"
 var string setupProvenance="NONE"
 var int setupBorn=na
@@ -1497,6 +1549,9 @@ if signalState=="IDLE" and not interactionCooldown and not na(interactionIdx)
     setupOpposingDi:=interactionDir==1?diMinus:interactionDir==-1?diPlus:na
     setupVolumeStrong:=interactionDir!=0 and rvolNow>=strongReactionRvol and volumeExpanding and ((interactionDir==1 and close>open) or (interactionDir==-1 and close<open))
     setupAdxAligned:=interactionDir!=0 and not na(adxValue) and adxValue>=adxTrendThreshold and nz(setupAlignedDi,0.0)>=nz(setupOpposingDi,0.0)
+    setupArrivalPressure:=interactionDir==1?bearArrivalPressure:interactionDir==-1?bullArrivalPressure:na
+    setupReactionPressure:=interactionDir==1?bullReactionPressure:interactionDir==-1?bearReactionPressure:na
+    setupReactionArrivalRatio:=not na(setupArrivalPressure)?nz(setupReactionPressure,0.0)/math.max(setupArrivalPressure,1.0):na
     int armTrendDir=confluenceScore>=hysteresisEnter?1:confluenceScore<=-hysteresisEnter?-1:0
     setupRegime:=armTrendDir==0?"TREND":interactionDir==armTrendDir?"TREND":"COUNTERTREND"
     setupProvenance:=interactionProvenance
@@ -1598,8 +1653,14 @@ bool reversalRegimeOk=liveRegime!="REVERSAL" or (enableReversalSignals and baseC
 bool signalContextOk=trendRegimeOk and countertrendRegimeOk and reversalRegimeOk and signalSessionOk
 
 bool lowTrendChop=not na(adxValue) and adxValue<chopAdxThreshold and math.abs(confluenceScore)<=chopMaxConfluence
+bool overlapChop=avgBarOverlap>=chopOverlapThreshold and math.abs(confluenceScore)<=chopMaxConfluence
+bool compressedChop=lowVolatilityRegime and (lowTrendChop or overlapChop)
+bool compositeChop=(lowTrendChop and overlapChop) or compressedChop
 bool chopException=setupClass=="FVG_SWEEP_RECLAIM" or setupClass=="OB_SWEEP_RECLAIM" or setupClass=="CLUSTER_SWEEP_RECLAIM" or setupClass=="ZONE_FAILURE"
-bool marketStateOk=not lowTrendChop or (allowSweepInChop and chopException)
+float liveMarketReactionQuality=f_clamp((setupDir==1?bullAbsorption:setupDir==-1?bearAbsorption:0.0)*0.50+math.min(reactionRvol/math.max(strongReactionRvol,0.10),1.5)/1.5*50.0,0.0,100.0)
+bool extremeVolException=(allowReversalInExtremeVol and setupRegime=="REVERSAL") or chopException
+bool volatilityStateOk=not highVolatilityRegime or liveMarketReactionQuality>=extremeVolMinReactionQuality or extremeVolException
+bool marketStateOk=(not compositeChop or (allowSweepInChop and chopException)) and volatilityStateOk
 
 bool isFailure=setupClass=="ZONE_FAILURE"
 float opposingConfluence=setupDir==1?math.max(-confluenceScore,0.0):math.max(confluenceScore,0.0)
@@ -1640,7 +1701,13 @@ bool confirmAdxLateRollover=institutionalReactionSetup and useInstitutionalAdxFi
 bool confirmVolumeWeak=institutionalReactionSetup and useInstitutionalVolumeFilter and rvolNow<minInstitutionalReactionRvol
 bool confirmVolumeRecovery=not institutionalReactionSetup or not useInstitutionalVolumeFilter or rvolNow>=minInstitutionalReactionRvol or liveAbsorption>=math.max(minAbsorptionScore,obMinReactionAbsorption)
 bool lateWeakRegime=institutionalReactionSetup and nz(setupExpansionAtr,0.0)>maxExpansionFromZoneAtr and confirmVolumeWeak and confirmAdxLateRollover
-bool institutionalRegimeConfirmOk=not institutionalReactionSetup or (not confirmAdxOpposing and not lateWeakRegime and confirmVolumeRecovery)
+float confirmAlignedReaction=setupDir==1?bullReactionPressure:setupDir==-1?bearReactionPressure:0.0
+float confirmOpposingArrival=setupDir==1?bearArrivalPressure:setupDir==-1?bullArrivalPressure:0.0
+float confirmReactionArrivalRatio=confirmAlignedReaction/math.max(confirmOpposingArrival,1.0)
+bool confirmArrivalAggressive=institutionalReactionSetup and confirmOpposingArrival>=maxOpposingArrivalPressure
+bool confirmArrivalAbsorbed=liveAbsorption>=arrivalAbsorptionThreshold or confirmReactionArrivalRatio>=minReactionVsArrivalRatio
+bool confirmArrivalOk=not institutionalReactionSetup or not confirmArrivalAggressive or confirmArrivalAbsorbed
+bool institutionalRegimeConfirmOk=not institutionalReactionSetup or (not confirmAdxOpposing and not lateWeakRegime and confirmVolumeRecovery and confirmArrivalOk)
 bool genericCloseRequirement=institutionalReactionSetup?true:normalCloseOk
 bool standardConfirm=not isFailure and genericCloseRequirement and signalParticipationOk and signalContextOk and marketStateOk and effortConfirmOk and obSignalConfirmOk and breakerSignalConfirmOk and institutionalContextConfirmOk and institutionalRegimeConfirmOk
 bool sameBarOk=allowSameBarConfirmation or na(setupArmedBar) or bar_index>setupArmedBar
@@ -1722,7 +1789,8 @@ if longConfirmed or shortConfirmed
     string zoneText=setupProvenance!="NONE"?setupProvenance:(setupDir==1?"BULL ":"BEAR ")+setupType+" #"+str.tostring(setupZoneId)
     string regimeText=(setupType=="OB" or setupType=="BREAKER")?" · V "+str.tostring(rvolNow,"0.00")+" · ADX "+str.tostring(nz(adxValue,0.0),"0.0"):""
     string spaceText=not na(signalAvailableRewardR)?" · SPACE "+str.tostring(signalAvailableRewardR,"0.0")+"R":""
-    string sigText=signalDisplay=="Minimal"?sideText:signalDisplay=="Compact"?setupRegime+" "+sideText+" · "+zoneText:"PLUTUS "+setupRegime+" "+sideText+" · "+setupClass+" · "+zoneText+" · ER "+str.tostring(nz(signalQAbsorption,0.0),"0.0")+regimeText+spaceText+" · SQ "+str.tostring(nz(signalQuality,0.0),"0.0")
+    string flowText=(setupType=="OB" or setupType=="BREAKER")?" · AR "+str.tostring(nz(setupReactionArrivalRatio,0.0),"0.00")+" · VR "+str.tostring(atrRegimeRatio,"0.00"):""
+    string sigText=signalDisplay=="Minimal"?sideText:signalDisplay=="Compact"?setupRegime+" "+sideText+" · "+zoneText:"PLUTUS "+setupRegime+" "+sideText+" · "+setupClass+" · "+zoneText+" · ER "+str.tostring(nz(signalQAbsorption,0.0),"0.0")+regimeText+flowText+spaceText+" · SQ "+str.tostring(nz(signalQuality,0.0),"0.0")
     label slb=label.new(bar_index,close,sigText,xloc=xloc.bar_index,style=longConfirmed?label.style_label_up:label.style_label_down,textcolor=color.white,color=color.new(sigColor,15),size=signalDisplay=="Detailed"?size.small:size.tiny)
     array.push(signalLabels,slb)
     while array.size(signalLabels)>maxSignalPreviews
@@ -1784,6 +1852,9 @@ if barstate.isconfirmed and (signalState=="INVALIDATED" or signalState=="EXPIRED
     setupOpposingDi:=na
     setupVolumeStrong:=false
     setupAdxAligned:=false
+    setupArrivalPressure:=na
+    setupReactionPressure:=na
+    setupReactionArrivalRatio:=na
     setupRegime:="NONE"
     setupProvenance:="NONE"
     setupBorn:=na
@@ -1843,8 +1914,9 @@ if barstate.islast
         string instGate=isStandaloneObSetup?(obSignalConfirmOk and institutionalContextConfirmOk?"OB PASS":"OB BLOCK")+" · R"+str.tostring(liveObRetests)+" M"+str.tostring(liveObMitigation,"0"):isStandaloneBreakerSetup?(breakerSignalConfirmOk and institutionalContextConfirmOk?"BB PASS":"BB BLOCK")+" · R"+str.tostring(liveBreakerRetests)+" M"+str.tostring(liveBreakerMitigation,"0"):"N/A"
         string ctxTail=(isStandaloneObSetup or isStandaloneBreakerSetup)?" · L"+str.tostring(nz(setupRangeLocation,50.0),"0")+" E"+str.tostring(nz(setupExpansionAtr,0.0),"0.0")+" D+"+str.tostring(nz(setupAlignedDiv,0.0),"0")+" D-"+str.tostring(nz(setupOpposingDiv,0.0),"0")+" V"+str.tostring(rvolNow,"0.00")+" A"+str.tostring(nz(adxValue,0.0),"0")+" DI"+str.tostring(confirmAlignedDi,"0")+"/"+str.tostring(confirmOpposingDi,"0"):""
         table.cell(signalAudit,1,8,instGate+ctxTail,text_color=(isStandaloneObSetup or isStandaloneBreakerSetup)?(((obSignalConfirmOk and isStandaloneObSetup) or (breakerSignalConfirmOk and isStandaloneBreakerSetup)) and institutionalContextConfirmOk?cBull:cBear):color.gray)
-        table.cell(signalAudit,0,9,"Last confirmed",text_color=color.silver)
-        table.cell(signalAudit,1,9,lastSignalAudit,text_color=color.white)
+        table.cell(signalAudit,0,9,"Market / flow",text_color=color.silver)
+        string marketAudit=(compositeChop?"CHOP":highVolatilityRegime?"HIGH VOL":lowVolatilityRegime?"LOW VOL":"NORMAL")+" · O"+str.tostring(avgBarOverlap,"0.00")+" · VR"+str.tostring(atrRegimeRatio,"0.00")+" · AR"+str.tostring(nz(setupReactionArrivalRatio,0.0),"0.00")
+        table.cell(signalAudit,1,9,marketAudit,text_color=marketStateOk?color.white:cBear)
 
 //------------------------------------------------------------------------------
 // Production status panel — restored full information set
