@@ -1491,7 +1491,7 @@ if signalState=="IDLE" and not interactionCooldown and not na(interactionIdx)
     setupAlignedDi:=interactionDir==1?diPlus:interactionDir==-1?diMinus:na
     setupOpposingDi:=interactionDir==1?diMinus:interactionDir==-1?diPlus:na
     setupVolumeStrong:=interactionDir!=0 and rvolNow>=strongReactionRvol and volumeExpanding and ((interactionDir==1 and close>open) or (interactionDir==-1 and close<open))
-    setupAdxAligned:=interactionDir!=0 and adxTrending and nz(setupAlignedDi,0.0)>=nz(setupOpposingDi,0.0)
+    setupAdxAligned:=interactionDir!=0 and not na(adxValue) and adxValue>=adxTrendThreshold and nz(setupAlignedDi,0.0)>=nz(setupOpposingDi,0.0)
     setupProvenance:=interactionProvenance
     setupBorn:=array.get(zBorn,interactionIdx)
     setupArmedBar:=bar_index
