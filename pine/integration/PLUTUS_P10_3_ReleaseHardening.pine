@@ -1461,11 +1461,11 @@ bool longConfirmed=false
 bool shortConfirmed=false
 if signalConfirmNow
     signalState:="CONFIRMED"
-    signalQZone=f_clamp(nz(setupArmQuality,setupZoneScore),0.0,100.0)
-    signalQContext=f_clamp(math.abs(nz(confluenceScore,0.0)),0.0,100.0)
-    signalQConfidence=f_clamp(nz(confidence,0.0),0.0,100.0)
-    signalQAbsorption=f_clamp(nz(liveAbsorption,setupAbsorption),0.0,100.0)
-    signalQuality=f_clamp(signalQZone*0.45+signalQContext*0.25+signalQConfidence*0.15+signalQAbsorption*0.15,0.0,100.0)
+    signalQZone:=f_clamp(nz(setupArmQuality,setupZoneScore),0.0,100.0)
+    signalQContext:=f_clamp(math.abs(nz(confluenceScore,0.0)),0.0,100.0)
+    signalQConfidence:=f_clamp(nz(confidence,0.0),0.0,100.0)
+    signalQAbsorption:=f_clamp(nz(liveAbsorption,setupAbsorption),0.0,100.0)
+    signalQuality:=f_clamp(signalQZone*0.45+signalQContext*0.25+signalQConfidence*0.15+signalQAbsorption*0.15,0.0,100.0)
     signalEntry:=close
     signalStop:=prospectiveStop
     float sigRisk=prospectiveRisk
