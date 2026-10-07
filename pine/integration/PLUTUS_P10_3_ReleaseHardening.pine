@@ -169,15 +169,22 @@ signalCooldownBars = input.int(5, "Directional Cooldown Bars", minval=0, maxval=
 sameZoneReentryBars = input.int(3, "Same-Zone Re-entry Delay", minval=0, maxval=50, group=groupSignals)
 allowSameBarConfirmation = input.bool(true, "Allow Interaction-Bar Close Confirmation", group=groupSignals)
 
-groupObSignals = "Order Block Signal Quality"
-obMinOriginQuality = input.float(65.0, "Minimum OB Origin Quality", minval=0, maxval=100, step=5, group=groupObSignals)
+groupObSignals = "Order Block / Breaker Signal Quality"
+obMinOriginQuality = input.float(40.0, "OB Minimum Origin Quality Floor", minval=0, maxval=100, step=5, group=groupObSignals)
+obPreferredOriginQuality = input.float(65.0, "OB Preferred Origin Quality", minval=0, maxval=100, step=5, group=groupObSignals)
 obMaxRetests = input.int(2, "Maximum OB Retests For Entry", minval=1, maxval=10, group=groupObSignals)
-obMaxMitigationPct = input.float(70.0, "Maximum OB Mitigation For Entry %", minval=10, maxval=100, step=5, group=groupObSignals)
-obMaxOpposingArrival = input.float(65.0, "Maximum Opposing Arrival Pressure", minval=0, maxval=100, step=5, group=groupObSignals)
-obMinReactionAbsorption = input.float(45.0, "Minimum OB Reaction Absorption", minval=0, maxval=100, step=5, group=groupObSignals)
-obRequireMidpointReclaim = input.bool(true, "Require OB Midpoint Reclaim", group=groupObSignals)
-obFirstTouchBonus = input.float(7.5, "First-Touch OB Quality Bonus", minval=0, maxval=25, step=2.5, group=groupObSignals)
-obSecondTouchPenalty = input.float(10.0, "Second-Touch OB Quality Penalty", minval=0, maxval=30, step=2.5, group=groupObSignals)
+obMaxMitigationPct = input.float(80.0, "Maximum OB Mitigation For Entry %", minval=10, maxval=100, step=5, group=groupObSignals)
+obMaxOpposingArrival = input.float(75.0, "Maximum Opposing Arrival Pressure", minval=0, maxval=100, step=5, group=groupObSignals)
+obMinReactionAbsorption = input.float(40.0, "Minimum OB Reaction Absorption", minval=0, maxval=100, step=5, group=groupObSignals)
+obMinReactionScore = input.float(52.5, "Minimum OB Reaction Score", minval=0, maxval=100, step=2.5, group=groupObSignals)
+obRequireMidpointReclaim = input.bool(false, "Require OB Midpoint Reclaim", group=groupObSignals)
+obFirstTouchBonus = input.float(10.0, "First-Touch OB Quality Bonus", minval=0, maxval=25, step=2.5, group=groupObSignals)
+obSecondTouchPenalty = input.float(5.0, "Second-Touch OB Quality Penalty", minval=0, maxval=30, step=2.5, group=groupObSignals)
+breakerMaxRetests = input.int(2, "Maximum Breaker Retests For Entry", minval=1, maxval=10, group=groupObSignals)
+breakerMaxMitigationPct = input.float(85.0, "Maximum Breaker Mitigation For Entry %", minval=10, maxval=100, step=5, group=groupObSignals)
+breakerMinReactionScore = input.float(47.5, "Minimum Breaker Reaction Score", minval=0, maxval=100, step=2.5, group=groupObSignals)
+breakerQualityRelief = input.float(20.0, "Breaker Zone-Quality Threshold Relief", minval=0, maxval=40, step=2.5, group=groupObSignals)
+obQualityRelief = input.float(12.5, "OB Zone-Quality Threshold Relief", minval=0, maxval=30, step=2.5, group=groupObSignals)
 
 groupCluster = "Institutional Cluster / Unicorn"
 enableInstitutionalClusters = input.bool(true, "Enable Breaker + FVG-Family Clusters", group=groupCluster)
@@ -1217,6 +1224,7 @@ int interactionSecondIdx=na
 int interactionDir=0
 string interactionClass="NONE"
 float interactionQuality=0.0
+float interactionRank=-1e9
 float interactionDepth=0.0
 bool interactionIsCluster=false
 float interactionTop=na
@@ -1241,11 +1249,13 @@ if enableSignals and signalZoneCount>0
         bool justFlipped=zst=="JUST_FLIPPED" and not na(zarmed) and bar_index==zarmed
         int intendedDir=zdir
         bool standaloneOb=ztyp=="OB"
+        bool standaloneBreaker=ztyp=="BREAKER"
         float obOriginQ=standaloneOb?array.get(zBaseScore,i):100.0
-        int obRetestCount=standaloneOb?array.get(zRetests,i):0
-        float obMitigation=standaloneOb?array.get(zMitigation,i):0.0
-        float obOpposingArrival=standaloneOb?(zdir==1?math.max(-p01,0.0):math.max(p01,0.0)):0.0
-        bool obInventoryOk=not standaloneOb or (obOriginQ>=obMinOriginQuality and obRetestCount<=obMaxRetests and obMitigation<=obMaxMitigationPct and obOpposingArrival<=obMaxOpposingArrival)
+        int zoneRetestCount=(standaloneOb or standaloneBreaker)?array.get(zRetests,i):0
+        float zoneMitigation=(standaloneOb or standaloneBreaker)?array.get(zMitigation,i):0.0
+        float opposingArrival=(standaloneOb or standaloneBreaker)?(zdir==1?math.max(-p01,0.0):math.max(p01,0.0)):0.0
+        bool obInventoryOk=not standaloneOb or (obOriginQ>=obMinOriginQuality and zoneRetestCount<=obMaxRetests and zoneMitigation<=obMaxMitigationPct and opposingArrival<=obMaxOpposingArrival)
+        bool breakerInventoryOk=not standaloneBreaker or (zoneRetestCount<=breakerMaxRetests and zoneMitigation<=breakerMaxMitigationPct)
         int clusterMate=na
         float clusterTop=na
         float clusterBottom=na
@@ -1285,7 +1295,7 @@ if enableSignals and signalZoneCount>0
         bool touchOk=hasCluster and clusterRequireIntersectionTouch?clusterTouch:normalTouch
         touchOk:=justFlipped?true:touchOk
 
-        if typeOk and obInventoryOk and not sameZoneTooSoon and touchOk
+        if typeOk and obInventoryOk and breakerInventoryOk and not sameZoneTooSoon and touchOk
             float zwidth=math.max(activeTop-activeBottom,syminfo.mintick)
             float depth=intendedDir==1?f_clamp((activeTop-low)/zwidth,0.0,2.0):f_clamp((high-activeBottom)/zwidth,0.0,2.0)
             bool swept=not justFlipped and (intendedDir==1?low<activeBottom:high>activeTop)
@@ -1295,15 +1305,27 @@ if enableSignals and signalZoneCount>0
             float absorption=intendedDir==1?bullAbsorption:bearAbsorption
             float erBoost=effortResultMode=="Off"?0.0:effortResultBoost*absorption/100.0
             float baseQ=hasCluster?clusterBaseQ:zscore
-            float obTouchAdj=standaloneOb?(obRetestCount<=1?obFirstTouchBonus:obRetestCount==2?-obSecondTouchPenalty:-obSecondTouchPenalty*2.0):0.0
-            float q=f_clamp(baseQ*0.80+f_clamp(depth*50.0,0.0,100.0)*0.10+erBoost+obTouchAdj,0.0,100.0)
+            float touchAdj=standaloneOb?(zoneRetestCount<=1?obFirstTouchBonus:zoneRetestCount==2?-obSecondTouchPenalty:-obSecondTouchPenalty*2.0):standaloneBreaker and zoneRetestCount<=1?7.5:0.0
+            float barCloseLoc=(close-low)/math.max(high-low,syminfo.mintick)
+            float directionalCloseQuality=intendedDir==1?barCloseLoc*100.0:(1.0-barCloseLoc)*100.0
+            float directionBodyQuality=(intendedDir==1 and close>open) or (intendedDir==-1 and close<open)?bodyEff*100.0:0.0
+            float mitigationQuality=(standaloneOb or standaloneBreaker)?100.0-f_clamp(zoneMitigation,0.0,100.0):50.0
+            float reactionScore=f_clamp(absorption*0.35+directionalCloseQuality*0.30+directionBodyQuality*0.20+mitigationQuality*0.15,0.0,100.0)
+            float q=f_clamp(baseQ*0.60+reactionScore*0.25+f_clamp(depth*50.0,0.0,100.0)*0.05+erBoost+touchAdj,0.0,100.0)
+            float effectiveThreshold=standaloneBreaker?math.max(25.0,minSignalZoneQuality-breakerQualityRelief):standaloneOb?math.max(30.0,minSignalZoneQuality-obQualityRelief):minSignalZoneQuality
+            bool originPreferred=not standaloneOb or obOriginQ>=obPreferredOriginQuality
+            bool reactionPass=standaloneBreaker?reactionScore>=breakerMinReactionScore:standaloneOb?(reactionScore>=obMinReactionScore or (originPreferred and reactionScore>=obMinReactionScore-10.0)):true
             bool effortPass=effortResultMode!="Require" or absorption>=minAbsorptionScore
-            if effortPass and q>=minSignalZoneQuality and q>interactionQuality
+            float typePriority=hasCluster?18.0:standaloneBreaker?14.0:standaloneOb?10.0:ztyp=="IFVG"?6.0:0.0
+            float directionPriority=((intendedDir==1 and close>=open) or (intendedDir==-1 and close<=open))?8.0:-4.0
+            float candidateRank=q+reactionScore*0.35+typePriority+directionPriority
+            if effortPass and reactionPass and q>=effectiveThreshold and candidateRank>interactionRank
                 interactionIdx:=i
                 interactionSecondIdx:=clusterMate
                 interactionDir:=intendedDir
                 interactionClass:=klass
                 interactionQuality:=q
+                interactionRank:=candidateRank
                 interactionDepth:=depth
                 interactionIsCluster:=hasCluster
                 interactionTop:=activeTop
@@ -1438,15 +1460,28 @@ bool failureConfirm=isFailure and failureCloseOk and failureImpulseOk and failur
 float liveAbsorption=setupDir==1?bullAbsorption:bearAbsorption
 bool effortConfirmOk=effortResultMode!="Require" or liveAbsorption>=minAbsorptionScore
 bool isStandaloneObSetup=setupType=="OB" and not setupIsCluster
+bool isStandaloneBreakerSetup=setupType=="BREAKER" and not setupIsCluster
 float liveObMitigation=not na(boundIdx) and isStandaloneObSetup?array.get(zMitigation,boundIdx):0.0
 int liveObRetests=not na(boundIdx) and isStandaloneObSetup?array.get(zRetests,boundIdx):0
 float liveObOriginQ=not na(boundIdx) and isStandaloneObSetup?array.get(zBaseScore,boundIdx):100.0
 float liveObOpposingArrival=isStandaloneObSetup?(setupDir==1?math.max(-p01,0.0):math.max(p01,0.0)):0.0
+float liveBreakerMitigation=not na(boundIdx) and isStandaloneBreakerSetup?array.get(zMitigation,boundIdx):0.0
+int liveBreakerRetests=not na(boundIdx) and isStandaloneBreakerSetup?array.get(zRetests,boundIdx):0
+float confirmCloseLoc=(close-low)/math.max(high-low,syminfo.mintick)
+float confirmDirectionalCloseQ=setupDir==1?confirmCloseLoc*100.0:(1.0-confirmCloseLoc)*100.0
+float confirmDirectionBodyQ=((setupDir==1 and close>open) or (setupDir==-1 and close<open))?bodyEff*100.0:0.0
+float confirmReactionScore=f_clamp(liveAbsorption*0.40+confirmDirectionalCloseQ*0.35+confirmDirectionBodyQ*0.25,0.0,100.0)
 bool obMidpointReclaimOk=not isStandaloneObSetup or not obRequireMidpointReclaim or (setupDir==1?close>=setupMid:close<=setupMid)
+bool obDisplacementAwayOk=not isStandaloneObSetup or (confirmReactionScore>=obMinReactionScore and ((setupDir==1 and close>open) or (setupDir==-1 and close<open)))
 bool obReactionAbsorptionOk=not isStandaloneObSetup or liveAbsorption>=obMinReactionAbsorption
 bool obLiveInventoryOk=not isStandaloneObSetup or (liveObOriginQ>=obMinOriginQuality and liveObRetests<=obMaxRetests and liveObMitigation<=obMaxMitigationPct and liveObOpposingArrival<=obMaxOpposingArrival)
-bool obSignalConfirmOk=obMidpointReclaimOk and obReactionAbsorptionOk and obLiveInventoryOk
-bool standardConfirm=not isFailure and normalCloseOk and signalParticipationOk and signalContextOk and effortConfirmOk and obSignalConfirmOk
+bool obSignalConfirmOk=not isStandaloneObSetup or (obReactionAbsorptionOk and obLiveInventoryOk and (obMidpointReclaimOk or obDisplacementAwayOk))
+bool breakerLiveInventoryOk=not isStandaloneBreakerSetup or (liveBreakerRetests<=breakerMaxRetests and liveBreakerMitigation<=breakerMaxMitigationPct)
+bool breakerReactionOk=not isStandaloneBreakerSetup or (confirmReactionScore>=breakerMinReactionScore and ((setupDir==1 and close>open) or (setupDir==-1 and close<open)))
+bool breakerSignalConfirmOk=breakerLiveInventoryOk and breakerReactionOk
+bool institutionalReactionSetup=isStandaloneObSetup or isStandaloneBreakerSetup
+bool genericCloseRequirement=institutionalReactionSetup?true:normalCloseOk
+bool standardConfirm=not isFailure and genericCloseRequirement and signalParticipationOk and signalContextOk and effortConfirmOk and obSignalConfirmOk and breakerSignalConfirmOk
 bool sameBarOk=allowSameBarConfirmation or na(setupArmedBar) or bar_index>setupArmedBar
 float prospectiveBuffer=nz(atr,0.0)*stopBufferAtr
 float prospectiveStop=setupDir==1?setupBottom-prospectiveBuffer:setupDir==-1?setupTop+prospectiveBuffer:na
@@ -1589,8 +1624,9 @@ if barstate.islast
         table.cell(signalAudit,1,6,str.tostring(confluenceScore,"#.0")+" · "+str.tostring(confidence,"#.0")+"%",text_color=confluenceScore>0?cBull:confluenceScore<0?cBear:color.white)
         table.cell(signalAudit,0,7,"Risk guard",text_color=color.silver)
         table.cell(signalAudit,1,7,signalRiskOk?"PASS":"BLOCK",text_color=signalRiskOk?cBull:cBear)
-        table.cell(signalAudit,0,8,"OB gate",text_color=color.silver)
-        table.cell(signalAudit,1,8,isStandaloneObSetup?(obSignalConfirmOk?"PASS":"BLOCK")+" · R"+str.tostring(liveObRetests)+" · M"+str.tostring(liveObMitigation,"0")+" · A"+str.tostring(liveObOpposingArrival,"0"):"N/A",text_color=isStandaloneObSetup?(obSignalConfirmOk?cBull:cBear):color.gray)
+        table.cell(signalAudit,0,8,"OB / BB gate",text_color=color.silver)
+        string instGate=isStandaloneObSetup?(obSignalConfirmOk?"OB PASS":"OB BLOCK")+" · R"+str.tostring(liveObRetests)+" · M"+str.tostring(liveObMitigation,"0")+" · A"+str.tostring(liveObOpposingArrival,"0"):isStandaloneBreakerSetup?(breakerSignalConfirmOk?"BB PASS":"BB BLOCK")+" · R"+str.tostring(liveBreakerRetests)+" · M"+str.tostring(liveBreakerMitigation,"0"):"N/A"
+        table.cell(signalAudit,1,8,instGate,text_color=(isStandaloneObSetup or isStandaloneBreakerSetup)?((obSignalConfirmOk and isStandaloneObSetup) or (breakerSignalConfirmOk and isStandaloneBreakerSetup)?cBull:cBear):color.gray)
         table.cell(signalAudit,0,9,"Last confirmed",text_color=color.silver)
         table.cell(signalAudit,1,9,lastSignalAudit,text_color=color.white)
 
