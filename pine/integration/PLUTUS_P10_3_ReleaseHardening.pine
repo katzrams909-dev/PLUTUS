@@ -1319,6 +1319,29 @@ f_reactionCode(string k)=>
      k=="CLUSTER_REJECTION"?"CL REJ":
      k=="CLUSTER_SWEEP_RECLAIM"?"CL SWP":k
 
+f_renderValidationPanel(table panel,bool syncOk,int duplicatePairs,int pendingCount,int signalCount,int trendCount,int counterCount,int reversalCount,int oneBarCount,int twoBarCount,int threeBarCount,int wickCount,int doneCount,int hit1Count,int hit2Count,float mfeSum,float maeSum,int ambiguousCount,string lastKey,color longColor,color shortColor) =>
+    table.clear(panel,0,0,1,7)
+    float hit1Pct=doneCount>0?hit1Count*100.0/doneCount:na
+    float hit2Pct=doneCount>0?hit2Count*100.0/doneCount:na
+    float avgMfe=doneCount>0?mfeSum/doneCount:na
+    float avgMae=doneCount>0?maeSum/doneCount:na
+    table.cell(panel,0,0,"PLUTUS VALIDATION",text_color=color.white)
+    table.cell(panel,1,0,"N "+str.tostring(signalCount),text_color=color.white)
+    table.cell(panel,0,1,"Pending sync",text_color=color.silver)
+    table.cell(panel,1,1,(syncOk and duplicatePairs==0?"PASS":"FAIL")+" · "+str.tostring(pendingCount)+" active",text_color=syncOk and duplicatePairs==0?longColor:shortColor)
+    table.cell(panel,0,2,"Regimes",text_color=color.silver)
+    table.cell(panel,1,2,"T "+str.tostring(trendCount)+" · C "+str.tostring(counterCount)+" · R "+str.tostring(reversalCount),text_color=color.white)
+    table.cell(panel,0,3,"Timing",text_color=color.silver)
+    table.cell(panel,1,3,"1B "+str.tostring(oneBarCount)+" · 2B "+str.tostring(twoBarCount)+" · 3B "+str.tostring(threeBarCount)+" · W "+str.tostring(wickCount),text_color=color.white)
+    table.cell(panel,0,4,"1R / 2R",text_color=color.silver)
+    table.cell(panel,1,4,(na(hit1Pct)?"—":str.tostring(hit1Pct,"0.0")+"%")+" / "+(na(hit2Pct)?"—":str.tostring(hit2Pct,"0.0")+"%"),text_color=color.white)
+    table.cell(panel,0,5,"Avg MFE / MAE",text_color=color.silver)
+    table.cell(panel,1,5,(na(avgMfe)?"—":str.tostring(avgMfe,"0.00")+"R")+" / "+(na(avgMae)?"—":str.tostring(avgMae,"0.00")+"R"),text_color=color.white)
+    table.cell(panel,0,6,"Ambiguous bars",text_color=color.silver)
+    table.cell(panel,1,6,str.tostring(ambiguousCount),text_color=ambiguousCount==0?color.white:color.orange)
+    table.cell(panel,0,7,"Last key",text_color=color.silver)
+    table.cell(panel,1,7,lastKey,text_color=color.white)
+
 f_clusterPair(string a,string b)=>
     bool breakerFvg=(a=="BREAKER" and b=="FVG") or (a=="FVG" and b=="BREAKER")
     bool breakerIfvg=(a=="BREAKER" and b=="IFVG") or (a=="IFVG" and b=="BREAKER")
@@ -1367,6 +1390,19 @@ var array<float> prBestRvol=array.new_float()
 var array<float> prBestDiv=array.new_float()
 var array<string> prProv=array.new_string()
 maxPendingReactions = 12
+
+f_pendingValidation() =>
+    bool syncOk=array.size(prZoneId)==array.size(prSecondId) and array.size(prZoneId)==array.size(prDir) and array.size(prZoneId)==array.size(prType) and array.size(prZoneId)==array.size(prClass) and array.size(prZoneId)==array.size(prTop) and array.size(prZoneId)==array.size(prBottom) and array.size(prZoneId)==array.size(prSourceQ) and array.size(prZoneId)==array.size(prBaseRank) and array.size(prZoneId)==array.size(prStartBar) and array.size(prZoneId)==array.size(prDeadline) and array.size(prZoneId)==array.size(prWick) and array.size(prZoneId)==array.size(prBestAbs) and array.size(prZoneId)==array.size(prBestRvol) and array.size(prZoneId)==array.size(prBestDiv) and array.size(prZoneId)==array.size(prProv)
+    int duplicates=0
+    if array.size(prZoneId)>1
+        for va=0 to array.size(prZoneId)-2
+            for vb=va+1 to array.size(prZoneId)-1
+                int vaSecond=array.get(prSecondId,va)
+                int vbSecond=array.get(prSecondId,vb)
+                bool sameSecond=(na(vaSecond) and na(vbSecond)) or (not na(vaSecond) and not na(vbSecond) and vaSecond==vbSecond)
+                if array.get(prZoneId,va)==array.get(prZoneId,vb) and sameSecond
+                    duplicates+=1
+    [syncOk,duplicates]
 
 int interactionIdx=na
 int interactionSecondIdx=na
@@ -2100,54 +2136,59 @@ var array<bool> voHit2=array.new_bool()
 var array<float> voMfe=array.new_float()
 var array<float> voMae=array.new_float()
 
-bool pendingSyncOk=array.size(prZoneId)==array.size(prSecondId) and array.size(prZoneId)==array.size(prDir) and array.size(prZoneId)==array.size(prType) and array.size(prZoneId)==array.size(prClass) and array.size(prZoneId)==array.size(prTop) and array.size(prZoneId)==array.size(prBottom) and array.size(prZoneId)==array.size(prSourceQ) and array.size(prZoneId)==array.size(prBaseRank) and array.size(prZoneId)==array.size(prStartBar) and array.size(prZoneId)==array.size(prDeadline) and array.size(prZoneId)==array.size(prWick) and array.size(prZoneId)==array.size(prBestAbs) and array.size(prZoneId)==array.size(prBestRvol) and array.size(prZoneId)==array.size(prBestDiv) and array.size(prZoneId)==array.size(prProv)
-int pendingDuplicatePairs=0
-if array.size(prZoneId)>1
-    for va=0 to array.size(prZoneId)-2
-        for vb=va+1 to array.size(prZoneId)-1
-            int vaSecond=array.get(prSecondId,va)
-            int vbSecond=array.get(prSecondId,vb)
-            bool sameSecond=(na(vaSecond) and na(vbSecond)) or (not na(vaSecond) and not na(vbSecond) and vaSecond==vbSecond)
-            if array.get(prZoneId,va)==array.get(prZoneId,vb) and sameSecond
-                pendingDuplicatePairs+=1
+f_updateValidationOutcomes() =>
+    int doneDelta=0
+    int hit1Delta=0
+    int hit2Delta=0
+    int ambiguousDelta=0
+    float mfeDelta=0.0
+    float maeDelta=0.0
+    int voi=array.size(voDir)-1
+    while voi>=0
+        int vdir=array.get(voDir,voi)
+        float vent=array.get(voEntry,voi)
+        float vrisk=array.get(voRisk,voi)
+        int vage=bar_index-array.get(voBar,voi)
+        float vfav=vdir==1?(high-vent)/vrisk:(vent-low)/vrisk
+        float vadv=vdir==1?(vent-low)/vrisk:(high-vent)/vrisk
+        float vmfe=math.max(array.get(voMfe,voi),vfav)
+        float vmae=math.max(array.get(voMae,voi),vadv)
+        bool new1=array.get(voHit1,voi) or vmfe>=1.0
+        bool new2=array.get(voHit2,voi) or vmfe>=2.0
+        bool stopHit=vmae>=1.0
+        bool ambiguousThisBar=(vfav>=1.0 and vadv>=1.0) or (vfav>=2.0 and vadv>=1.0)
+        array.set(voMfe,voi,vmfe)
+        array.set(voMae,voi,vmae)
+        array.set(voHit1,voi,new1)
+        array.set(voHit2,voi,new2)
+        bool finishOutcome=new2 or stopHit or vage>=validationOutcomeBars
+        if finishOutcome
+            doneDelta+=1
+            hit1Delta+=new1?1:0
+            hit2Delta+=new2?1:0
+            ambiguousDelta+=ambiguousThisBar?1:0
+            mfeDelta+=vmfe
+            maeDelta+=vmae
+            array.remove(voDir,voi)
+            array.remove(voEntry,voi)
+            array.remove(voRisk,voi)
+            array.remove(voBar,voi)
+            array.remove(voHit1,voi)
+            array.remove(voHit2,voi)
+            array.remove(voMfe,voi)
+            array.remove(voMae,voi)
+        voi-=1
+    [doneDelta,hit1Delta,hit2Delta,ambiguousDelta,mfeDelta,maeDelta]
 
-int voi=array.size(voDir)-1
-while voi>=0
-    int vdir=array.get(voDir,voi)
-    float vent=array.get(voEntry,voi)
-    float vrisk=array.get(voRisk,voi)
-    int vage=bar_index-array.get(voBar,voi)
-    float vfav=vdir==1?(high-vent)/vrisk:(vent-low)/vrisk
-    float vadv=vdir==1?(vent-low)/vrisk:(high-vent)/vrisk
-    float vmfe=math.max(array.get(voMfe,voi),vfav)
-    float vmae=math.max(array.get(voMae,voi),vadv)
-    bool old1=array.get(voHit1,voi)
-    bool old2=array.get(voHit2,voi)
-    bool new1=old1 or vmfe>=1.0
-    bool new2=old2 or vmfe>=2.0
-    bool stopHit=vmae>=1.0
-    bool ambiguousThisBar=(vfav>=1.0 and vadv>=1.0) or (vfav>=2.0 and vadv>=1.0)
-    array.set(voMfe,voi,vmfe)
-    array.set(voMae,voi,vmae)
-    array.set(voHit1,voi,new1)
-    array.set(voHit2,voi,new2)
-    bool finishOutcome=new2 or stopHit or vage>=validationOutcomeBars
-    if finishOutcome
-        validationOutcomeDoneCount+=1
-        validationHit1RCount+=new1?1:0
-        validationHit2RCount+=new2?1:0
-        validationAmbiguousCount+=ambiguousThisBar?1:0
-        validationMfeSum+=vmfe
-        validationMaeSum+=vmae
-        array.remove(voDir,voi)
-        array.remove(voEntry,voi)
-        array.remove(voRisk,voi)
-        array.remove(voBar,voi)
-        array.remove(voHit1,voi)
-        array.remove(voHit2,voi)
-        array.remove(voMfe,voi)
-        array.remove(voMae,voi)
-    voi-=1
+[pendingSyncOk,pendingDuplicatePairs]=f_pendingValidation()
+
+[outDoneDelta,outHit1Delta,outHit2Delta,outAmbiguousDelta,outMfeDelta,outMaeDelta]=f_updateValidationOutcomes()
+validationOutcomeDoneCount+=outDoneDelta
+validationHit1RCount+=outHit1Delta
+validationHit2RCount+=outHit2Delta
+validationAmbiguousCount+=outAmbiguousDelta
+validationMfeSum+=outMfeDelta
+validationMaeSum+=outMaeDelta
 
 bool longConfirmed=false
 bool shortConfirmed=false
@@ -2371,29 +2412,10 @@ if barstate.islast
         table.cell(signalAudit,1,11,lastSignalAudit,text_color=color.white)
 
 var table validationPanel=table.new(position.bottom_right,2,8,border_width=1,frame_width=1,bgcolor=color.new(color.black,15))
-if barstate.islast
+if barstate.islast and showValidationPanel
+    f_renderValidationPanel(validationPanel,pendingSyncOk,pendingDuplicatePairs,array.size(prZoneId),validationSignalCount,validationTrendCount,validationCountertrendCount,validationReversalCount,validationOneBarCount,validationTwoBarCount,validationThreeBarCount,validationWickCount,validationOutcomeDoneCount,validationHit1RCount,validationHit2RCount,validationMfeSum,validationMaeSum,validationAmbiguousCount,validationLastKey,signalLongColor,signalShortColor)
+else if barstate.islast
     table.clear(validationPanel,0,0,1,7)
-    if showValidationPanel
-        float hit1Pct=validationOutcomeDoneCount>0?validationHit1RCount*100.0/validationOutcomeDoneCount:na
-        float hit2Pct=validationOutcomeDoneCount>0?validationHit2RCount*100.0/validationOutcomeDoneCount:na
-        float avgMfe=validationOutcomeDoneCount>0?validationMfeSum/validationOutcomeDoneCount:na
-        float avgMae=validationOutcomeDoneCount>0?validationMaeSum/validationOutcomeDoneCount:na
-        table.cell(validationPanel,0,0,"PLUTUS VALIDATION",text_color=color.white)
-        table.cell(validationPanel,1,0,"N "+str.tostring(validationSignalCount),text_color=color.white)
-        table.cell(validationPanel,0,1,"Pending sync",text_color=color.silver)
-        table.cell(validationPanel,1,1,(pendingSyncOk and pendingDuplicatePairs==0?"PASS":"FAIL")+" · "+str.tostring(array.size(prZoneId))+" active",text_color=pendingSyncOk and pendingDuplicatePairs==0?signalLongColor:signalShortColor)
-        table.cell(validationPanel,0,2,"Regimes",text_color=color.silver)
-        table.cell(validationPanel,1,2,"T "+str.tostring(validationTrendCount)+" · C "+str.tostring(validationCountertrendCount)+" · R "+str.tostring(validationReversalCount),text_color=color.white)
-        table.cell(validationPanel,0,3,"Timing",text_color=color.silver)
-        table.cell(validationPanel,1,3,"1B "+str.tostring(validationOneBarCount)+" · 2B "+str.tostring(validationTwoBarCount)+" · 3B "+str.tostring(validationThreeBarCount)+" · W "+str.tostring(validationWickCount),text_color=color.white)
-        table.cell(validationPanel,0,4,"1R / 2R",text_color=color.silver)
-        table.cell(validationPanel,1,4,(na(hit1Pct)?"—":str.tostring(hit1Pct,"0.0")+"%")+" / "+(na(hit2Pct)?"—":str.tostring(hit2Pct,"0.0")+"%"),text_color=color.white)
-        table.cell(validationPanel,0,5,"Avg MFE / MAE",text_color=color.silver)
-        table.cell(validationPanel,1,5,(na(avgMfe)?"—":str.tostring(avgMfe,"0.00")+"R")+" / "+(na(avgMae)?"—":str.tostring(avgMae,"0.00")+"R"),text_color=color.white)
-        table.cell(validationPanel,0,6,"Ambiguous bars",text_color=color.silver)
-        table.cell(validationPanel,1,6,str.tostring(validationAmbiguousCount),text_color=validationAmbiguousCount==0?color.white:color.orange)
-        table.cell(validationPanel,0,7,"Last key",text_color=color.silver)
-        table.cell(validationPanel,1,7,validationLastKey,text_color=color.white)
 
 //------------------------------------------------------------------------------
 // Production status panel — restored full information set
