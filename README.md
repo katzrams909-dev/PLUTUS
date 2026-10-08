@@ -68,6 +68,4 @@ See:
 - `docs/PROJECT_SPEC.md`
 - `docs/ENGINE_ARCHITECTURE.md`
 - `docs/RELEASE_v1.0.md`
-- `docs/USER_GUIDE.md`
-- `tests/regression/VALIDATION_PROTOCOL.md`
 - `tests/regression/RC1_RELEASE_AUDIT.md`
