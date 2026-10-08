@@ -276,7 +276,9 @@ minAbsorptionScore = input.float(45.0, "Minimum Absorption Score", minval=0, max
 effortResultBoost = input.float(12.5, "Maximum Effort / Result Boost", minval=0, maxval=30, step=2.5, group=groupEffort)
 
 groupSignalVisual = "Signal Visuals"
-signalDisplay = input.string("Detailed", "Signal Label Detail", options=["Minimal", "Compact", "Detailed"], group=groupSignalVisual)
+signalDisplay = input.string("Compact", "Signal Label Detail", options=["Minimal", "Compact", "Detailed"], group=groupSignalVisual)
+signalLongColor = input.color(color.rgb(0, 200, 120), "LONG Signal Color", group=groupSignalVisual)
+signalShortColor = input.color(color.rgb(230, 70, 70), "SHORT Signal Color", group=groupSignalVisual)
 showSignalRiskReward = input.bool(true, "Show Risk / Reward", group=groupSignalVisual)
 showSignalLevels = input.bool(true, "Show Entry / Stop / Target Lines", group=groupSignalVisual)
 showSignalPrices = input.bool(false, "Show Signal Price Labels", group=groupSignalVisual)
@@ -2103,14 +2105,14 @@ var array<line> signalTargetLines=array.new_line()
 var array<label> signalPriceLabels=array.new_label()
 
 if longConfirmed or shortConfirmed
-    color sigColor=longConfirmed?cBull:cBear
+    color sigColor=longConfirmed?signalLongColor:signalShortColor
     string sideText=longConfirmed?"LONG":"SHORT"
-    string zoneText=setupProvenance!="NONE"?setupProvenance:(setupDir==1?"BULL ":"BEAR ")+setupType+" #"+str.tostring(setupZoneId)
-    string regimeText=(setupType=="OB" or setupType=="BREAKER")?" · V "+str.tostring(rvolNow,"0.00")+" · ADX "+str.tostring(nz(adxValue,0.0),"0.0"):""
-    string spaceText=not na(signalAvailableRewardR)?" · SPACE "+str.tostring(signalAvailableRewardR,"0.0")+"R":""
-    string flowText=(setupType=="OB" or setupType=="BREAKER")?" · AR "+str.tostring(nz(setupReactionArrivalRatio,0.0),"0.00")+" · VR "+str.tostring(atrRegimeRatio,"0.00"):""
-    string reactionTimingText=" · "+str.tostring(math.max(setupConfirmBarsUsed,1))+"B"+(setupTouchedWithWick?" WICK":"")
-    string sigText=signalDisplay=="Minimal"?sideText:signalDisplay=="Compact"?setupRegime+" "+sideText+" · "+zoneText:"PLUTUS "+setupRegime+" "+sideText+" · "+setupClass+reactionTimingText+" · "+zoneText+" · ER "+str.tostring(nz(signalQAbsorption,0.0),"0.0")+regimeText+flowText+spaceText+" · SQ "+str.tostring(nz(signalQuality,0.0),"0.0")
+    string shortReg=setupRegime=="REVERSAL"?"REV":setupRegime=="COUNTERTREND"?"CTR":setupRegime=="TREND"?"TRD":""
+    string shortType=setupType=="BREAKER"?"BB":setupType
+    string shortClass=setupClass=="FVG_REJECTION"?"FVG REJ":setupClass=="FVG_SWEEP_RECLAIM"?"FVG SWP":setupClass=="IFVG_RETEST"?"IFVG RT":setupClass=="OB_REJECTION"?"OB REJ":setupClass=="OB_SWEEP_RECLAIM"?"OB SWP":setupClass=="BREAKER_RETEST"?"BB RT":setupClass=="ZONE_FAILURE"?"FAIL":setupClass=="CLUSTER_REJECTION"?"CL REJ":setupClass=="CLUSTER_SWEEP_RECLAIM"?"CL SWP":setupClass
+    string sourceText=setupIsCluster?"CL #"+str.tostring(setupZoneId)+"/"+str.tostring(setupSecondZoneId):shortType+" #"+str.tostring(setupZoneId)
+    string timingText=str.tostring(math.max(setupConfirmBarsUsed,1))+"B"+(setupTouchedWithWick?" W":"")
+    string sigText=signalDisplay=="Minimal"?sideText:signalDisplay=="Compact"?shortReg+" "+sideText+" · "+sourceText+" · SQ "+str.tostring(nz(signalQuality,0.0),"0"):shortReg+" "+sideText+" · "+shortClass+" · "+sourceText+" · "+timingText+" · SQ "+str.tostring(nz(signalQuality,0.0),"0")+(not na(signalAvailableRewardR)?" · "+str.tostring(signalAvailableRewardR,"0.0")+"R":"")
     label slb=label.new(bar_index,close,sigText,xloc=xloc.bar_index,style=longConfirmed?label.style_label_up:label.style_label_down,textcolor=color.white,color=color.new(sigColor,15),size=signalDisplay=="Detailed"?size.small:size.tiny)
     array.push(signalLabels,slb)
     while array.size(signalLabels)>maxSignalPreviews
@@ -2119,8 +2121,8 @@ if longConfirmed or shortConfirmed
     int sigRight=bar_index+signalObjectBars
     if showSignalLevels
         line el=line.new(bar_index,signalEntry,sigRight,signalEntry,xloc=xloc.bar_index,extend=extend.none,color=color.new(sigColor,20))
-        line stl=line.new(bar_index,signalStop,sigRight,signalStop,xloc=xloc.bar_index,extend=extend.none,color=color.new(cBear,15),style=line.style_dashed)
-        line tl=line.new(bar_index,signalTarget,sigRight,signalTarget,xloc=xloc.bar_index,extend=extend.none,color=color.new(cBull,15),style=line.style_dashed)
+        line stl=line.new(bar_index,signalStop,sigRight,signalStop,xloc=xloc.bar_index,extend=extend.none,color=color.new(color.gray,15),style=line.style_dashed)
+        line tl=line.new(bar_index,signalTarget,sigRight,signalTarget,xloc=xloc.bar_index,extend=extend.none,color=color.new(sigColor,15),style=line.style_dashed)
         array.push(signalEntryLines,el)
         array.push(signalStopLines,stl)
         array.push(signalTargetLines,tl)
@@ -2132,14 +2134,14 @@ if longConfirmed or shortConfirmed
             line.delete(array.shift(signalTargetLines))
     if showSignalPrices
         label ep=label.new(sigRight,signalEntry,"ENTRY "+str.tostring(signalEntry,format.mintick),xloc=xloc.bar_index,style=label.style_label_left,textcolor=color.white,color=color.new(sigColor,65),size=size.tiny)
-        label sp=label.new(sigRight,signalStop,"STOP "+str.tostring(signalStop,format.mintick),xloc=xloc.bar_index,style=label.style_label_left,textcolor=color.white,color=color.new(cBear,65),size=size.tiny)
-        label tp=label.new(sigRight,signalTarget,"TARGET "+str.tostring(signalTarget,format.mintick),xloc=xloc.bar_index,style=label.style_label_left,textcolor=color.white,color=color.new(cBull,65),size=size.tiny)
+        label sp=label.new(sigRight,signalStop,"STOP "+str.tostring(signalStop,format.mintick),xloc=xloc.bar_index,style=label.style_label_left,textcolor=color.white,color=color.new(color.gray,65),size=size.tiny)
+        label tp=label.new(sigRight,signalTarget,"TARGET "+str.tostring(signalTarget,format.mintick),xloc=xloc.bar_index,style=label.style_label_left,textcolor=color.white,color=color.new(sigColor,65),size=size.tiny)
         array.push(signalPriceLabels,ep),array.push(signalPriceLabels,sp),array.push(signalPriceLabels,tp)
         while array.size(signalPriceLabels)>maxSignalPreviews*3
             label.delete(array.shift(signalPriceLabels))
     if showSignalRiskReward and signalEntry!=signalStop
         box rb=box.new(bar_index,math.max(signalEntry,signalStop),sigRight,math.min(signalEntry,signalStop),xloc=xloc.bar_index,extend=extend.none,border_color=color.new(color.gray,45),bgcolor=color.new(color.gray,83))
-        box pb=box.new(bar_index,math.max(signalEntry,signalTarget),sigRight,math.min(signalEntry,signalTarget),xloc=xloc.bar_index,extend=extend.none,border_color=color.new(cBull,45),bgcolor=color.new(cBull,82))
+        box pb=box.new(bar_index,math.max(signalEntry,signalTarget),sigRight,math.min(signalEntry,signalTarget),xloc=xloc.bar_index,extend=extend.none,border_color=color.new(sigColor,45),bgcolor=color.new(sigColor,82))
         array.push(signalRiskBoxes,rb),array.push(signalRewardBoxes,pb)
         while array.size(signalRiskBoxes)>maxSignalPreviews
             box.delete(array.shift(signalRiskBoxes))
