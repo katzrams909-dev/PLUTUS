@@ -123,7 +123,7 @@ mitigationPenaltyMax = input.float(25.0, "Maximum Mitigation Score Penalty", min
 retestPenalty = input.float(5.0, "Penalty Per Retest", minval=0.0, maxval=25.0, step=1.0, group=groupLifecycle)
 freshnessDecayPer100Bars = input.float(10.0, "Freshness Decay Per 100 Bars", minval=0.0, maxval=50.0, step=1.0, group=groupLifecycle)
 maxZoneAgeBars = input.int(250, "Maximum Zone Age (Bars)", minval=10, maxval=2000, group=groupLifecycle)
-maxTrackedZones = input.int(50, "Maximum Tracked Zones", minval=4, maxval=80, group=groupLifecycle)
+maxTrackedZones = input.int(30, "Maximum Tracked Zones", minval=4, maxval=80, group=groupLifecycle)
 removeInvalidated = input.bool(true, "Remove Invalidated Zones", group=groupLifecycle)
 removeExpired = input.bool(true, "Remove Expired Zones", group=groupLifecycle)
 showOnlyQualified = input.bool(true, "Show Only Qualified Zones", group=groupLifecycle)
@@ -909,78 +909,47 @@ for pass=0 to 3
                     if ov>=(typ=="FVG" and suppressNestedFvg?fvgFamilyOverlapPct:duplicateOverlapPct) or (sameFamily and not na(atr) and sep<=minZoneSeparationAtr*atr)
                         duplicate:=true
         if not duplicate and (score>=minQualificationScore or not showOnlyQualified)
-            bool admitNewZone=true
             if array.size(zDir)>=maxTrackedZones
-                int evictIdx=na
-                float weakestKeepScore=1e9
-                int existingCount=array.size(zDir)
-                for ei=0 to existingCount-1
-                    string est=array.get(zState,ei)
-                    string etyp=array.get(zType,ei)
-                    float escore=array.get(zScore,ei)
-                    float emit=array.get(zMitigation,ei)
-                    int eage=bar_index-array.get(zBorn,ei)
-                    bool etouched=array.get(zTouched,ei)
-                    bool earmed=not na(array.get(zArmedBar,ei))
-                    // Higher keep score = harder to evict.
-                    float typeKeep=etyp=="BREAKER"?30.0:etyp=="OB"?25.0:etyp=="IFVG"?18.0:10.0
-                    float stateKeep=est=="JUST_FLIPPED"?40.0:est=="FRESH"?20.0:est=="RETESTED"?15.0:est=="PARTIAL"?8.0:est=="TERMINAL_FILL"?-20.0:0.0
-                    float interactionKeep=(etouched or earmed)?35.0:0.0
-                    float freshnessKeep=f_clamp(20.0-eage/25.0,0.0,20.0)
-                    float mitigationKeep=-emit*0.20
-                    float keepScore=escore+typeKeep+stateKeep+interactionKeep+freshnessKeep+mitigationKeep
-                    if keepScore<weakestKeepScore
-                        weakestKeepScore:=keepScore
-                        evictIdx:=ei
-
-                float incomingTypeKeep=typ=="BREAKER"?30.0:typ=="OB"?25.0:typ=="IFVG"?18.0:10.0
-                float incomingKeepScore=score+incomingTypeKeep+20.0
-                if not na(evictIdx) and incomingKeepScore>weakestKeepScore+5.0
-                    box old=array.get(zBox,evictIdx)
-                    if not na(old)
-                        box.delete(old)
-                    array.remove(zId,evictIdx)
-                    array.remove(zDir,evictIdx)
-                    array.remove(zType,evictIdx)
-                    array.remove(zState,evictIdx)
-                    array.remove(zTop,evictIdx)
-                    array.remove(zBottom,evictIdx)
-                    array.remove(zBaseScore,evictIdx)
-                    array.remove(zScore,evictIdx)
-                    array.remove(zMitigation,evictIdx)
-                    array.remove(zBorn,evictIdx)
-                    array.remove(zRetests,evictIdx)
-                    array.remove(zTouched,evictIdx)
-                    array.remove(zArmedBar,evictIdx)
-                    array.remove(zPendingDir,evictIdx)
-                    array.remove(zRetireBar,evictIdx)
-                    array.remove(zBox,evictIdx)
-                else
-                    admitNewZone:=false
-
-            if admitNewZone
-                array.push(zId,nextZoneId)
-                nextZoneId+=1
-                array.push(zDir,dir)
-                array.push(zType,typ)
-                array.push(zState,"FRESH")
-                array.push(zTop,top)
-                array.push(zBottom,bottom)
-                array.push(zBaseScore,score)
-                array.push(zScore,score)
-                array.push(zMitigation,0.0)
-                array.push(zBorn,bar_index)
-                array.push(zRetests,0)
-                array.push(zTouched,false)
-                array.push(zArmedBar,na)
-                array.push(zPendingDir,0)
-                array.push(zRetireBar,na)
-                box nb=na
-                if showZones
-                    color zc=dir==1?cBull:cBear
-                    string txt=showZoneText?(dir==1?"BULL ":"BEAR ")+typ+" · "+str.tostring(score,"#.0")+" · FRESH":""
-                    nb:=box.new(bar_index,top,bar_index,bottom,xloc=xloc.bar_index,extend=extend.none,border_color=color.new(zc,35),bgcolor=color.new(zc,zoneOpacityFresh),text=txt,text_color=zc,text_size=size.tiny)
-                array.push(zBox,nb)
+                box old=array.shift(zBox)
+                if not na(old)
+                    box.delete(old)
+                array.shift(zId)
+                array.shift(zDir)
+                array.shift(zType)
+                array.shift(zState)
+                array.shift(zTop)
+                array.shift(zBottom)
+                array.shift(zBaseScore)
+                array.shift(zScore)
+                array.shift(zMitigation)
+                array.shift(zBorn)
+                array.shift(zRetests)
+                array.shift(zTouched)
+                array.shift(zArmedBar)
+                array.shift(zPendingDir)
+                array.shift(zRetireBar)
+            array.push(zId,nextZoneId)
+            nextZoneId+=1
+            array.push(zDir,dir)
+            array.push(zType,typ)
+            array.push(zState,"FRESH")
+            array.push(zTop,top)
+            array.push(zBottom,bottom)
+            array.push(zBaseScore,score)
+            array.push(zScore,score)
+            array.push(zMitigation,0.0)
+            array.push(zBorn,bar_index)
+            array.push(zRetests,0)
+            array.push(zTouched,false)
+            array.push(zArmedBar,na)
+            array.push(zPendingDir,0)
+            array.push(zRetireBar,na)
+            box nb=na
+            if showZones
+                color zc=dir==1?cBull:cBear
+                string txt=showZoneText?(dir==1?"BULL ":"BEAR ")+typ+" · "+str.tostring(score,"#.0")+" · FRESH":""
+                nb:=box.new(bar_index,top,bar_index,bottom,xloc=xloc.bar_index,extend=extend.none,border_color=color.new(zc,35),bgcolor=color.new(zc,zoneOpacityFresh),text=txt,text_color=zc,text_size=size.tiny)
+            array.push(zBox,nb)
 float bestBullScore=0.0
 float bestBearScore=0.0
 string bestBullType="NONE"
