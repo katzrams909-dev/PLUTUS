@@ -1,7 +1,7 @@
 # PLUTUS RC1 — Final Regression & Release Audit
 
 Baseline under test: `pine/release/PLUTUS_RC1.pine`
-Baseline commit: `ed840b27a02ff7e4a15351ef7aa5d2cf78368568`
+Baseline commit: `c2e8d0860164f98b372038f177a92c0bf9d0bfae`
 
 ## Release policy
 
@@ -424,7 +424,7 @@ PLUTUS v1.0 may be tagged only when:
 - [ ] final RC commit SHA is recorded.
 - [ ] RC is frozen and tagged as v1.0.
 
-Current status: **RC1 P10.4 COMPILE-PASS / REGRESSION PENDING**.
+Current status: **RC1 FEATURE-FROZEN / COMPILE-PASS / FINAL REGRESSION RECOMMENDED**.
 
 
 ---
@@ -498,3 +498,18 @@ Any same-flip-bar IFVG/Breaker signal or back-plotted delayed entry is a P0 rele
 - [ ] Recheck named multi-bar/wick regression cases on chart.
 - [ ] Confirm no same-flip-bar IFVG/Breaker signals.
 - [ ] Confirm prior GBPUSD false-long regression remains closed.
+
+
+---
+
+## Release Freeze Record
+
+- [x] Trading-model feature freeze accepted.
+- [x] Frozen RC baseline: `c2e8d0860164f98b372038f177a92c0bf9d0bfae`.
+- [x] User-confirmed Pine v6 compile pass at frozen baseline.
+- [x] Release notes added in `docs/RELEASE_v1.0.md`.
+- [x] README / project specification / engine architecture updated for v1.0.
+- [ ] Git tag `v1.0` created.
+- [ ] Optional extended historical/runtime regression completed.
+
+Policy after freeze: only demonstrated compile/runtime, repaint, direction, lifecycle, provenance, or release-blocking defects should change the frozen model.
